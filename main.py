@@ -1,0 +1,411 @@
+from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from app.db.database import get_db, engine
+from app.db import models
+from app.api import auth
+from app.core.security import get_current_user
+from pydantic import BaseModel
+import uuid
+import datetime
+from apscheduler.schedulers.background import BackgroundScheduler
+from contextlib import asynccontextmanager
+from app.workers import poll_all_users_task, check_all_meetings_task, check_all_inactivity_task
+import gc
+
+# 1. Background Scheduler for Periodic Tasks
+scheduler = BackgroundScheduler()
+scheduler.add_job(poll_all_users_task, 'interval', minutes=2)
+scheduler.add_job(check_all_meetings_task, 'interval', minutes=15)
+scheduler.add_job(check_all_inactivity_task, 'interval', hours=1)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[SYSTEM] Starting Background Scheduler...")
+    scheduler.start()
+    yield
+    print("[SYSTEM] Shutting down Background Scheduler...")
+    scheduler.shutdown()
+
+# Create tables if they don't exist
+models.Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Outreach v3 API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth.router)
+app.include_router(auth.capability_router)
+
+class CampaignCreate(BaseModel):
+    name: str
+    user_url: str
+    target_industry: str
+    target_location: str
+    target_employee_count: str | None = None
+    query: str = "" # Keeping as optional for legacy if needed, but industry/location are primary now
+    class Config:
+        from_attributes = True
+
+class CampaignResponse(BaseModel):
+    id: str
+    name: str
+    status: models.CampaignStatus
+    created_at: datetime.datetime
+    class Config:
+        from_attributes = True
+
+class BatchDeleteRequest(BaseModel):
+    campaign_ids: list[str]
+
+@app.get("/health/email")
+def email_health_check():
+    """Diagnostic: verify Gmail OAuth config on Render."""
+    import os
+    config_status = {
+        "GMAIL_TOKEN_JSON": "SET" if os.getenv("GMAIL_TOKEN_JSON") else "MISSING",
+        "GMAIL_CREDENTIALS_JSON": "SET" if os.getenv("GMAIL_CREDENTIALS_JSON") else "MISSING",
+        "EMAIL_USER": os.getenv("EMAIL_USER", "MISSING"),
+        "NEON_DB_URL": "SET" if os.getenv("NEON_DB_URL") else "MISSING",
+        "OPENAI_API_KEY": "SET" if os.getenv("OPENAI_API_KEY") else "MISSING",
+    }
+    return {"config": config_status, "mode": "STRICT_GMAIL_NATIVE"}
+
+@app.post("/campaigns", response_model=CampaignResponse)
+def create_campaign(
+    campaign: CampaignCreate, 
+    background_tasks: BackgroundTasks, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    # Tactical Limit Enforcement for Demo Identities (Permanent Lock)
+    if current_user.is_demo:
+        # We use a persistent sentinel to ensure deletion doesn't reset the quota
+        if current_user.has_used_trial_quota:
+            raise HTTPException(
+                status_code=403, 
+                detail="Trial identity quota exceeded. You have already utilized your 1-campaign entitlement. Please upgrade to professional access for unlimited mobilization."
+            )
+
+    # 1. Create campaign in DB tied to user
+    campaign_id = str(uuid.uuid4())
+    new_campaign = models.Campaign(
+        id=campaign_id,
+        user_id=current_user.id,
+        name=campaign.name,
+        user_query=campaign.query,
+        target_industry=campaign.target_industry,
+        target_location=campaign.target_location,
+        target_employee_count=campaign.target_employee_count,
+        status=models.CampaignStatus.RESEARCHING_USER_COMPANY
+    )
+    db.add(new_campaign)
+    
+    # Commit quota consumption for Demo Users
+    if current_user.is_demo:
+        current_user.has_used_trial_quota = True
+    
+    # 2. Instantly persist Mission Origin
+    intel = models.UserCompanyIntel(
+        campaign_id=campaign_id, 
+        website=campaign.user_url,
+        company_name="Synchronizing Identity..."
+    )
+    db.add(intel)
+    db.commit()
+    db.refresh(new_campaign)
+    
+    # 3. Trigger Stage 1 Direct Research using BackgroundTasks
+    from app.workers import research_user_company_worker
+    background_tasks.add_task(research_user_company_worker, campaign_id)
+    
+    return new_campaign
+
+@app.get("/campaigns")
+def list_campaigns(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    # Strictly filter by user_id
+    db_campaigns = db.query(models.Campaign).filter(
+        models.Campaign.user_id == current_user.id
+    ).order_by(models.Campaign.created_at.desc()).all()
+    results = []
+    for campaign in db_campaigns:
+        results.append({
+            "id": campaign.id,
+            "name": campaign.name,
+            "status": campaign.status,
+            "created_at": campaign.created_at,
+            "query": campaign.user_query,
+            "target_industry": campaign.target_industry,
+            "target_location": campaign.target_location,
+        })
+    return results
+
+@app.delete("/campaigns/{campaign_id}")
+def delete_campaign(
+    campaign_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    # Isolation: User can only delete their own campaign
+    db_campaign = db.query(models.Campaign).filter(
+        models.Campaign.id == campaign_id,
+        models.Campaign.user_id == current_user.id
+    ).first()
+    if not db_campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found or access denied")
+    
+    db.delete(db_campaign)
+    db.commit()
+    return {"message": "Campaign deleted successfully"}
+
+@app.patch("/campaigns/{campaign_id}/status", response_model=CampaignResponse)
+@app.put("/campaigns/{campaign_id}/status", response_model=CampaignResponse)
+def update_campaign_status(
+    campaign_id: str, 
+    status: str = Query(..., alias="status"), 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    db_campaign = db.query(models.Campaign).filter(
+        models.Campaign.id == campaign_id,
+        models.Campaign.user_id == current_user.id
+    ).first()
+    if not db_campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found or access denied")
+    
+    try:
+        # Map string status to Enum member
+        status_enum = models.CampaignStatus(status.upper())
+        db_campaign.status = status_enum
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+
+    db.commit()
+    db.refresh(db_campaign)
+    return db_campaign
+
+@app.post("/campaigns/batch-delete")
+def batch_delete_campaigns(
+    request: BatchDeleteRequest, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    campaign_ids = request.campaign_ids
+    # Multi-tenant policy: only delete campaigns owned by current_user
+    campaigns_to_delete = db.query(models.Campaign).filter(
+        models.Campaign.id.in_(campaign_ids),
+        models.Campaign.user_id == current_user.id
+    ).all()
+    
+    count = len(campaigns_to_delete)
+    if count == 0:
+        return {"message": "No campaigns identified for decommission within your sector."}
+
+    # Bulk deletion with ownership check
+    db.query(models.Campaign).filter(
+        models.Campaign.id.in_(campaign_ids),
+        models.Campaign.user_id == current_user.id
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"message": f"Successfully decommissioned {count} campaigns from your intelligence sector."}
+
+@app.get("/campaigns/{campaign_id}")
+def get_campaign(
+    campaign_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    db_campaign = db.query(models.Campaign).filter(
+        models.Campaign.id == campaign_id,
+        models.Campaign.user_id == current_user.id
+    ).first()
+    if not db_campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found in your intelligence sector")
+    
+    # Enrich with details based on status
+    target_companies = []
+    for tc in db_campaign.target_companies:
+        tc_dict = tc.__dict__.copy()
+        tc_dict.pop("_sa_instance_state", None)
+        target_companies.append(tc_dict)
+        
+    dms = []
+    for dm in db_campaign.dms:
+        dm_dict = dm.__dict__.copy()
+        dm_dict.pop("_sa_instance_state", None)
+        import datetime
+        
+        # Include communication logs
+        logs = []
+        for log in dm.logs:
+            ld = log.__dict__.copy()
+            ld.pop("_sa_instance_state", None)
+            logs.append(ld)
+        dm_dict["logs"] = logs
+        dms.append(dm_dict)
+        
+    drafts = []
+    # Force Reverse-Chronological Draft Sequence (Newest first)
+    from datetime import UTC
+    sorted_drafts = sorted(db_campaign.drafts, key=lambda x: x.created_at if x.created_at else datetime.datetime.min.replace(tzinfo=UTC), reverse=True)
+    
+    for d in sorted_drafts:
+        d_dict = d.__dict__.copy()
+        d_dict.pop("_sa_instance_state", None)
+        drafts.append(d_dict)
+
+    result = {
+        "id": db_campaign.id,
+        "name": db_campaign.name,
+        "status": db_campaign.status,
+        "created_at": db_campaign.created_at,
+        "query": db_campaign.user_query,
+        "target_industry": db_campaign.target_industry,
+        "target_location": db_campaign.target_location,
+        "user_intel": db_campaign.user_intel.__dict__ if db_campaign.user_intel else None,
+        "target_companies_count": len([c for c in db_campaign.target_companies if getattr(c, 'status', 'NEW') != "REJECTED"]),
+        "target_companies": target_companies,
+        "dms_count": len(db_campaign.dms),
+        "dms": dms,
+        "drafts_count": len(db_campaign.drafts),
+        "drafts": drafts,
+    }
+    # Remove SQLAlchemy internal state
+    if result["user_intel"]: result["user_intel"].pop("_sa_instance_state", None)
+    
+    return result
+
+class DraftUpdate(BaseModel):
+    subject: str
+    body: str
+    email: str
+
+@app.patch("/drafts/{draft_id}")
+def update_draft(draft_id: str, update: DraftUpdate, db: Session = Depends(get_db)):
+    db_draft = db.query(models.EmailDraft).filter(models.EmailDraft.id == draft_id).first()
+    if not db_draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    
+    db_draft.subject = update.subject
+    db_draft.body = update.body
+    
+    if db_draft.dm:
+        db_draft.dm.email = update.email
+        
+    db.commit()
+    return {"message": "Draft updated successfully"}
+
+@app.post("/drafts/{draft_id}/send")
+def send_draft(draft_id: str, db: Session = Depends(get_db)):
+    db_draft = db.query(models.EmailDraft).filter(models.EmailDraft.id == draft_id).first()
+    if not db_draft:
+        raise HTTPException(status_code=404, detail="Email engagement protocol not found.")
+    
+    # 1. Coordinate Validation
+    prospect_email = db_draft.dm.email if db_draft.dm else None
+    if not prospect_email:
+        raise HTTPException(status_code=400, detail="Deployment coordinate (Email) missing. Please refine and synchronize stakeholder data.")
+        
+    from app.core.email_service import email_service
+    
+    try:
+        # 2. Coordinate Threading
+        thread_id = db_draft.dm.thread_id
+        
+        from app.core.token_service import TokenService
+        # 3. Strategic Deployment with campaign-specific credentials
+        creds = TokenService.get_google_credentials(db, db_draft.campaign.user_id)
+        msg_data = email_service.send_email(
+            to_email=prospect_email,
+            subject=db_draft.subject,
+            body=db_draft.body,
+            creds=creds,
+            thread_id=thread_id
+        )
+        msg_id = msg_data["id"]
+        thread_id = msg_data["thread_id"]
+        
+        # 4. Log to Communication History
+        from datetime import UTC
+        import datetime
+        new_log = models.CommunicationLog(
+            campaign_id=db_draft.campaign_id,
+            dm_id=db_draft.decision_maker_id,
+            direction="SENT",
+            subject=db_draft.subject,
+            body=db_draft.body,
+            message_id=msg_id
+        )
+        db.add(new_log)
+        
+        # 5. Status & CRM Synchronization
+        if db_draft.dm:
+            dm = db_draft.dm
+            dm.last_message_id = msg_id
+            dm.thread_id = thread_id
+            if dm.status == "DISCOVERY_CALL":
+                hs_status = "Discovery Invitation Sent"
+                dm.status = "WAITING_FOR_REPLY" # Shared state for 'Wait' but UI will use pulse logic
+            elif db_draft.followup_index == 0:
+                hs_status = "Initial Email Sent"
+                dm.status = "INITIAL_SENT"
+            else:
+                idx = db_draft.followup_index
+                dm.followup_count = idx
+                suffix = "st" if idx == 1 else "nd" if idx == 2 else "rd" if idx == 3 else "th"
+                hs_status = f"{idx}{suffix} Follow Up Sent"
+                dm.status = f"FOLLOWUP_{idx}_SENT"
+            
+            # Update HubSpot CRM
+            from app.integrations.hubspot import hubspot_provider
+            hubspot_provider.update_lead_status(dm.hubspot_id, hs_status)
+            
+        db_draft.status = "SENT"
+        db_draft.message_id = msg_id
+        db_draft.sent_at = datetime.datetime.now(UTC)
+            
+        db.commit()
+        return {"message": f"Engagement protocol mobilized. HubSpot status updated to '{hs_status if db_draft.dm else 'N/A'}'."}
+    except Exception as e:
+        print(f"Deployment Failure: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Tactical deployment failed: {str(e)}")
+
+@app.get("/prospects/{dm_id}")
+def get_prospect_details(dm_id: str, db: Session = Depends(get_db)):
+    dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
+    if not dm:
+        raise HTTPException(status_code=404, detail="Stakeholder not found")
+    
+    logs = []
+    for log in dm.logs:
+        log_dict = log.__dict__.copy()
+        log_dict.pop("_sa_instance_state", None)
+        logs.append(log_dict)
+        
+    result = {
+        "id": dm.id,
+        "name": dm.name,
+        "position": dm.position,
+        "email": dm.email,
+        "linkedin": dm.linkedin,
+        "status": dm.status,
+        "company_name": dm.target_company.name if dm.target_company else "N/A",
+        "logs": sorted(logs, key=lambda x: x['received_at'], reverse=True)
+    }
+    
+    return result
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}

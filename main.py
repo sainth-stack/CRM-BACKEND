@@ -1,45 +1,57 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.db.database import get_db, engine
 from app.db import models
 from app.api import auth
 from app.core.security import get_current_user
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from starlette.requests import Request
 import uuid
 import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
+import ipaddress
+import urllib.parse
 from contextlib import asynccontextmanager
-from app.workers import poll_all_users_task, check_all_meetings_task, check_all_inactivity_task
+from app.workers import sweep_stuck_campaigns_task
+from app.core.logging_config import setup_logging
 import gc
+import os
 
-# 1. Background Scheduler for Periodic Tasks
-scheduler = BackgroundScheduler()
-scheduler.add_job(poll_all_users_task, 'interval', minutes=2)
-scheduler.add_job(check_all_meetings_task, 'interval', minutes=15)
-scheduler.add_job(check_all_inactivity_task, 'interval', hours=1)
+# Initialize Enterprise Logging
+logger = setup_logging()
+
+# --- Rate Limiter (IP-based, Redis-backed) ---
+limiter = Limiter(key_func=get_remote_address, storage_uri=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[SYSTEM] Booting up and sweeping for ghosted campaigns...")
-    from app.workers import sweep_stuck_campaigns_task
-    import threading
-    threading.Thread(target=sweep_stuck_campaigns_task).start()
-    
-    print("[SYSTEM] Starting Background Scheduler...")
-    scheduler.start()
+    # 1. Startup: Resurrection Protocol
+    # Scans for campaigns that were processing when server last died
+    logger.info("Mobilizing Outreach Resurrection Protocol...")
+    sweep_stuck_campaigns_task()
     yield
-    print("[SYSTEM] Shutting down Background Scheduler...")
-    scheduler.shutdown()
+    # 2. Shutdown: Cleanup
+    logger.info("Decommissioning API server... performing memory sweep.")
+    gc.collect()
 
 # Create tables if they don't exist
 models.Base.metadata.create_all(bind=engine)
 
+# --- CORS (Env-configured, production-safe) ---
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+
 app = FastAPI(title="Outreach v3 API", lifespan=lifespan)
+
+# Attach rate limiter state and error handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -77,6 +89,33 @@ def get_visibility_filter(db: Session, current_user: models.User):
         target_user_ids = db.query(models.User.id).filter(models.User.created_by_id == current_user.id)
         return models.Campaign.user_id.in_(target_user_ids)
     return models.Campaign.user_id == current_user.id
+
+# --- SSRF Protection Utility ---
+def validate_url_for_ssrf(url: str) -> str:
+    """
+    Blocks Server-Side Request Forgery attacks on user-submitted URLs.
+    Rejects private IPs, loopback, cloud metadata endpoints, and non-HTTP schemes.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ["http", "https"]:
+            raise HTTPException(status_code=400, detail="Only HTTP/HTTPS URLs are permitted.")
+        hostname = parsed.hostname
+        if not hostname:
+            raise HTTPException(status_code=400, detail="Invalid URL: missing hostname.")
+        # Block raw private IP submissions
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                raise HTTPException(status_code=400, detail="Internal network URLs are not permitted.")
+        except ValueError:
+            pass  # Hostname string — not a raw IP, safe to proceed
+        return url
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid URL format.")
+
 
 @app.get("/health/email")
 def email_health_check():
@@ -140,31 +179,41 @@ def create_campaign(
                 detail="Deployment Lock: Your 1-campaign entitlement has been strictly enforced. Simultaneous operation intercepted."
             )
     
+    # Apply SSRF protection on user-submitted URL
+    validated_url = validate_url_for_ssrf(campaign.user_url)
+
     # 2. Instantly persist Mission Origin
     intel = models.UserCompanyIntel(
-        campaign_id=campaign_id, 
-        website=campaign.user_url,
+        campaign_id=campaign_id,
+        website=validated_url,
         company_name="Synchronizing Identity..."
     )
     db.add(intel)
     db.commit()
     db.refresh(new_campaign)
     
-    # 3. Trigger Stage 1 Direct Research using BackgroundTasks
+    # 3. Trigger Stage 1 via Distributed Celery Message Queue
     from app.workers import research_user_company_worker
-    background_tasks.add_task(research_user_company_worker, campaign_id)
+    research_user_company_worker.delay(campaign_id)
     
     return new_campaign
 
 @app.get("/campaigns")
 def list_campaigns(
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Results per page")
 ):
-    # Enforce Hierarchical Visibility Filter
+    """Paginated campaign listing with Zero-Trust hierarchical isolation."""
+    visibility_filter = get_visibility_filter(db, current_user)
+    skip = (page - 1) * page_size
+
+    total = db.query(models.Campaign).filter(visibility_filter).count()
     db_campaigns = db.query(models.Campaign).filter(
-        get_visibility_filter(db, current_user)
-    ).order_by(models.Campaign.created_at.desc()).all()
+        visibility_filter
+    ).order_by(models.Campaign.created_at.desc()).offset(skip).limit(page_size).all()
+
     results = []
     for campaign in db_campaigns:
         results.append({
@@ -176,7 +225,13 @@ def list_campaigns(
             "target_industry": campaign.target_industry,
             "target_location": campaign.target_location,
         })
-    return results
+    return {
+        "campaigns": results,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size
+    }
 
 @app.delete("/campaigns/{campaign_id}")
 def delete_campaign(
@@ -249,11 +304,17 @@ def batch_delete_campaigns(
 
 @app.get("/campaigns/{campaign_id}")
 def get_campaign(
-    campaign_id: str, 
+    campaign_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    db_campaign = db.query(models.Campaign).filter(
+    # N+1 Fix: Single query with all relationships eager-loaded
+    db_campaign = db.query(models.Campaign).options(
+        joinedload(models.Campaign.user_intel),
+        joinedload(models.Campaign.target_companies),
+        joinedload(models.Campaign.dms).joinedload(models.DecisionMaker.logs),
+        joinedload(models.Campaign.drafts)
+    ).filter(
         models.Campaign.id == campaign_id,
         get_visibility_filter(db, current_user)
     ).first()

@@ -26,3 +26,6 @@ PyJWT
 cryptography
 passlib[bcrypt]
 bcrypt
+celery
+redis
+slowapi

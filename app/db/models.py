@@ -23,9 +23,9 @@ class User(Base):
     otp_expiry = Column(DateTime, nullable=True)
     provider = Column(String, nullable=True) # google, microsoft
     provider_user_id = Column(String, nullable=True)
-    role = Column(SQLEnum(UserRole), default=UserRole.USER)
+    role = Column(SQLEnum(UserRole), default=UserRole.USER, index=True)
     user_limit = Column(Integer, default=0) # Total users an admin can create
-    created_by_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
+    created_by_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     
     is_demo = Column(Boolean, default=False)
     demo_expires_at = Column(DateTime, nullable=True)
@@ -77,10 +77,10 @@ class Campaign(Base):
     __tablename__ = "campaigns"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String, nullable=False)
     user_query = Column(Text, nullable=False)
-    status = Column(SQLEnum(CampaignStatus), default=CampaignStatus.PENDING)
+    status = Column(SQLEnum(CampaignStatus), default=CampaignStatus.PENDING, index=True)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
     
     # Target company parameters
@@ -100,7 +100,7 @@ class UserCompanyIntel(Base):
     __tablename__ = "user_company_intel"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"))
+    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
     company_name = Column(String, nullable=False)
     website = Column(String)
     motto = Column(Text)
@@ -113,7 +113,7 @@ class TargetCompany(Base):
     __tablename__ = "target_companies"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"))
+    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
     name = Column(String, nullable=False)
     website = Column(String)
     domain = Column(String, nullable=True)
@@ -126,7 +126,7 @@ class TargetCompany(Base):
     deep_research = Column(Text)
     similarity_score = Column(JSON) # Store score and reasoning
     rejection_reason = Column(Text, nullable=True)
-    status = Column(String, default="ACTIVE") # NEW, ACTIVE, DISCOVERY_CALL, TERMINATED, REJECTED
+    status = Column(String, default="ACTIVE", index=True) # NEW, ACTIVE, DISCOVERY_CALL, TERMINATED, REJECTED
     
     campaign = relationship("Campaign", back_populates="target_companies")
     dms = relationship("DecisionMaker", back_populates="target_company", cascade="all, delete-orphan")
@@ -135,8 +135,8 @@ class DecisionMaker(Base):
     __tablename__ = "decision_makers"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"))
-    target_company_id = Column(String, ForeignKey("target_companies.id", ondelete="CASCADE"))
+    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
+    target_company_id = Column(String, ForeignKey("target_companies.id", ondelete="CASCADE"), index=True)
     name = Column(String, nullable=False)
     position = Column(String)
     email = Column(String)
@@ -144,7 +144,7 @@ class DecisionMaker(Base):
     linkedin = Column(String)
     similarity_score = Column(JSON) # Store score and reasoning
     hubspot_id = Column(String, nullable=True)
-    status = Column(String, default="NEW") # NEW, SYNCED, DRAFTED, INITIAL_SENT, FOLLOWUP_X_SENT, DISCOVERY_CALL, TERMINATED
+    status = Column(String, default="NEW", index=True) # NEW, SYNCED, DRAFTED, INITIAL_SENT, FOLLOWUP_X_SENT, DISCOVERY_CALL, TERMINATED
     followup_count = Column(Integer, default=0)
     last_message_id = Column(String, nullable=True) # ID of the last email sent
     thread_id = Column(String, nullable=True) # References/In-Reply-To header
@@ -166,11 +166,11 @@ class EmailDraft(Base):
     __tablename__ = "email_drafts"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"))
-    decision_maker_id = Column(String, ForeignKey("decision_makers.id", ondelete="CASCADE"))
+    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
+    decision_maker_id = Column(String, ForeignKey("decision_makers.id", ondelete="CASCADE"), index=True)
     subject = Column(String)
     body = Column(Text)
-    status = Column(String, default="DRAFTED") # DRAFTED, APPROVED, SENT
+    status = Column(String, default="DRAFTED", index=True) # DRAFTED, APPROVED, SENT
     is_approved = Column(Boolean, default=False)
     message_id = Column(String, nullable=True) # To track once sent
     sent_at = Column(DateTime, nullable=True)
@@ -184,9 +184,9 @@ class CommunicationLog(Base):
     __tablename__ = "communication_logs"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"))
-    dm_id = Column(String, ForeignKey("decision_makers.id", ondelete="CASCADE"))
-    direction = Column(String) # SENT, RECEIVED
+    campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
+    dm_id = Column(String, ForeignKey("decision_makers.id", ondelete="CASCADE"), index=True)
+    direction = Column(String, index=True) # SENT, RECEIVED
     subject = Column(String)
     body = Column(Text)
     message_id = Column(String) # For threading match

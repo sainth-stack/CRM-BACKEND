@@ -47,12 +47,43 @@ def decrypt_token(encrypted_token: str) -> str:
             detail="Failed to decrypt secure token"
         )
 
-# Thread-safe in-memory O(1) Access Revocation Cache
-_ACTIVE_SECURITY_REVOCATIONS: Dict[str, int] = {}
+# Distributed Session Revocation Cache (Redis-backed, in-memory fallback)
+# Stores revocation timestamps keyed by user_id.
+# Any JWT issued BEFORE this timestamp is immediately invalidated.
+_REVOCATION_FALLBACK: dict = {}  # Used only if Redis is unreachable
+
+def _get_redis():
+    """Returns a Redis client. Returns None if unavailable."""
+    try:
+        import redis
+        r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), socket_connect_timeout=1)
+        r.ping()  # Fail fast if Redis is down
+        return r
+    except Exception:
+        return None
 
 def revoke_sessions(user_id: str):
-    """Flags a user's ID to instantly terminate any pre-existing JWTs globally."""
-    _ACTIVE_SECURITY_REVOCATIONS[user_id] = int(datetime.now(UTC).timestamp())
+    """
+    Instantly terminates all pre-existing JWTs for a user across ALL server pods.
+    Writes to Redis for distributed consistency. Falls back to in-memory if Redis
+    is unavailable (single-pod degraded mode).
+    """
+    revocation_time = int(datetime.now(UTC).timestamp())
+    r = _get_redis()
+    if r:
+        # TTL: 8 days (max JWT lifetime is 7 days, so all tokens will expire naturally)
+        r.setex(f"revoked:{user_id}", 60 * 60 * 24 * 8, revocation_time)
+    else:
+        _REVOCATION_FALLBACK[user_id] = revocation_time
+        print(f"[SECURITY] Redis unavailable — revocation stored in-memory (single-pod mode).")
+
+def _get_revocation_time(user_id: str) -> int:
+    """Retrieves the revocation timestamp for a user from Redis or in-memory fallback."""
+    r = _get_redis()
+    if r:
+        val = r.get(f"revoked:{user_id}")
+        return int(val) if val else 0
+    return _REVOCATION_FALLBACK.get(user_id, 0)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Generates a JWT access token for session management."""
@@ -102,10 +133,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         if user_id is None:
             raise credentials_exception
             
-        # Enterprise Edge Defense: Instant Zero-Latency Session Revocation
+        # Enterprise Edge Defense: Distributed Session Revocation Check
         iat = payload.get("iat")
-        if iat is not None and user_id in _ACTIVE_SECURITY_REVOCATIONS:
-            if iat < _ACTIVE_SECURITY_REVOCATIONS[user_id]:
+        if iat is not None:
+            revocation_time = _get_revocation_time(user_id)
+            if revocation_time and iat < revocation_time:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Session terminated. Security credentials have been reset.",

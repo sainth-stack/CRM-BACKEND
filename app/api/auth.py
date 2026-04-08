@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Body, Request
 from sqlalchemy.orm import Session
 from typing import Dict, Any
 from pydantic import BaseModel, EmailStr
@@ -18,8 +18,13 @@ from app.core.security import (
 )
 from app.core.token_service import TokenService
 from app.core.email_service import email_service
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+# Module-level limiter (shares state with main app via Redis)
+limiter = Limiter(key_func=get_remote_address)
 
 class LoginRequest(BaseModel):
     email: str
@@ -30,12 +35,13 @@ class VerifyOTPRequest(BaseModel):
     otp: str
 
 @router.post("/login")
-async def login(request: LoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")  # Brute-force shield: 10 attempts/minute per IP
+async def login(request: Request, credentials: LoginRequest = Body(...), db: Session = Depends(get_db)):
     """
     Standard Email/Password Sign-In.
     Verifies credentials and issues a JWT session.
     """
-    user = db.query(models.User).filter(models.User.email == request.email).first()
+    user = db.query(models.User).filter(models.User.email == credentials.email).first()
     if not user or not user.hashed_password:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -43,7 +49,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    if not verify_password(request.password, user.hashed_password):
+    if not verify_password(credentials.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password.",
@@ -90,9 +96,10 @@ async def manual_add_user(request: LoginRequest, db: Session = Depends(get_db)):
     return {"message": "User added successfully"}
 
 @router.post("/demo/signup")
-async def demo_signup(request: LoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")   # Bot-flood shield: 5 demo signups/minute per IP
+async def demo_signup(request: Request, credentials: LoginRequest = Body(...), db: Session = Depends(get_db)):
     """Public onboarding for 5-day trial identities."""
-    existing_user = db.query(models.User).filter(models.User.email == request.email).first()
+    existing_user = db.query(models.User).filter(models.User.email == credentials.email).first()
     if existing_user:
         # Boundary Enforcement: Prevent Trial Renewal Loops
         if existing_user.is_demo:
@@ -104,12 +111,10 @@ async def demo_signup(request: LoginRequest, db: Session = Depends(get_db)):
     
     # Generate 6-digit OTP for initial verification
     otp = str(random.randint(100000, 999999))
-    
-    # Create temporary demo user
-    # Note: demo_expires_at is set ONLY after OTP verification
+
     user = models.User(
-        email=request.email,
-        hashed_password=get_password_hash(request.password),
+        email=credentials.email,
+        hashed_password=get_password_hash(credentials.password),
         is_demo=True,
         signup_source="demo",
         otp_code=otp,
@@ -177,9 +182,10 @@ class ForgotPasswordRequest(BaseModel):
     email: str
 
 @router.post("/forgot-password")
-async def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")   # Enumeration shield: 5 reset requests/minute per IP
+async def forgot_password(request: Request, payload: ForgotPasswordRequest = Body(...), db: Session = Depends(get_db)):
     """Generates an OTP and dispatches it via GMail for identity verification."""
-    user = db.query(models.User).filter(models.User.email == request.email).first()
+    user = db.query(models.User).filter(models.User.email == payload.email).first()
     if not user:
         # Explicitly checking for user as requested for clearer UX feedback
         raise HTTPException(
@@ -194,7 +200,7 @@ async def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(
     db.commit()
 
     try:
-        email_service.send_otp_email(user.email, otp)
+        email_service.send_otp_email(payload.email, otp)
     except Exception as e:
         print(f"[AUTH] OTP Dispatch Error: {e}")
         raise HTTPException(status_code=500, detail="Identity portal communication failed.")

@@ -13,7 +13,8 @@ from app.core.security import (
     get_current_user, 
     encrypt_token, 
     verify_password, 
-    get_password_hash
+    get_password_hash,
+    revoke_sessions
 )
 from app.core.token_service import TokenService
 from app.core.email_service import email_service
@@ -251,6 +252,9 @@ async def reset_password(request: ResetPasswordRequest, db: Session = Depends(ge
     user.otp_code = None # Invalidate OTP after success
     user.otp_expiry = None
     db.commit()
+    
+    # Dispatch Kill-Switch: Terminate all pre-existing stateless JWTs globally
+    revoke_sessions(user.id)
 
     return {"message": "Identity credentials updated. You may now initialize a secure session."}
 
@@ -443,11 +447,16 @@ async def provision_user(
         
     # Boundary Enforcement for Admins
     if current_user.role == models.UserRole.ADMIN:
+        # Dynamic Query: Fetch explicit fresh state to prevent stale JWT claim bypass
+        fresh_admin = db.query(models.User).filter(models.User.id == current_user.id).first()
+        if not fresh_admin:
+            raise HTTPException(status_code=401, detail="Administrator identity invalid.")
+            
         user_count = db.query(models.User).filter(models.User.created_by_id == current_user.id).count()
-        if user_count >= current_user.user_limit:
+        if user_count >= fresh_admin.user_limit:
             raise HTTPException(
                 status_code=400, 
-                detail=f"User provision limit reached ({current_user.user_limit}). Contact Super Admin for sector expansion."
+                detail=f"User provision limit reached ({fresh_admin.user_limit}). Contact Super Admin for sector expansion."
             )
             
     existing = db.query(models.User).filter(models.User.email == request.email).first()

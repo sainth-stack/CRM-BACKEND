@@ -47,6 +47,13 @@ def decrypt_token(encrypted_token: str) -> str:
             detail="Failed to decrypt secure token"
         )
 
+# Thread-safe in-memory O(1) Access Revocation Cache
+_ACTIVE_SECURITY_REVOCATIONS: Dict[str, int] = {}
+
+def revoke_sessions(user_id: str):
+    """Flags a user's ID to instantly terminate any pre-existing JWTs globally."""
+    _ACTIVE_SECURITY_REVOCATIONS[user_id] = int(datetime.now(UTC).timestamp())
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Generates a JWT access token for session management."""
     to_encode = data.copy()
@@ -55,7 +62,10 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     else:
         expire = datetime.now(UTC) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     
-    to_encode.update({"exp": expire})
+    to_encode.update({
+        "exp": expire,
+        "iat": int(datetime.now(UTC).timestamp())
+    })
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -63,7 +73,11 @@ def create_refresh_token(data: dict) -> str:
     """Generates a long-lived JWT refresh token for session management."""
     to_encode = data.copy()
     expire = datetime.now(UTC) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    to_encode.update({
+        "exp": expire, 
+        "type": "refresh",
+        "iat": int(datetime.now(UTC).timestamp())
+    })
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
@@ -87,6 +101,16 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
+            
+        # Enterprise Edge Defense: Instant Zero-Latency Session Revocation
+        iat = payload.get("iat")
+        if iat is not None and user_id in _ACTIVE_SECURITY_REVOCATIONS:
+            if iat < _ACTIVE_SECURITY_REVOCATIONS[user_id]:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Session terminated. Security credentials have been reset.",
+                    headers={"WWW-Authenticate": "Bearer"}
+                )
             
         role_claim = payload.get("role")
         if role_claim is None:

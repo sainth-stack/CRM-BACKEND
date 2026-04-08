@@ -834,3 +834,51 @@ def check_all_meetings_task():
 def check_all_inactivity_task():
     """Governing task: mobilizing silence sentinel for all user sectors."""
     check_inactivity_reminders_task()
+
+def sweep_stuck_campaigns_task():
+    """Resurrection Protocol: Recovers ephemeral operations lost to server restarts and memory evictions across all tenants."""
+    from app.db.database import SessionLocal
+    from app.db import models
+    import threading
+
+    print("[SENTINEL] Sweeping for ghosted background operations...")
+    db = SessionLocal()
+    try:
+        stuck_campaigns = db.query(models.Campaign).filter(
+            models.Campaign.status.in_([
+                models.CampaignStatus.RESEARCHING_USER_COMPANY,
+                models.CampaignStatus.FINDING_TARGET_COMPANIES,
+                models.CampaignStatus.FINDING_DECISION_MAKERS,
+                models.CampaignStatus.DRAFTING_EMAILS
+            ])
+        ).all()
+        
+        count = len(stuck_campaigns)
+        if count == 0:
+            print("[SENTINEL] No ghosted operations found. Memory state is pristine.")
+            return
+            
+        print(f"[SENTINEL] Discovered {count} dropped operations. Initializing resurrection sequence...")
+        
+        for campaign in stuck_campaigns:
+            # Skip expired demo users securely
+            owner = campaign.owner
+            if owner and owner.is_demo and owner.demo_expires_at:
+                if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
+                    continue
+                    
+            print(f"[RECOVERY] Resurrecting ghosted pipeline for Campaign {campaign.id} at stage: {campaign.status.name}")
+            
+            if campaign.status == models.CampaignStatus.RESEARCHING_USER_COMPANY:
+                threading.Thread(target=research_user_company_worker, args=(campaign.id,)).start()
+            elif campaign.status == models.CampaignStatus.FINDING_TARGET_COMPANIES:
+                threading.Thread(target=find_companies_worker, args=(campaign.id,)).start()
+            elif campaign.status == models.CampaignStatus.FINDING_DECISION_MAKERS:
+                threading.Thread(target=find_dms_worker, args=(campaign.id,)).start()
+            elif campaign.status == models.CampaignStatus.DRAFTING_EMAILS:
+                threading.Thread(target=draft_emails_worker, args=(campaign.id,)).start()
+                
+    except Exception as e:
+        print(f"[SENTINEL] Deep Sweeper Failure: {e}")
+    finally:
+        db.close()

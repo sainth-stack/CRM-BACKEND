@@ -21,6 +21,11 @@ scheduler.add_job(check_all_inactivity_task, 'interval', hours=1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("[SYSTEM] Booting up and sweeping for ghosted campaigns...")
+    from app.workers import sweep_stuck_campaigns_task
+    import threading
+    threading.Thread(target=sweep_stuck_campaigns_task).start()
+    
     print("[SYSTEM] Starting Background Scheduler...")
     scheduler.start()
     yield
@@ -64,6 +69,15 @@ class CampaignResponse(BaseModel):
 class BatchDeleteRequest(BaseModel):
     campaign_ids: list[str]
 
+def get_visibility_filter(db: Session, current_user: models.User):
+    """Enforces the Zero-Trust multi-tenant data isolation boundary."""
+    if current_user.role == models.UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Sovereign authority cannot access localized operational data.")
+    elif current_user.role == models.UserRole.ADMIN:
+        target_user_ids = db.query(models.User.id).filter(models.User.created_by_id == current_user.id)
+        return models.Campaign.user_id.in_(target_user_ids)
+    return models.Campaign.user_id == current_user.id
+
 @app.get("/health/email")
 def email_health_check():
     """Diagnostic: verify Gmail OAuth config on Render."""
@@ -84,6 +98,10 @@ def create_campaign(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+    # Hierarchy boundary: Only localized operators can initialize executions
+    if current_user.role != models.UserRole.USER:
+        raise HTTPException(status_code=403, detail="Only Localized Users can mobilize new campaigns.")
+
     # Tactical Limit Enforcement for Demo Identities (Permanent Lock)
     if current_user.is_demo:
         # We use a persistent sentinel to ensure deletion doesn't reset the quota
@@ -109,9 +127,18 @@ def create_campaign(
     
     # Commit quota consumption for Demo Users
     if current_user.is_demo:
-        db.query(models.User).filter(models.User.id == current_user.id).update(
-            {"has_used_trial_quota": True}
-        )
+        # Atomic lock constraint: Prevents multi-click race conditions entirely
+        updated_rows = db.query(models.User).filter(
+            models.User.id == current_user.id,
+            models.User.has_used_trial_quota.in_([False, None])
+        ).update({"has_used_trial_quota": True}, synchronize_session=False)
+        
+        if updated_rows == 0:
+            db.rollback()
+            raise HTTPException(
+                status_code=429, 
+                detail="Deployment Lock: Your 1-campaign entitlement has been strictly enforced. Simultaneous operation intercepted."
+            )
     
     # 2. Instantly persist Mission Origin
     intel = models.UserCompanyIntel(
@@ -134,9 +161,9 @@ def list_campaigns(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    # Strictly filter by user_id
+    # Enforce Hierarchical Visibility Filter
     db_campaigns = db.query(models.Campaign).filter(
-        models.Campaign.user_id == current_user.id
+        get_visibility_filter(db, current_user)
     ).order_by(models.Campaign.created_at.desc()).all()
     results = []
     for campaign in db_campaigns:
@@ -157,10 +184,10 @@ def delete_campaign(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    # Isolation: User can only delete their own campaign
+    # Isolation: Apply Zero-Trust boundary
     db_campaign = db.query(models.Campaign).filter(
         models.Campaign.id == campaign_id,
-        models.Campaign.user_id == current_user.id
+        get_visibility_filter(db, current_user)
     ).first()
     if not db_campaign:
         raise HTTPException(status_code=404, detail="Campaign not found or access denied")
@@ -179,7 +206,7 @@ def update_campaign_status(
 ):
     db_campaign = db.query(models.Campaign).filter(
         models.Campaign.id == campaign_id,
-        models.Campaign.user_id == current_user.id
+        get_visibility_filter(db, current_user)
     ).first()
     if not db_campaign:
         raise HTTPException(status_code=404, detail="Campaign not found or access denied")
@@ -202,20 +229,20 @@ def batch_delete_campaigns(
     current_user: models.User = Depends(get_current_user)
 ):
     campaign_ids = request.campaign_ids
-    # Multi-tenant policy: only delete campaigns owned by current_user
+    # Multi-tenant policy: hierarchical batch isolation
     campaigns_to_delete = db.query(models.Campaign).filter(
         models.Campaign.id.in_(campaign_ids),
-        models.Campaign.user_id == current_user.id
+        get_visibility_filter(db, current_user)
     ).all()
     
     count = len(campaigns_to_delete)
     if count == 0:
         return {"message": "No campaigns identified for decommission within your sector."}
 
-    # Bulk deletion with ownership check
+    # Bulk deletion with hierarchical boundary check
     db.query(models.Campaign).filter(
         models.Campaign.id.in_(campaign_ids),
-        models.Campaign.user_id == current_user.id
+        get_visibility_filter(db, current_user)
     ).delete(synchronize_session=False)
     db.commit()
     return {"message": f"Successfully decommissioned {count} campaigns from your intelligence sector."}
@@ -228,7 +255,7 @@ def get_campaign(
 ):
     db_campaign = db.query(models.Campaign).filter(
         models.Campaign.id == campaign_id,
-        models.Campaign.user_id == current_user.id
+        get_visibility_filter(db, current_user)
     ).first()
     if not db_campaign:
         raise HTTPException(status_code=404, detail="Campaign not found in your intelligence sector")
@@ -292,8 +319,17 @@ class DraftUpdate(BaseModel):
     email: str
 
 @app.patch("/drafts/{draft_id}")
-def update_draft(draft_id: str, update: DraftUpdate, db: Session = Depends(get_db)):
-    db_draft = db.query(models.EmailDraft).filter(models.EmailDraft.id == draft_id).first()
+def update_draft(
+    draft_id: str, 
+    update: DraftUpdate, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    # Sector Query Boundary: Ensure draft belongs to a campaign governed by the actor
+    db_draft = db.query(models.EmailDraft).join(models.Campaign).filter(
+        models.EmailDraft.id == draft_id,
+        get_visibility_filter(db, current_user)
+    ).first()
     if not db_draft:
         raise HTTPException(status_code=404, detail="Draft not found")
     
@@ -307,8 +343,16 @@ def update_draft(draft_id: str, update: DraftUpdate, db: Session = Depends(get_d
     return {"message": "Draft updated successfully"}
 
 @app.post("/drafts/{draft_id}/send")
-def send_draft(draft_id: str, db: Session = Depends(get_db)):
-    db_draft = db.query(models.EmailDraft).filter(models.EmailDraft.id == draft_id).first()
+def send_draft(
+    draft_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    # Sector Query Boundary: Hard IDOR prevention & Hierarchical Trust
+    db_draft = db.query(models.EmailDraft).join(models.Campaign).filter(
+        models.EmailDraft.id == draft_id,
+        get_visibility_filter(db, current_user)
+    ).first()
     if not db_draft:
         raise HTTPException(status_code=404, detail="Email engagement protocol not found.")
     
@@ -384,8 +428,16 @@ def send_draft(draft_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Tactical deployment failed: {str(e)}")
 
 @app.get("/prospects/{dm_id}")
-def get_prospect_details(dm_id: str, db: Session = Depends(get_db)):
-    dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
+def get_prospect_details(
+    dm_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    # Sector Query Boundary: Guarantee hierarchical relationship ownership
+    dm = db.query(models.DecisionMaker).join(models.Campaign).filter(
+        models.DecisionMaker.id == dm_id,
+        get_visibility_filter(db, current_user)
+    ).first()
     if not dm:
         raise HTTPException(status_code=404, detail="Stakeholder not found")
     

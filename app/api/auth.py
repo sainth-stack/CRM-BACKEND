@@ -49,8 +49,18 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Issue internal JWT session
-    access_token = create_access_token(data={"sub": user.id, "email": user.email})
+    # Issue Internal Stateless Session (Fat JWT Payload)
+    access_token = create_access_token(data={
+        "sub": user.id, 
+        "email": user.email,
+        "role": user.role.value,
+        "created_by_id": user.created_by_id,
+        "user_limit": user.user_limit,
+        "is_demo": user.is_demo,
+        "demo_expires_at": user.demo_expires_at.isoformat() if user.demo_expires_at else None,
+        "has_used_trial_quota": user.has_used_trial_quota,
+        "provider": user.provider
+    })
     refresh_token = create_refresh_token(data={"sub": user.id})
 
     return {
@@ -132,8 +142,18 @@ async def verify_demo_otp(request: VerifyOTPRequest, db: Session = Depends(get_d
     user.otp_expiry = None
     db.commit()
     
-    # Issue initial session
-    access_token = create_access_token(data={"sub": user.id, "email": user.email})
+    # Issue initial session (Stateless Structure)
+    access_token = create_access_token(data={
+        "sub": user.id, 
+        "email": user.email,
+        "role": user.role.value,
+        "created_by_id": user.created_by_id,
+        "user_limit": user.user_limit,
+        "is_demo": user.is_demo,
+        "demo_expires_at": user.demo_expires_at.isoformat() if user.demo_expires_at else None,
+        "has_used_trial_quota": user.has_used_trial_quota,
+        "provider": user.provider
+    })
     refresh_token = create_refresh_token(data={"sub": user.id})
     
     return {

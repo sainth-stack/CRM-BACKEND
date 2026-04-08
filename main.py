@@ -109,7 +109,9 @@ def create_campaign(
     
     # Commit quota consumption for Demo Users
     if current_user.is_demo:
-        current_user.has_used_trial_quota = True
+        db.query(models.User).filter(models.User.id == current_user.id).update(
+            {"has_used_trial_quota": True}
+        )
     
     # 2. Instantly persist Mission Origin
     intel = models.UserCompanyIntel(

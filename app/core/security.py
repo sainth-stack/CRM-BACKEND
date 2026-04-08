@@ -87,11 +87,30 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
+            
+        role_claim = payload.get("role")
+        if role_claim is None:
+            # Fallback for legacy simple-tokens
+            user = db.query(models.User).filter(models.User.id == user_id).first()
+            if user is None:
+                raise credentials_exception
+        else:
+            # Fully Stateless Synthetic Identity Resolution
+            user = models.User(
+                id=user_id,
+                email=payload.get("email"),
+                role=models.UserRole(role_claim),
+                created_by_id=payload.get("created_by_id"),
+                user_limit=payload.get("user_limit", 0),
+                is_demo=payload.get("is_demo", False),
+                has_used_trial_quota=payload.get("has_used_trial_quota", False),
+                provider=payload.get("provider")
+            )
+            demo_expires_at_str = payload.get("demo_expires_at")
+            if demo_expires_at_str:
+                user.demo_expires_at = datetime.fromisoformat(demo_expires_at_str)
+                
     except jwt.PyJWTError:
-        raise credentials_exception
-
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if user is None:
         raise credentials_exception
 
     # Tactical Boundary Enforcement: Demo Identity Expiry Gate

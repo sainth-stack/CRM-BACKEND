@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Body, Request
+import os
+from fastapi import APIRouter, Depends, HTTPException, status, Body, Request, Query
 from sqlalchemy.orm import Session
 from typing import Dict, Any
 from pydantic import BaseModel, EmailStr
@@ -18,13 +19,15 @@ from app.core.security import (
 )
 from app.core.token_service import TokenService
 from app.core.email_service import email_service
+from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from app.core.logging_config import logger
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 # Module-level limiter (shares state with main app via Redis)
-limiter = Limiter(key_func=get_remote_address)
+limiter = Limiter(key_func=get_remote_address, storage_uri=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
 class LoginRequest(BaseModel):
     email: str
@@ -81,6 +84,7 @@ async def login(request: Request, credentials: LoginRequest = Body(...), db: Ses
     }
 
 @router.post("/manual-add-user")
+@limiter.limit("5/minute")
 async def manual_add_user(request: LoginRequest, db: Session = Depends(get_db)):
     """
     Direct Identity Provisioning.
@@ -129,6 +133,8 @@ async def demo_signup(request: Request, credentials: LoginRequest = Body(...), d
     db.add(user)
     db.commit()
     
+    try:
+        email_service.send_verification_email(user.email, otp)
     except Exception as e:
         logger.error(f"[DEMO] Identity verification dispatch failure: {e}")
         # In production, we might want to log this but continue
@@ -179,10 +185,7 @@ async def verify_demo_otp(request: VerifyOTPRequest, db: Session = Depends(get_d
         }
     }
 
-import random
-import datetime
-from datetime import UTC, timedelta
-from app.core.email_service import email_service
+
 
 class ForgotPasswordRequest(BaseModel):
     email: str
@@ -208,6 +211,8 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest = Bod
     user.otp_expiry = datetime.datetime.now(UTC) + timedelta(minutes=10)
     db.commit()
 
+    try:
+        email_service.send_verification_email(user.email, otp)
     except Exception as e:
         logger.error(f"[AUTH] Identity verification dispatch failure: {e}")
         raise HTTPException(status_code=500, detail="Identity portal communication failed.")
@@ -219,6 +224,7 @@ class VerifyOTPRequest(BaseModel):
     otp: str
 
 @router.post("/verify-otp")
+@limiter.limit("10/minute")
 async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
     """
     Verification Coordinate Validation.
@@ -244,6 +250,7 @@ class ResetPasswordRequest(BaseModel):
     reset_token: str
 
 @router.post("/reset-password")
+@limiter.limit("10/minute")
 async def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
     """
     Cryptographic Credential Restoration.
@@ -470,6 +477,7 @@ class UserProvisionRequest(BaseModel):
     password: str
 
 @router.post("/management/users")
+@limiter.limit("5/minute")
 async def provision_user(
     request: UserProvisionRequest, 
     db: Session = Depends(get_db),
@@ -541,23 +549,31 @@ async def provision_user(
     }
 
 @router.get("/management/users")
+@limiter.limit("15/minute")
 async def list_managed_users(
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Results per page")
 ):
     """
     Operational Sector Audit.
-    Retrieves a listing of all User identities active within the Administrator's jurisdiction.
+    Retrieves a paginated listing of all User identities active within the Administrator's jurisdiction.
+    Enforces strict hierarchical boundaries and memory-safe pagination.
     """
     if current_user.role not in [models.UserRole.ADMIN, models.UserRole.SUPER_ADMIN]:
         raise HTTPException(status_code=403, detail="Administrative authority required.")
         
-    # Filter by creator if not Super Admin
+    # Boundary Enforcement: Filter by creator if not Super Admin
     query = db.query(models.User).filter(models.User.role == models.UserRole.USER)
     if current_user.role == models.UserRole.ADMIN:
         query = query.filter(models.User.created_by_id == current_user.id)
-        
-    users = query.all()
+    
+    # Mathematical Offset Calculation
+    total = query.count()
+    skip = (page - 1) * page_size
+    users = query.order_by(models.User.created_at.desc()).offset(skip).limit(page_size).all()
+    
     result = []
     for u in users:
         # Metrics: Campaign Activity
@@ -569,9 +585,17 @@ async def list_managed_users(
             "is_demo": u.is_demo,
             "created_at": u.created_at
         })
-    return result
+
+    return {
+        "users": result,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size if total > 0 else 0
+    }
 
 @router.delete("/management/users/{user_id}")
+@limiter.limit("5/minute")
 async def decommission_user(
     user_id: str,
     db: Session = Depends(get_db),

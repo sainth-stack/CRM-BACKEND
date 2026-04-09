@@ -133,7 +133,10 @@ def email_health_check():
     }
     return {"config": config_status, "mode": "STRICT_GMAIL_NATIVE"}
 
+from app.core.sanitizer import sanitize_text
+
 @app.post("/campaigns", response_model=CampaignResponse)
+@limiter.limit("5/minute")
 def create_campaign(
     campaign: CampaignCreate, 
     background_tasks: BackgroundTasks, 
@@ -143,11 +146,18 @@ def create_campaign(
     """
     Campaign Mobilization Protocol.
     Initializes a new outreach campaign, validates target parameters, and triggers the autonomous research cluster.
+    Input parameters are normalized via the Sanitization Engine to mitigate injection risks.
     """
     # Hierarchy boundary: Only localized operators can initialize executions
     if current_user.role != models.UserRole.USER:
         raise HTTPException(status_code=403, detail="Only Localized Users can mobilize new campaigns.")
 
+    # 0. High-Fidelity Input Sanitization
+    sanitized_name = sanitize_text(campaign.name, max_length=100)
+    sanitized_industry = sanitize_text(campaign.target_industry, max_length=200)
+    sanitized_location = sanitize_text(campaign.target_location, max_length=200)
+    sanitized_emp_count = sanitize_text(campaign.target_employee_count, max_length=50) if campaign.target_employee_count else None
+    
     # Tactical Limit Enforcement for Demo Identities (Permanent Lock)
     if current_user.is_demo:
         # We use a persistent sentinel to ensure deletion doesn't reset the quota
@@ -162,11 +172,11 @@ def create_campaign(
     new_campaign = models.Campaign(
         id=campaign_id,
         user_id=current_user.id,
-        name=campaign.name,
-        user_query=campaign.query,
-        target_industry=campaign.target_industry,
-        target_location=campaign.target_location,
-        target_employee_count=campaign.target_employee_count,
+        name=sanitized_name,
+        user_query=sanitize_text(campaign.query, max_length=500),
+        target_industry=sanitized_industry,
+        target_location=sanitized_location,
+        target_employee_count=sanitized_emp_count,
         status=models.CampaignStatus.RESEARCHING_USER_COMPANY
     )
     db.add(new_campaign)
@@ -267,6 +277,7 @@ def delete_campaign(
 
 @app.patch("/campaigns/{campaign_id}/status", response_model=CampaignResponse)
 @app.put("/campaigns/{campaign_id}/status", response_model=CampaignResponse)
+@limiter.limit("15/minute")
 def update_campaign_status(
     campaign_id: str, 
     status: str = Query(..., alias="status"), 
@@ -434,6 +445,7 @@ def update_draft(
     return {"message": "Draft updated successfully"}
 
 @app.post("/drafts/{draft_id}/send")
+@limiter.limit("10/minute")
 def send_draft(
     draft_id: str, 
     db: Session = Depends(get_db),

@@ -5,6 +5,7 @@ from langchain_core.prompts import ChatPromptTemplate
 import os
 from dotenv import load_dotenv
 from app.core.logging_config import logger
+from app.core.sanitizer import sanitize_for_llm
 
 load_dotenv()
 
@@ -59,8 +60,9 @@ def extract_schedule_info(reply_text: str, current_date: str, location_context: 
     
     try:
         logger.info("[DISCOVERY] Extracting scheduling coordinates from prospect reply...")
+        safe_reply = sanitize_for_llm(reply_text, context_limit=2000)
         extraction = chain.invoke({
-            "reply_text": reply_text, 
+            "reply_text": safe_reply, 
             "current_date": current_date,
             "location_context": location_context
         })
@@ -116,6 +118,7 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
     
     try:
         logger.info(f"[DISCOVERY] Synthesizing strategic discovery response for {dm_name} at {target_company}...")
+        safe_interest = sanitize_for_llm(last_interest, context_limit=3000)
         response = chain.invoke({
             "user_company_name": user_intel.get("name", ""),
             "user_company_offerings": user_intel.get("offerings", ""),
@@ -123,7 +126,7 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
             "dm_name": dm_name,
             "dm_position": dm_position,
             "target_company": target_company,
-            "last_interest_context": last_interest,
+            "last_interest_context": safe_interest,
             "booking_context": booking_context,
             "narrative_instruction": narrative_instruction
         })

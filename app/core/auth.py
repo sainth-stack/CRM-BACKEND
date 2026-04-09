@@ -1,4 +1,5 @@
 import os
+from app.core.logging_config import logger
 import requests
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, status
@@ -96,9 +97,7 @@ class GoogleAuthService:
             # The refresh token is only emitted if access_type was "offline" 
             # and it's the first time or prompt=consent was used.
             if not credentials.refresh_token:
-                # We can't persist the mailbox without a refresh token
-                # In production, we'd prompt the user to re-authenticate with prompt=consent
-                pass 
+                logger.warning(f"[AUTH] Critical Intelligence Gap: Refresh token missing for {target_redirect}. Long-term accessibility limited.")
 
             user_info_response = requests.get(
                 "https://www.googleapis.com/oauth2/v3/userinfo",
@@ -112,9 +111,7 @@ class GoogleAuthService:
                 "access_token": credentials.token # Temporary access
             }
         except Exception as e:
-             print(f"[REJECTED] Mailbox Connection Exchange Failed: {str(e)}")
-             import traceback
-             traceback.print_exc()
+             logger.error(f"[REJECTED] Mailbox Connection Exchange Failed: {e}", exc_info=True)
              raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to exchange mailbox access code: {str(e)}"

@@ -22,7 +22,11 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 # Configuration from environment variables
-SECRET_KEY = os.getenv("JWT_SECRET", "super-secret-key-change-me-in-prod")
+SECRET_KEY = os.getenv("JWT_SECRET")
+if not SECRET_KEY:
+    logger.error("Security Infrastructure Failure: 'JWT_SECRET' not identified in environment.")
+    raise RuntimeError("Security Infrastructure Failure: 'JWT_SECRET' environment variable is required.")
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 24 hours
 REFRESH_TOKEN_EXPIRE_DAYS = 7
@@ -30,9 +34,8 @@ REFRESH_TOKEN_EXPIRE_DAYS = 7
 # Encryption setup for persistent OAuth refresh tokens
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 if not ENCRYPTION_KEY:
-    # In development, we generate one, but it MUST be set in production
-    ENCRYPTION_KEY = Fernet.generate_key().decode()
-    logger.warning(f"[SECURITY] ENCRYPTION_KEY not set. Using temporary key: {ENCRYPTION_KEY}")
+    logger.error("Security Infrastructure Failure: 'ENCRYPTION_KEY' not identified in environment.")
+    raise RuntimeError("Security Infrastructure Failure: 'ENCRYPTION_KEY' environment variable is required for persistent token security.")
 
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 

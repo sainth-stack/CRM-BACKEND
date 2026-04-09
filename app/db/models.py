@@ -124,7 +124,8 @@ class TargetCompany(Base):
     contact_email = Column(String)
     contact_number = Column(String)
     deep_research = Column(Text)
-    similarity_score = Column(JSON) # Store score and reasoning
+    relevance_score = Column(Integer, default=0, index=True) # Anchored numeric quality index
+    relevance_explanation = Column(Text, nullable=True) # Strategic reasoning for the score
     rejection_reason = Column(Text, nullable=True)
     status = Column(String, default="ACTIVE", index=True) # NEW, ACTIVE, DISCOVERY_CALL, TERMINATED, REJECTED
     
@@ -142,7 +143,8 @@ class DecisionMaker(Base):
     email = Column(String)
     reply_intent = Column(String, nullable=True) # POSITIVE, NEUTRAL, NEGATIVE
     linkedin = Column(String)
-    similarity_score = Column(JSON) # Store score and reasoning
+    relevance_score = Column(Integer, default=0, index=True) # Operational lead quality score
+    relevance_explanation = Column(Text, nullable=True) # Agentic reasoning for coordinate selection
     hubspot_id = Column(String, nullable=True)
     status = Column(String, default="NEW", index=True) # NEW, SYNCED, DRAFTED, INITIAL_SENT, FOLLOWUP_X_SENT, DISCOVERY_CALL, TERMINATED
     followup_count = Column(Integer, default=0)

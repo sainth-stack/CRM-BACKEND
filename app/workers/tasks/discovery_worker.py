@@ -31,6 +31,7 @@ def find_companies_worker(self, campaign_id: str):
     """
     Phase 2a: Target Company Discovery Cluster.
     Executes deep web research to identify companies matching the campaign's ideal customer profile (ICP).
+    Uses high-performance batch writes to stabilize the database during large discovery missions.
     """
     db = SessionLocal()
     try:
@@ -39,7 +40,6 @@ def find_companies_worker(self, campaign_id: str):
             logger.warning(f"Aborting Company Discovery: Campaign {campaign_id} not found.")
             return
 
-        # Temporal Boundary Check: Security gate for demo accounts
         owner = campaign.owner
         if owner and owner.is_demo and owner.demo_expires_at:
             if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
@@ -64,8 +64,18 @@ def find_companies_worker(self, campaign_id: str):
         except:
             offerings_list = [user_intel.offerings]
 
-        # Incremental Store: Commit each company as it is found for real-time UI updates
+        # PERFORMANCE & IDEMPOTENCY: Anchored Identity Resolution
+        existing_domains = {c.domain.lower() if c.domain else "" for c in db.query(models.TargetCompany).filter(models.TargetCompany.campaign_id == campaign_id).all()}
+        discovered_entities = []
+        
         for co in find_target_companies(criteria, offerings_list):
+            domain = (co.get("domain") or "").lower()
+            
+            # Idempotency Guard: Skip redundant entities already secured for this specific campaign
+            if domain and domain in existing_domains:
+                logger.debug(f"[IDEMPOTENCY] Skipping {co.get('name')} - Domain {domain} already exists for campaign {campaign_id}")
+                continue
+
             score = co.get("similarity_score", 0)
             status = co.get("status", "REJECTED")
 
@@ -81,19 +91,33 @@ def find_companies_worker(self, campaign_id: str):
                 contact_email="N/A",
                 contact_number="N/A",
                 deep_research=co.get("deep_research"),
-                similarity_score={"score": score, "reason": co.get("score_reason", "")},
+                relevance_score=score,
+                relevance_explanation=co.get("score_reason", ""),
                 rejection_reason=co.get("rejection_reason"),
                 status=status
             )
-            db.add(new_co)
-            db.commit()
-            logger.info(f"Incremental Discovery: Saved {co.get('name')} ({status} | Score: {score})")
+            discovered_entities.append(new_co)
+            if domain: existing_domains.add(domain) # Prevent duplicates within the same research batch
 
-        # Advance pipeline to DM finding
+        if discovered_entities:
+            # Heartbeat Integrity Gate: Verify campaign still exists before committing
+            if not db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first():
+                logger.warning(f"[MISSION ABORTED] Campaign {campaign_id} deleted during research cycle. Discarding company discovery results.")
+                return
+            
+            db.add_all(discovered_entities)
+            db.commit()
+            logger.info(f"[MISSION CONTROL] Performance Success: Batch committed {len(discovered_entities)} companies for campaign {campaign_id}")
+
+        # Final Heartbeat Integrity Check before advancing pipeline
+        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        if not campaign:
+            logger.warning(f"[MISSION ABORTED] Campaign {campaign_id} lost during discovery synchronization.")
+            return
+
         campaign.status = models.CampaignStatus.FINDING_DECISION_MAKERS
         db.commit()
         find_dms_worker.delay(campaign_id)
-        logger.info(f"[MISSION CONTROL] Company Discovery Complete for {campaign_id}. Dispatched Stakeholder Identification.")
     except Exception as e:
         logger.error(f"Operational Failure in Company Discovery for {campaign_id}: {e}", exc_info=True)
         db.rollback()
@@ -101,12 +125,12 @@ def find_companies_worker(self, campaign_id: str):
     finally:
         db.close()
 
-
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def find_dms_worker(self, campaign_id: str):
     """
     Phase 2b: Stakeholder Identification Cluster.
     Pinpoints key decision-makers within discovered companies and synchronizes results with HubSpot.
+    Optimized for high-throughput with single-transaction commits across all identified entities.
     """
     logger.info(f"[MISSION CONTROL] Transition: Initiating Stakeholder Discovery for {campaign_id}")
     db = SessionLocal()
@@ -116,7 +140,6 @@ def find_dms_worker(self, campaign_id: str):
             logger.warning(f"Aborting DM Finder: Campaign {campaign_id} not found.")
             return
 
-        # Temporal Boundary Check
         owner = campaign.owner
         if owner and owner.is_demo and owner.demo_expires_at:
             if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
@@ -130,62 +153,87 @@ def find_dms_worker(self, campaign_id: str):
 
         if not target_cos:
             logger.info(f"[MISSION CONTROL] No NEW companies found for {campaign_id}. Advancing to Outreach phase.")
-            campaign.status = models.CampaignStatus.DRAFTING_EMAILS
-            db.commit()
-            from app.workers.tasks.ghostwriter_worker import draft_emails_worker
-            draft_emails_worker.delay(campaign_id)
+            
+            # Re-verify campaign before status update
+            campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+            if campaign:
+                campaign.status = models.CampaignStatus.DRAFTING_EMAILS
+                db.commit()
+                from app.workers.tasks.ghostwriter_worker import draft_emails_worker
+                draft_emails_worker.delay(campaign_id)
             return
 
         logger.info(f"[MISSION CONTROL] Processing {len(target_cos)} target entities for stakeholder identification.")
 
+        # IDEMPOTENCY: Identity Anchor Recovery
+        existing_dm_identifiers = {
+            (dm.target_company_id, dm.name.lower()) 
+            for dm in db.query(models.DecisionMaker).filter(models.DecisionMaker.campaign_id == campaign_id).all()
+        }
+
+        all_new_dms = []
         for co in target_cos:
             try:
                 logger.debug(f"[DM FINDER] Identifying stakeholders at {co.name}")
                 dms = find_decision_makers(co.name, co.location)
 
-                with SessionLocal() as local_db:
-                    saved_count = 0
-                    for dm in dms:
-                        score = dm.get("similarity_score", 0)
-                        if score >= 70:
-                            new_dm = models.DecisionMaker(
-                                campaign_id=campaign_id,
-                                target_company_id=co.id,
-                                name=dm.get("name"),
-                                position=dm.get("position"),
-                                linkedin=dm.get("linkedin"),
-                                similarity_score={"score": score, "reason": dm.get("score_reason", "")},
-                                status="NEW"
-                            )
-                            local_db.add(new_dm)
-                            local_db.flush()
+                for dm in dms:
+                    dm_name = dm.get("name") or "Unknown"
+                    identifier = (co.id, dm_name.lower())
+                    
+                    if identifier in existing_dm_identifiers:
+                        logger.debug(f"[IDEMPOTENCY] Skipping DM {dm_name} at {co.name} - Identity already secured.")
+                        continue
 
-                            email = predict_prospect_email(dm.get("name"), co.domain)
-                            new_dm.email = email
+                    score = dm.get("similarity_score", 0)
+                    if score >= 70:
+                        new_dm = models.DecisionMaker(
+                            campaign_id=campaign_id,
+                            target_company_id=co.id,
+                            name=dm_name,
+                            position=dm.get("position"),
+                            linkedin=dm.get("linkedin"),
+                            relevance_score=score,
+                            relevance_explanation=dm.get("score_reason", ""),
+                            status="NEW"
+                        )
+                        email = predict_prospect_email(dm_name, co.domain)
+                        new_dm.email = email
 
-                            try:
-                                hs_id = hubspot_provider.create_lead(dm, co.name, email=email)
-                                if hs_id:
-                                    new_dm.hubspot_id = hs_id
-                                    new_dm.status = "SYNCED"
-                            except Exception as hs_e:
-                                logger.error(f"HubSpot Sync Error for {dm.get('name')}: {hs_e}")
+                        # External CRM Synchronization (Managed per-entry for error isolation)
+                        try:
+                            hs_id = hubspot_provider.create_lead(dm, co.name, email=email)
+                            if hs_id:
+                                new_dm.hubspot_id = hs_id
+                                new_dm.status = "SYNCED"
+                        except Exception as hs_e:
+                            logger.error(f"HubSpot Sync Error for {dm_name}: {hs_e}")
 
-                            saved_count += 1
-
-                    local_db.commit()
-                    logger.info(f"[DM FINDER] Secured {saved_count} validated stakeholders for {co.name}.")
+                        all_new_dms.append(new_dm)
+                        existing_dm_identifiers.add(identifier) # Prevent duplicates within the same batch
 
                 co.status = "ACTIVE"
-                db.commit()
-
             except Exception as proc_e:
                 logger.error(f"Error processing stakeholders for company {co.name}: {proc_e}")
 
-            # Force memory cleanup during heavy agent iterations
             gc.collect()
 
-        logger.info(f"[MISSION CONTROL] DM Discovery complete for {campaign_id}. Launching Outreach Generation.")
+        if all_new_dms:
+            # Heartbeat Integrity Gate: Deletion Safety
+            if not db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first():
+                logger.warning(f"[MISSION ABORTED] Campaign {campaign_id} deleted during DM identification. Discarding batch.")
+                return
+
+            db.add_all(all_new_dms)
+            db.commit()
+            logger.info(f"[MISSION CONTROL] Successfully synchronized {len(all_new_dms)} stakeholders across {len(target_cos)} entities.")
+
+        # Atomic Status Transition Gate
+        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        if not campaign:
+            logger.warning(f"[MISSION ABORTED] Final sync failed: Campaign {campaign_id} deleted.")
+            return
+
         campaign.status = models.CampaignStatus.DRAFTING_EMAILS
         db.commit()
         from app.workers.tasks.ghostwriter_worker import draft_emails_worker

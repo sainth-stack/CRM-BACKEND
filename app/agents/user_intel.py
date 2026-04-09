@@ -7,6 +7,7 @@ import re
 import os
 from dotenv import load_dotenv
 from app.core.logging_config import logger
+from app.core.sanitizer import sanitize_html, sanitize_for_llm
 
 load_dotenv()
 
@@ -79,10 +80,7 @@ def scrape_homepage_lite(url: str):
             nav_paths = set(re.findall(r'href=["\'](/[a-zA-Z0-9\-_]+)["\']', html))
             important_paths = [p for p in nav_paths if any(k in p.lower() for k in ['course', 'project', 'hackathon', 'price', 'pricing', 'about'])]
 
-            body_text = re.sub(r'<script.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-            body_text = re.sub(r'<style.*?</style>', '', body_text, flags=re.DOTALL | re.IGNORECASE)
-            body_text = re.sub(r'<.*?>', ' ', body_text)
-            body_text = re.sub(r'\s+', ' ', body_text).strip()
+            body_text = sanitize_html(html)
             
             return {
                 "title": title,
@@ -148,9 +146,10 @@ def research_user_company(company_url: str):
     
     try:
         logger.info(f"[USER INTEL] Synchronizing intelligence for {domain}...")
+        safe_context = sanitize_for_llm(master_context, context_limit=15000)
         data = chain.invoke({
             "company_url": domain, 
-            "search_results": master_context
+            "search_results": safe_context
         })
         return data.model_dump()
     except Exception as e:

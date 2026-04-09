@@ -278,4 +278,3 @@ def find_target_companies(target_criteria: dict, user_offerings: list):
             try: yield f.result()
             except Exception as e:
                 logger.error(f"[AGENT] Async lead processing error: {e}")
-                pass

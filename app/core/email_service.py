@@ -69,23 +69,24 @@ class EmailService:
             logger.error(f"[GMAIL] API Error during outreach to {to_email}: {e}")
             raise e
 
-    def send_otp_email(self, to_email: str, otp: str):
+    def send_verification_email(self, to_email: str, otp: str):
         """
         Identity Verification Dispatch.
-        Dispatches a system-critical verification code (OTP) via the core vault credentials.
+        Dispatches a system-critical verification code (OTP) via the core vault credentials 
+        sourced from environmental synchronization (GMAIL_TOKEN_JSON).
         """
-        token_path = os.path.join(os.getcwd(), 'token.json')
-        if not os.path.exists(token_path):
-            import json
-            token_json = os.getenv("GMAIL_TOKEN_JSON")
-            if token_json:
-                data = json.loads(token_json)
-                creds = Credentials.from_authorized_user_info(data)
-            else:
-                logger.error("Identity Infrastructure Failure: System vault (token.json) not identified.")
-                raise Exception("Identity Infrastructure Failure: System vault (token.json) not identified.")
-        else:
-            creds = Credentials.from_authorized_user_file(token_path)
+        import json
+        token_json = os.getenv("GMAIL_TOKEN_JSON")
+        if not token_json:
+            logger.error("Identity Infrastructure Failure: System vault (GMAIL_TOKEN_JSON) not identified in environment.")
+            raise Exception("Identity Infrastructure Failure: System vault (GMAIL_TOKEN_JSON) not identified.")
+        
+        try:
+            data = json.loads(token_json)
+            creds = Credentials.from_authorized_user_info(data)
+        except Exception as e:
+            logger.error(f"Identity Infrastructure Failure: Failed to mobilize vault credentials: {e}")
+            raise Exception(f"Identity Infrastructure Failure: Vault synchronization compromised: {e}")
             
         subject = "Identity Verification Access Code"
         body = f"""

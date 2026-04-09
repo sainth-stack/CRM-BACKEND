@@ -6,6 +6,7 @@ from app.db.database import SessionLocal
 from app.db import models
 from app.agents.user_intel import research_user_company
 from app.workers.config.celery_app import celery_app
+from app.core.logging_config import logger
 import json
 import datetime
 from datetime import UTC
@@ -13,22 +14,30 @@ from datetime import UTC
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def research_user_company_worker(self, campaign_id: str):
-    """Phase 1: Deep user-company capability extraction."""
+    """
+    Phase 1: Deep user-company capability extraction.
+    Researches the user's base domain to build a capability model for AI-driven emails.
+    """
     db = SessionLocal()
     try:
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-        if not campaign: return
+        if not campaign:
+            logger.warning(f"Campaign {campaign_id} not found in intel worker.")
+            return
 
         # Temporal Boundary Check: Pause worker for expired trials
         owner = campaign.owner
         if owner and owner.is_demo and owner.demo_expires_at:
             if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
-                print(f"[MISSION CONTROL] Suspension: Campaign {campaign_id} owner trial expired.")
+                logger.info(f"[MISSION CONTROL] Suspension: Campaign {campaign_id} owner trial expired.")
                 return
 
         intel = campaign.user_intel
-        if not intel: return
+        if not intel:
+            logger.warning(f"No user intel profile for campaign {campaign_id}.")
+            return
 
+        logger.info(f"Starting deep research for campaign {campaign_id} on {intel.website}")
         research_data = research_user_company(intel.website)
         if research_data:
             intel.company_name = research_data.get("exact_company_name")
@@ -39,14 +48,17 @@ def research_user_company_worker(self, campaign_id: str):
             db.commit()
             check_phase_1_completion(campaign_id)
     except Exception as e:
-        print(f"User Research Error: {e}")
+        logger.error(f"User Research Critical Error for campaign {campaign_id}: {e}", exc_info=True)
         self.retry(exc=e)
     finally:
         db.close()
 
 
 def check_phase_1_completion(campaign_id: str):
-    """Synchronization Gate: Triggers Phase 2 only when deep research is validated."""
+    """
+    Synchronization Gate: Triggers Phase 2 only when deep research is validated.
+    Ensures that target company discovery only begins after high-fidelity intel is secured.
+    """
     from app.workers.tasks.discovery_worker import find_companies_worker
     db = SessionLocal()
     try:
@@ -58,14 +70,14 @@ def check_phase_1_completion(campaign_id: str):
             "Analysis pending deep synchronization.",
             "Identity verified through site architecture."
         ]:
-            print(f"[MISSION CONTROL] User Intel Phase Complete for {campaign_id}. Dispatching Redis Task.")
+            logger.info(f"[MISSION CONTROL] User Intel Phase Complete for {campaign_id}. Dispatching Discovery Cluster.")
             campaign.status = models.CampaignStatus.FINDING_TARGET_COMPANIES
             db.commit()
             find_companies_worker.delay(campaign_id)
         else:
-            print(f"[MISSION CONTROL] Intel validation failed for {campaign_id}. Halting progression.")
+            logger.info(f"[MISSION CONTROL] Intel validation failed for {campaign_id}. Halting progression.")
     except Exception as e:
         db.rollback()
-        print(f"Error in Phase 1 Gate: {e}")
+        logger.error(f"Synchronization Gate Error for campaign {campaign_id}: {e}")
     finally:
         db.close()

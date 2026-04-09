@@ -2,7 +2,9 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 import enum
+from app.core.logging_config import logger
 
+# Specialized LLM for sentiment and intent analysis
 llm = ChatOpenAI(
     model="gpt-4o-mini", 
     temperature=0,
@@ -44,16 +46,23 @@ Return only the structured intent classification.
 """
 
 def classify_reply_intent(original_email: str, prospect_reply: str) -> dict:
+    """
+    Sentiment & Intent Discovery Protocol.
+    Analyzes prospect communication to determine the optimal next step in the outreach lifecycle.
+    Classifies replies into POSITIVE (Interest), NEGATIVE (Opt-out), or NEUTRAL (Information Gap).
+    """
     structured_llm = llm.with_structured_output(IntentClassification)
     prompt = ChatPromptTemplate.from_template(INTENT_PROMPT)
     chain = prompt | structured_llm
     
     try:
+        logger.info("[INTENT] Analyzing prospect reply for sentiment signals...")
         result = chain.invoke({
             "original_email": original_email,
             "prospect_reply": prospect_reply
         })
+        logger.info(f"[INTENT] Classification complete: {result.intent}")
         return result.model_dump()
     except Exception as e:
-        print(f"Error in Intent Classification: {e}")
-        return {"intent": "NEUTRAL", "reasoning": "Fallback due to error"}
+        logger.error(f"[INTENT] Critical classification error: {e}")
+        return {"intent": "NEUTRAL", "reasoning": "Fallback due to operational error"}

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from app.core.logging_config import logger
 
 # LangChain / OpenAI
 from langchain_openai import ChatOpenAI
@@ -48,6 +49,11 @@ class DeduplicationResult(BaseModel):
 # --- PIPELINE COMPONENTS ---
 
 class CompanyFinderPipeline:
+    """
+    Intelligence Discovery Cluster: Company Identification.
+    Orchestrates search reconnaissance, deduplication, deep research, and AI-driven validation
+    to identify high-fidelity leads within a specific industry vertical.
+    """
     def __init__(self):
         self.llm = ChatOpenAI(
             model="gpt-4o-mini", 
@@ -62,36 +68,46 @@ class CompanyFinderPipeline:
             self.tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
         except ImportError:
             self.tavily = None
+            logger.debug("[PIPELINE] Tavily client initialization bypassed.")
 
     def get_domain(self, url: str) -> str:
+        """Extracts the normalized corporate domain from a URL for identity tracking."""
         try:
             if not url or url == "unknown" or "linkedin.com" in url: return "unknown"
             parsed = urlparse(url)
             domain = parsed.netloc or parsed.path.split('/')[0]
             domain = domain[4:] if domain.startswith("www.") else domain
             return domain.lower()
-        except: return "unknown"
+        except Exception: return "unknown"
 
     def sanitize_landing_page(self, url: str) -> str:
+        """Normalizes a raw landing page URL to its primary corporate root."""
         try:
             if not url or url == "unknown": return "unknown"
             parsed = urlparse(url)
             if not parsed.scheme: url = "https://" + url; parsed = urlparse(url)
             return f"{parsed.scheme}://{parsed.netloc}"
-        except: return url
+        except Exception: return url
 
     def fetch_zenserp_page(self, query: str, page: int, headers: dict) -> list:
+        """Executes a paginated SERP request via the Zenserp API gateway."""
         params = {"q": query, "num": 10, "start": page * 10, "engine": "google"}
         try:
             response = requests.get('https://app.zenserp.com/api/v2/search', headers=headers, params=params, timeout=10)
             response.raise_for_status()
             return response.json().get("organic", [])
-        except: return []
+        except Exception as e:
+            logger.debug(f"[ZENSERP] Page {page} fetch error: {e}")
+            return []
 
     def stage_1_recon(self, industry: str, location: str, size: str) -> list:
+        """
+        Phase 1: Search Reconnaissance.
+        Mobilizes multi-threaded search queries to gather raw LinkedIn company snapshots.
+        """
         query = f'site:linkedin.com/company "{industry}" "{location}"'
         if size: query += f' "{size}"'
-        print(f" [Pipeline] Stage 1: Parallel Zenserp Recon for '{query}'")
+        logger.info(f"[PIPELINE] Stage 1: Parallel Zenserp Recon for query sector '{query}'")
         all_results = []
         headers = {"apikey": ZENSERP_API_KEY} if ZENSERP_API_KEY else {}
         with ThreadPoolExecutor(max_workers=3) as executor:
@@ -101,8 +117,12 @@ class CompanyFinderPipeline:
         return all_results
 
     def stage_2_dedup(self, raw_results: list) -> List[DeduplicatedCompany]:
+        """
+        Phase 2: Entity Deduplication.
+        Uses AI-driven auditing to filter out search aggregators and normalize unique company brand identities.
+        """
         if not raw_results: return []
-        print(f" [Pipeline] Stage 2: Deduplicating {len(raw_results)} snippets...")
+        logger.info(f"[PIPELINE] Stage 2: Deduplicating {len(raw_results)} snippets into unique identities...")
         structured_llm = self.llm.with_structured_output(DeduplicationResult)
         sys_prompt = """You are a Lead Integrity Auditor. 
 1. Use the provided search snippets to identify ALL unique companies. 
@@ -113,26 +133,31 @@ class CompanyFinderPipeline:
         try:
             return structured_llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=json.dumps(raw_results, indent=2))]).companies
         except Exception as e:
-            print(f" [Pipeline] Dedup Error: {e}")
+            logger.error(f"[PIPELINE] Deduplication audit critical failure: {e}")
             return []
 
     def execute_advanced_search(self, query: str) -> list:
-        """Helper to run a deep Tavily search concurrently."""
+        """Executes a high-fidelity deep research query via the Tavily cluster."""
         try:
             if not self.tavily: return []
             resp = self.tavily.search(query=query, search_depth="advanced", max_results=5)
             return resp.get('results', [])
-        except: return []
+        except Exception as e:
+            logger.debug(f"[TAVILY] Supplemental search error: {e}")
+            return []
 
     def stage_3_research_one(self, company_name: str, location: str) -> dict:
-        """Dual-Stream Parallel Research: Identity + Intent."""
-        print(f" [Pipeline] Deep Research: {company_name}...")
+        """
+        Phase 3: Deep Identity & Intent Research.
+        Mobilizes dual-stream parallel searches to establish corporate identity and operational intent.
+        """
+        logger.info(f"[PIPELINE] Deep Research: Establishing intelligence for {company_name}...")
         
         identity_results = []
         intent_results = []
         site = "unknown"
         
-        # NESTED PARALLELIZATION: Execute Identity and Intent searches concurrently
+        # Concurrent execution of identity and intent intelligence streams
         queries = [
             f'"{company_name}" "{location}" official website or corporate home page',
             f'"{company_name}" "{location}" Recent News Projects Challenges Growth 2024 2025'
@@ -144,7 +169,7 @@ class CompanyFinderPipeline:
             identity_results = identity_future.result()
             intent_results = intent_future.result()
 
-        # Handle Identity Lock (Website Selection)
+        # Phase 3.1: Identity Lock (Official Domain Selection)
         if identity_results:
             try:
                 identity_auditor = self.llm.with_structured_output(WebsiteExtraction)
@@ -152,8 +177,9 @@ class CompanyFinderPipeline:
                 selection = identity_auditor.invoke([SystemMessage(content=audit_prompt), HumanMessage(content=json.dumps(identity_results, indent=2))])
                 if selection and selection.official_url:
                     site = self.sanitize_landing_page(selection.official_url)
-                    print(f" [IDENTITY] Verified: {company_name} -> {site}")
-            except: pass
+                    logger.info(f"[IDENTITY] Verified: {company_name} -> {site}")
+            except Exception as e:
+                logger.debug(f"[IDENTITY] Domain selection error for {company_name}: {e}")
 
         return {
             "name": company_name, 
@@ -163,7 +189,10 @@ class CompanyFinderPipeline:
         }
 
     def stage_4_validate(self, industry: str, offerings: List[str], res_data: dict) -> CompanyValidation:
-        """Strategic Requirement Cross-Validation."""
+        """
+        Phase 4: Strategic Cross-Validation.
+        Audits the company against target sector definitions and user offerings to verify ROI-positive synergy.
+        """
         structured_llm = self.llm.with_structured_output(CompanyValidation)
         off_str = ", ".join(offerings)
         
@@ -179,25 +208,37 @@ MISSION:
 
 FINAL DECISION: Only is_valid_lead if Requirement Justification is strong AND they are a Primary Operator of {industry}."""
         
-        context = json.dumps(res_data.get('raw_research', [])[:8], indent=2) # Send both identity & intent data
+        context = json.dumps(res_data.get('raw_research', [])[:8], indent=2)
         msg = f"Company: {res_data['name']}\nWebsite: {res_data['website']}\nOfferings: {off_str}\nResearch:\n{context}"
         
         try:
             return structured_llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=msg)])
-        except:
-            return CompanyValidation(name=res_data['name'], is_industry_match=False, is_valid_lead=False, has_demonstrated_requirement=False, requirement_justification="Error", synergy_score=0, company_type="Sync Error", employee_count="N/A", is_offering_synergy=False, is_primary_operator=False)
+        except Exception as e:
+            logger.error(f"[PIPELINE] Validation failure for {res_data['name']}: {e}")
+            return CompanyValidation(name=res_data['name'], is_industry_match=False, is_valid_lead=False, has_demonstrated_requirement=False, requirement_justification="Sync Error", synergy_score=0, company_type="Sync Error", employee_count="N/A", is_offering_synergy=False, is_primary_operator=False)
 
     def stage_3_synthesize(self, name: str, raw_research: List[Dict]) -> str:
+        """
+        Phase 5: Intelligence Synthesis.
+        Transforms raw research artifacts into a cohesive, human-readable prose intelligence report.
+        """
         if not raw_research: return "No verifiable artifacts discovered."
         prompt = f"Transform the following research artifacts for {name} into a clean, human-readable prose intelligence report. Focus on their operational nature and potential needs."
         messages = [SystemMessage(content="Professional Intelligence Analyst."), HumanMessage(content=prompt + "\n" + json.dumps(raw_research, indent=2))]
         try:
             return self.llm.invoke(messages).content.strip()
-        except: return "Analysis pending."
+        except Exception as e:
+            logger.error(f"[PIPELINE] Intelligence synthesis failure: {e}")
+            return "Analysis pending."
 
 # --- PROD INTERFACE ---
 
 def find_target_companies(target_criteria: dict, user_offerings: list):
+    """
+    Main Orchestrator: Target Company Identification Agent.
+    Executes a multi-stage discovery pipeline to identify, research, and validate high-quality leads.
+    Yields validated candidates as they are processed.
+    """
     pipeline = CompanyFinderPipeline()
     industry = target_criteria.get("industry", "Manufacturing")
     location = target_criteria.get("location", "UK")
@@ -210,7 +251,7 @@ def find_target_companies(target_criteria: dict, user_offerings: list):
     if not unique_companies: return
 
     def process_lead(co_meta):
-        # Full Phase Parallelization
+        # Parallel Execution Cluster for Speed
         res = pipeline.stage_3_research_one(co_meta.name, location)
         val = pipeline.stage_4_validate(industry, user_offerings, res)
         syn = pipeline.stage_3_synthesize(co_meta.name, res['raw_research'])
@@ -235,4 +276,6 @@ def find_target_companies(target_criteria: dict, user_offerings: list):
         futures = {ex.submit(process_lead, c): c for c in unique_companies}
         for f in as_completed(futures):
             try: yield f.result()
-            except: pass
+            except Exception as e:
+                logger.error(f"[AGENT] Async lead processing error: {e}")
+                pass

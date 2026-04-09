@@ -9,13 +9,16 @@ from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from app.db import models
 from app.db.database import get_db
+from app.core.logging_config import logger
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 def verify_password(plain_password, hashed_password):
+    """Verifies a plain-text password against a hashed persistent credential."""
     return pwd_context.verify(plain_password, hashed_password)
 
 def get_password_hash(password):
+    """Generates a secure PBKDF2 hash for a user-provided password."""
     return pwd_context.hash(password)
 
 # Configuration from environment variables
@@ -29,56 +32,57 @@ ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 if not ENCRYPTION_KEY:
     # In development, we generate one, but it MUST be set in production
     ENCRYPTION_KEY = Fernet.generate_key().decode()
-    print(f"WARNING: ENCRYPTION_KEY not set. Using temporary key: {ENCRYPTION_KEY}")
+    logger.warning(f"[SECURITY] ENCRYPTION_KEY not set. Using temporary key: {ENCRYPTION_KEY}")
 
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
 def encrypt_token(token: str) -> str:
-    """Encrypts a string (e.g., OAuth refresh token) using AES-256 (Fernet)."""
+    """Encrypts a string (e.g., OAuth refresh token) using AES-256 (Fernet) for secure storage."""
     return cipher_suite.encrypt(token.encode()).decode()
 
 def decrypt_token(encrypted_token: str) -> str:
-    """Decrypts an AES-256 encrypted string."""
+    """Decrypts an AES-256 encrypted string to its original plain-text representation."""
     try:
         return cipher_suite.decrypt(encrypted_token.encode()).decode()
     except Exception:
+        logger.error("[SECURITY] Cryptographic decryption failure.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to decrypt secure token"
         )
 
 # Distributed Session Revocation Cache (Redis-backed, in-memory fallback)
-# Stores revocation timestamps keyed by user_id.
-# Any JWT issued BEFORE this timestamp is immediately invalidated.
+# Stores revocation timestamps keyed by user_id to invalidate JWTs issued before the last reset.
 _REVOCATION_FALLBACK: dict = {}  # Used only if Redis is unreachable
+logger.debug("[SECURITY] Session revocation cache initialized.")
 
 def _get_redis():
-    """Returns a Redis client. Returns None if unavailable."""
+    """Retrieves an active Redis client connection for distributed operations."""
     try:
         import redis
         r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), socket_connect_timeout=1)
-        r.ping()  # Fail fast if Redis is down
+        r.ping()
         return r
     except Exception:
         return None
 
 def revoke_sessions(user_id: str):
     """
-    Instantly terminates all pre-existing JWTs for a user across ALL server pods.
-    Writes to Redis for distributed consistency. Falls back to in-memory if Redis
-    is unavailable (single-pod degraded mode).
+    Distributed Session Termination.
+    Instantly terminates all pre-existing JWTs for a user across the entire server cluster.
     """
     revocation_time = int(datetime.now(UTC).timestamp())
     r = _get_redis()
     if r:
-        # TTL: 8 days (max JWT lifetime is 7 days, so all tokens will expire naturally)
+        # TTL: 8 days (exceeds max potential JWT lifetime)
         r.setex(f"revoked:{user_id}", 60 * 60 * 24 * 8, revocation_time)
+        logger.info(f"[SECURITY] Distributed session revocation active for user {user_id}")
     else:
         _REVOCATION_FALLBACK[user_id] = revocation_time
-        print(f"[SECURITY] Redis unavailable — revocation stored in-memory (single-pod mode).")
+        logger.warning(f"[SECURITY] Redis unavailable — revocation stored in-memory for user {user_id} (single-pod scale only).")
 
 def _get_revocation_time(user_id: str) -> int:
-    """Retrieves the revocation timestamp for a user from Redis or in-memory fallback."""
+    """Retrieves the last recorded revocation timestamp for a user identity."""
     r = _get_redis()
     if r:
         val = r.get(f"revoked:{user_id}")
@@ -86,7 +90,7 @@ def _get_revocation_time(user_id: str) -> int:
     return _REVOCATION_FALLBACK.get(user_id, 0)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Generates a JWT access token for session management."""
+    """Generates a high-fidelity JWT access token for stateful session management."""
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(UTC) + expires_delta
@@ -101,7 +105,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 def create_refresh_token(data: dict) -> str:
-    """Generates a long-lived JWT refresh token for session management."""
+    """Generates a long-lived JWT refresh token designed for persistent identity anchoring."""
     to_encode = data.copy()
     expire = datetime.now(UTC) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     to_encode.update({
@@ -115,8 +119,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> models.User:
     """
-    Dependency that validates the JWT and returns the current user model.
-    Enforces the primary horizontal auth boundary.
+    Zero-Trust Identity Resolution.
+    Validates JWT integrity, enforces distributed revocation policies, and assembles the localized user identity.
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -138,6 +142,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         if iat is not None:
             revocation_time = _get_revocation_time(user_id)
             if revocation_time and iat < revocation_time:
+                logger.warning(f"[SECURITY] Intercepted revoked JWT for user {user_id}")
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Session terminated. Security credentials have been reset.",
@@ -146,12 +151,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
             
         role_claim = payload.get("role")
         if role_claim is None:
-            # Fallback for legacy simple-tokens
+            # Persistent Identity Resolution
             user = db.query(models.User).filter(models.User.id == user_id).first()
             if user is None:
                 raise credentials_exception
         else:
-            # Fully Stateless Synthetic Identity Resolution
+            # Stateless Synthetic Identity Resolution
             user = models.User(
                 id=user_id,
                 email=payload.get("email"),
@@ -171,8 +176,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 
     # Tactical Boundary Enforcement: Demo Identity Expiry Gate
     if user.is_demo and user.demo_expires_at:
-        # Note: We use UTC synchronization to ensure globally consistent boundaries
         if user.demo_expires_at.replace(tzinfo=UTC) < datetime.now(UTC):
+            logger.info(f"[SECURITY] Trial identity expired for {user.email}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Your demo period of 5 days has been completed, please take subscription to continue with our services please contact to our sales team - sales@ai-priori.com"

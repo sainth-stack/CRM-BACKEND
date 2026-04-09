@@ -6,9 +6,11 @@ import json
 import re
 import os
 from dotenv import load_dotenv
+from app.core.logging_config import logger
 
 load_dotenv()
 
+# Deterministic LLM for high-fidelity extraction
 llm = ChatOpenAI(
     model="gpt-4o-mini", 
     temperature=0,
@@ -56,7 +58,10 @@ class UserIntelResponse(BaseModel):
     deep_research: str = Field(description="A high-fidelity business focus summary")
 
 def scrape_homepage_lite(url: str):
-    """Fetches identity markers and discovers the site's navigation map."""
+    """
+    Identity Marker Extraction.
+    Executes a high-fidelity headless fetch to capture primary corporate metadata and discover functional sitemap verticals.
+    """
     try:
         if not url.startswith('http'):
             url = f"https://{url}"
@@ -70,8 +75,7 @@ def scrape_homepage_lite(url: str):
             meta_desc = re.search(r'<meta name="description" content="(.*?)"', html, re.IGNORECASE)
             meta_desc = meta_desc.group(1) if meta_desc else ""
             
-            # DETERMINISTIC DEPTH: Extract common nav paths to focus secondary search
-            # We look for /courses, /projects, /hackathons, /pricing, /about
+            # Navigational Mapping Vertical Extraction
             nav_paths = set(re.findall(r'href=["\'](/[a-zA-Z0-9\-_]+)["\']', html))
             important_paths = [p for p in nav_paths if any(k in p.lower() for k in ['course', 'project', 'hackathon', 'price', 'pricing', 'about'])]
 
@@ -83,18 +87,23 @@ def scrape_homepage_lite(url: str):
             return {
                 "title": title,
                 "description": meta_desc,
-                "nav_paths": sorted(list(important_paths)), # Sorted for determinism
+                "nav_paths": sorted(list(important_paths)), 
                 "raw_text_snippet": body_text[:4000]
             }
     except Exception as e:
-        print(f"Scraping failed for {url}: {e}")
+        logger.warning(f"[SCRAPER] Lite-scrape mission compromised for {url}: {e}")
     return None
 
 def research_user_company(company_url: str):
+    """
+    User Identity & Intent Research Orchestrator.
+    Maps out a company's corporate architecture and extracts their primary value-drivers through sitemap traversal and targeted search.
+    """
     parsed = urlparse(company_url if '://' in company_url else f'https://{company_url}')
     domain = parsed.netloc.replace('www.', '')
     
-    # Phase 0: Direct Scrape (Navigation Mapping)
+    # Phase 0: Identity Mapping (Ground Truth Extraction)
+    logger.info(f"[USER INTEL] Mobilizing identity mapping for domain: {domain}")
     ground_truth = scrape_homepage_lite(company_url)
     ground_truth_text = "WEBSITE IS UNREACHABLE"
     nav_context = ""
@@ -104,14 +113,12 @@ def research_user_company(company_url: str):
         if ground_truth['nav_paths']:
             nav_context = f"Discovered Sitemap Verticals: {', '.join(ground_truth['nav_paths'])}"
 
-    # Phase 1: High-Speed Surgical Probe
-    # We build deterministic queries based on discovered paths + general identity
+    # Phase 1: High-Speed Surgical Reconnaissance
     base_queries = [
         f"site:{domain} about mission",
         f"site:{domain} products offerings"
     ]
     
-    # Add surgical path queries (Limit to top 3 for latency)
     if ground_truth and ground_truth['nav_paths']:
         for path in ground_truth['nav_paths'][:3]:
             base_queries.append(f"site:{domain}{path} listing details")
@@ -119,37 +126,35 @@ def research_user_company(company_url: str):
     all_results = []
     seen_urls = set()
     
-    # Run searches sequentially for determinism (or use a stable parallel sort)
     for q in base_queries:
         results = search_provider.parallel_search(q)
         for r in results:
             result_url = r['url'].lower()
-            # STRICT IDENTITY GUARD: Discard cross-domain noise
             if domain in result_url and r['url'] not in seen_urls:
                 all_results.append(r)
                 seen_urls.add(r['url'])
     
-    # Sort for deterministic LLM input
     all_results.sort(key=lambda x: x['url'])
     results_text = "\n".join([f"Source: {r['url']}\nSnippet: {r['content']}\n" for r in all_results[:10]])
     
     master_context = f"{ground_truth_text}\n{nav_context}\n\nRELEVANT VERTICAL DATA:\n{results_text}"
 
-    # Phase 2: Extraction with Anti-Fuzzy Enforcement
+    # Phase 2: Intelligence Extraction with Sovereign Policy Enforcement
     structured_llm = llm.with_structured_output(UserIntelResponse)
-    STRICT_PROMPT = USER_INTEL_PROMPT + f"\n\nSTRICT SOVEREIGNTY: Focus ONLY on {domain}. Discard similar entities like 'Gnanamani'. If {domain} has sub-pages for Courses or Projects, list EVERY item found in those paths."
+    STRICT_PROMPT = USER_INTEL_PROMPT + f"\n\nSTRICT SOVEREIGNTY: Focus ONLY on {domain}. Discard similar entities. If {domain} has sub-pages for Courses or Projects, list EVERY item found in those paths."
     
     prompt = ChatPromptTemplate.from_template(STRICT_PROMPT)
     chain = prompt | structured_llm
     
     try:
+        logger.info(f"[USER INTEL] Synchronizing intelligence for {domain}...")
         data = chain.invoke({
             "company_url": domain, 
             "search_results": master_context
         })
         return data.model_dump()
     except Exception as e:
-        print(f"Extraction Error for {domain}: {e}")
+        logger.error(f"[USER INTEL] Intelligence extraction failed for {domain}: {e}", exc_info=True)
         return {
             "exact_company_name": domain.split('.')[0].capitalize(),
             "website": company_url,

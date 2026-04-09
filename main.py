@@ -119,7 +119,10 @@ def validate_url_for_ssrf(url: str) -> str:
 
 @app.get("/health/email")
 def email_health_check():
-    """Diagnostic: verify Gmail OAuth config on Render."""
+    """
+    Diagnostic Sector Operations.
+    Verifies the Gmail OAuth2 configuration and environmental readiness of the active sector.
+    """
     import os
     config_status = {
         "GMAIL_TOKEN_JSON": "SET" if os.getenv("GMAIL_TOKEN_JSON") else "MISSING",
@@ -137,6 +140,10 @@ def create_campaign(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+    """
+    Campaign Mobilization Protocol.
+    Initializes a new outreach campaign, validates target parameters, and triggers the autonomous research cluster.
+    """
     # Hierarchy boundary: Only localized operators can initialize executions
     if current_user.role != models.UserRole.USER:
         raise HTTPException(status_code=403, detail="Only Localized Users can mobilize new campaigns.")
@@ -205,7 +212,10 @@ def list_campaigns(
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Results per page")
 ):
-    """Paginated campaign listing with Zero-Trust hierarchical isolation."""
+    """
+    Sovereign Campaign Audit.
+    Retrieves a paginated list of campaigns governed by the actor, enforcing strict multi-tenant isolation boundaries.
+    """
     visibility_filter = get_visibility_filter(db, current_user)
     skip = (page - 1) * page_size
 
@@ -239,6 +249,10 @@ def delete_campaign(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+    """
+    Sector Asset Decommissioning.
+    Permanently deletes a campaign and its associated intelligence data from the sector.
+    """
     # Isolation: Apply Zero-Trust boundary
     db_campaign = db.query(models.Campaign).filter(
         models.Campaign.id == campaign_id,
@@ -259,6 +273,10 @@ def update_campaign_status(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+    """
+    Operational State Redirection.
+    Manually overrides the functional state of a campaign to facilitate human-in-the-loop intervention.
+    """
     db_campaign = db.query(models.Campaign).filter(
         models.Campaign.id == campaign_id,
         get_visibility_filter(db, current_user)
@@ -283,6 +301,10 @@ def batch_delete_campaigns(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+    """
+    Bulk Intelligence Termination.
+    Efficiently decommissions multiple campaigns simultaneously while maintaining sector integrity.
+    """
     campaign_ids = request.campaign_ids
     # Multi-tenant policy: hierarchical batch isolation
     campaigns_to_delete = db.query(models.Campaign).filter(
@@ -308,6 +330,10 @@ def get_campaign(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+    """
+    Deep Intelligence Audit.
+    Retrieves comprehensive metadata, discovered stakeholders, and communication history for a specific campaign.
+    """
     # N+1 Fix: Single query with all relationships eager-loaded
     db_campaign = db.query(models.Campaign).options(
         joinedload(models.Campaign.user_intel),
@@ -386,6 +412,10 @@ def update_draft(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+    """
+    Content Refinement Protocol.
+    Updates the subject or body of an outreach draft prior to tactical deployment.
+    """
     # Sector Query Boundary: Ensure draft belongs to a campaign governed by the actor
     db_draft = db.query(models.EmailDraft).join(models.Campaign).filter(
         models.EmailDraft.id == draft_id,
@@ -483,9 +513,7 @@ def send_draft(
         db.commit()
         return {"message": f"Engagement protocol mobilized. HubSpot status updated to '{hs_status if db_draft.dm else 'N/A'}'."}
     except Exception as e:
-        print(f"Deployment Failure: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Tactical Deployment Failure for draft {draft_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Tactical deployment failed: {str(e)}")
 
 @app.get("/prospects/{dm_id}")
@@ -494,6 +522,10 @@ def get_prospect_details(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+    """
+    Stakeholder Dossier Audit.
+    Retrieves detailed communication history and metadata for a specific prospect.
+    """
     # Sector Query Boundary: Guarantee hierarchical relationship ownership
     dm = db.query(models.DecisionMaker).join(models.Campaign).filter(
         models.DecisionMaker.id == dm_id,
@@ -523,4 +555,5 @@ def get_prospect_details(
 
 @app.get("/health")
 def health():
+    """System Vitality Check."""
     return {"status": "ok"}

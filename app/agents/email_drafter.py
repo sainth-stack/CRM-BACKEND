@@ -2,9 +2,11 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 import os
 from dotenv import load_dotenv
+from app.core.logging_config import logger
 
 load_dotenv()
 
+# Specialized LLM for high-fidelity content generation
 llm = ChatOpenAI(
     model="gpt-4o-mini", 
     temperature=0,
@@ -78,11 +80,17 @@ class EmailDraftResponse(BaseModel):
     body: str = Field(description="The full, hyper-personalized email body")
 
 def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_name: str, target_company_research: str):
+    """
+    Hyper-Personalized Outreach Synthesis.
+    Constructs a strategic outreach draft by cross-referencing user value drivers with target company intelligence.
+    Ensures zero-placeholder compliance and professional brand alignment.
+    """
     structured_llm = llm.with_structured_output(EmailDraftResponse)
     prompt = ChatPromptTemplate.from_template(EMAIL_DRAFTER_PROMPT)
     chain = prompt | structured_llm
     
     try:
+        logger.info(f"[GHOSTWRITER] Drafting initial outreach for stakeholders at {target_company_name}...")
         data = chain.invoke({
             "user_company_name": user_intel.get("company_name", ""),
             "user_company_moto": user_intel.get("moto", ""),
@@ -93,18 +101,22 @@ def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_nam
             "dm_company": target_company_name,
             "target_company_research": target_company_research
         })
-        parsed_data = data.model_dump()
-        return parsed_data
+        return data.model_dump()
     except Exception as e:
-        print(f"Error in structured email drafter: {e}")
+        logger.error(f"[GHOSTWRITER] Outreach drafting critical failure: {e}", exc_info=True)
         return None
 
 def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: str, thread_history: str, followup_number: int):
+    """
+    Strategic Persistence Engineering.
+    Drafts high-context follow-up communication designed to address prospect concerns while maintaining outreach momentum.
+    """
     structured_llm = llm.with_structured_output(EmailDraftResponse)
     prompt = ChatPromptTemplate.from_template(FOLLOW_UP_PROMPT)
     chain = prompt | structured_llm
     
     try:
+        logger.info(f"[GHOSTWRITER] Drafting follow-up #{followup_number} for {dm_info.get('name')}...")
         data = chain.invoke({
             "user_company_name": user_intel.get("company_name", ""),
             "user_company_research": user_intel.get("deep_research", ""),
@@ -115,14 +127,18 @@ def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: s
         })
         return data.model_dump()
     except Exception as e:
-        print(f"Error in follow-up drafting: {e}")
+        logger.error(f"[GHOSTWRITER] Follow-up drafting failure: {e}")
         return None
+
 class NudgeDraftResponse(BaseModel):
     subject: str = Field(description="The short nudge subject")
     body: str = Field(description="The short nudge body")
 
 def draft_nudge_email(dm_name: str, user_company_name: str):
-    """Drafts a short, polite nudge for non-responsive prospects."""
+    """
+    Inactivity Resurrection Protocol.
+    Generates ultra-short inbox nudges for non-responsive prospects to bring the thread to priority visibility.
+    """
     structured_llm = llm.with_structured_output(NudgeDraftResponse)
     prompt = ChatPromptTemplate.from_template("""
     You are a polite business assistant. 
@@ -138,8 +154,9 @@ def draft_nudge_email(dm_name: str, user_company_name: str):
     """)
     chain = prompt | structured_llm
     try:
+        logger.info(f"[GHOSTWRITER] Generating inbox nudge for {dm_name}...")
         response = chain.invoke({"dm_name": dm_name, "user_company_name": user_company_name})
         return response.body if hasattr(response, 'body') else f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"
     except Exception as e:
-        print(f"Error drafting nudge: {e}")
+        logger.error(f"[GHOSTWRITER] Nudge generation compromised: {e}")
         return f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"

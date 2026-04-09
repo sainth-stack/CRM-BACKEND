@@ -4,6 +4,7 @@ from ddgs import DDGS
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import warnings
+from app.core.logging_config import logger
 
 # Suppress impersonation warnings from ddgs/curl-cffi
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="Impersonate.*")
@@ -14,10 +15,18 @@ load_dotenv()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 class SearchProvider:
+    """
+    Unified Search Intelligence Bridge.
+    Coordinates between Tavily (Deep Web) and DuckDuckGo (Agile Fallback) to provide comprehensive context for outreach.
+    """
     def __init__(self):
         self.tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
     def search_tavily(self, query: str, include_domains: list = None):
+        """
+        Executes a high-fidelity deep research query via Tavily.
+        Returns extracted content and raw analysis for LLM consumption.
+        """
         if not self.tavily:
             return []
         try:
@@ -28,20 +37,27 @@ class SearchProvider:
             results = response.get('results', [])
             return [{"title": r.get('title', ''), "url": r.get('url', ''), "content": r.get('content', ''), "raw_content": r.get('raw_content', ''), "score": r.get('score', 0.8)} for r in results]
         except Exception as e:
-            print(f"Tavily search error: {e}")
+            logger.error(f"Tavily deep research failure: {e}")
             return []
 
     def search_ddgs(self, query: str):
-        # DuckDuckGo fallback
+        """
+        Executes an agile search via DuckDuckGo.
+        Serves as the primary redundancy layer for the discovery engine.
+        """
         try:
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=15))
             return [{"title": r['title'], "url": r['href'], "content": r['body'], "score": 0.5} for r in results]
         except Exception as e:
-            print(f"DuckDuckGo search error: {e}")
+            logger.error(f"DuckDuckGo fallback search failure: {e}")
             return []
 
     def parallel_search(self, query: str, include_domains: list = None):
+        """
+        High-Performance Multi-threaded Search.
+        Aggregates results from both primary and secondary providers simultaneously for maximum speed.
+        """
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_tavily = executor.submit(self.search_tavily, query, include_domains)
             future_ddgs = executor.submit(self.search_ddgs, query)

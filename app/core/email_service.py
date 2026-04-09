@@ -4,24 +4,28 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from app.core.logging_config import logger
 
 class EmailService:
     """
     Production-grade stateless email service for multi-tenant outreach.
-    Requires external injection of GMail Credentials.
+    Orchestrates GMail API interactions for campaign outreach, identity verification, 
+    and administrative provisioning. Requires external injection of OAuth2 Credentials.
     """
     
     def send_email(self, to_email: str, subject: str, body: str, creds: Credentials, thread_id: str = None) -> dict:
         """
-        Routes outreach distribution through the provided user sector credentials.
+        Campaign Outreach Dispatch.
+        Routes distribution through the provided user sector credentials with support for thread-based engagement.
         """
         if not creds:
+            logger.error("Security Error: Outreach capability blocked. No mailbox synchronization identified.")
             raise Exception("Security Error: Outreach capability blocked. No mailbox synchronization identified for this user.")
         
         try:
             return self._send_via_gmail(to_email, subject, body, creds, thread_id)
         except Exception as e:
-            print(f"[EMAIL] Outreach Dispatch Failure: {e}")
+            logger.error(f"[EMAIL] Outreach Dispatch Failure to {to_email}: {e}", exc_info=True)
             raise e
 
     def _send_via_gmail(self, to_email: str, subject: str, body: str, creds: Credentials, thread_id: str = None) -> dict:
@@ -59,23 +63,26 @@ class EmailService:
             sent_msg = service.users().messages().send(userId='me', body=data).execute()
             msg_id = sent_msg.get('id')
             new_thread_id = sent_msg.get('threadId')
-            print(f"[GMAIL] Mission Success: Dispatched to {to_email} (Msg ID: {msg_id}, Thread ID: {new_thread_id})")
+            logger.info(f"[GMAIL] Mission Success: Dispatched to {to_email} (Msg ID: {msg_id}, Thread ID: {new_thread_id})")
             return {"id": msg_id, "thread_id": new_thread_id}
         except Exception as e:
-            print(f"[GMAIL] API Error during outreach to {to_email}: {e}")
+            logger.error(f"[GMAIL] API Error during outreach to {to_email}: {e}")
             raise e
 
     def send_otp_email(self, to_email: str, otp: str):
-        """Sends a system-critical identity verification code (OTP) via the core vault credentials."""
+        """
+        Identity Verification Dispatch.
+        Dispatches a system-critical verification code (OTP) via the core vault credentials.
+        """
         token_path = os.path.join(os.getcwd(), 'token.json')
         if not os.path.exists(token_path):
-            # Fallback for Render if stored in env var as JSON
             import json
             token_json = os.getenv("GMAIL_TOKEN_JSON")
             if token_json:
                 data = json.loads(token_json)
                 creds = Credentials.from_authorized_user_info(data)
             else:
+                logger.error("Identity Infrastructure Failure: System vault (token.json) not identified.")
                 raise Exception("Identity Infrastructure Failure: System vault (token.json) not identified.")
         else:
             creds = Credentials.from_authorized_user_file(token_path)
@@ -96,16 +103,17 @@ class EmailService:
         return self._send_via_gmail(to_email, subject, body, creds)
 
     def send_provisioning_email(self, to_email: str, role: str, password: str, creds: Credentials):
-        """Dispatches an authoritative welcome and credential handover to new operators."""
+        """
+        Operator Provisioning Dispatch.
+        Dispatches authoritative welcome and initial credentials to newly established Administrative or User sectors.
+        """
         subject = f"Mission Provisioning: {role.replace('_', ' ').title()} Access Authorized"
-        
-        # Determine Login URL (ideally from env, but defaulting to common local/prod paths)
         login_url = os.getenv("FRONTEND_URL", "http://localhost:5173") + "/login"
         
         # Brand Alignment Palette
-        COLOR_PRIMARY = "#FE1919"    # Red
-        COLOR_SECONDARY = "#0073B1"  # Data Blue
-        COLOR_ACCENT = "#F8931F"     # Intelligence Orange
+        COLOR_PRIMARY = "#FE1919"
+        COLOR_SECONDARY = "#0073B1"
+        COLOR_ACCENT = "#F8931F"
         COLOR_DARK = "#111827"
         
         body = f"""

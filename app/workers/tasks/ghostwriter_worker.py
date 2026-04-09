@@ -1,13 +1,9 @@
-"""
-Phase 3: Email Ghostwriting Worker
-Celery task that drafts personalized outreach emails for all discovered DMs.
-Also contains follow-up and discovery call drafting helpers.
-"""
 from app.db.database import SessionLocal
 from app.db import models
 from app.agents.email_drafter import draft_personalized_email, draft_followup_email, draft_nudge_email
 from app.agents.discovery_agent import draft_discovery_request
 from app.workers.config.celery_app import celery_app
+from app.core.logging_config import logger
 import json
 import datetime
 import gc
@@ -16,20 +12,24 @@ from datetime import UTC
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def draft_emails_worker(self, campaign_id: str):
-    """Phase 3: AI-powered personalized email drafting for all validated stakeholders."""
+    """
+    Phase 3: AI-powered ghostwriting cluster.
+    Generates hyper-personalized outreach content for all stakeholders identified in previous phases.
+    Uses deep research data to ensure relevance and high conversion rates.
+    """
     db = SessionLocal()
     try:
-        print(f"[MISSION CONTROL] Initiating Email Ghostwriting for campaign {campaign_id}...")
+        logger.info(f"[MISSION CONTROL] Transition: Initiating Email Ghostwriting for campaign {campaign_id}")
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         if not campaign or not campaign.user_intel:
-            print(f"Aborting Email Drafting: Missing campaign or intel for {campaign_id}")
+            logger.warning(f"Aborting Email Drafting: Missing campaign or intel for {campaign_id}")
             return
 
-        # Temporal Boundary Check
+        # Temporal Boundary Check: Security gate for trial accounts
         owner = campaign.owner
         if owner and owner.is_demo and owner.demo_expires_at:
             if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
-                print(f"[MISSION CONTROL] Suspension: Campaign {campaign_id} owner trial expired.")
+                logger.info(f"[MISSION CONTROL] Suspension: Campaign {campaign_id} owner trial expired.")
                 return
 
         user_intel_raw = campaign.user_intel
@@ -49,10 +49,10 @@ def draft_emails_worker(self, campaign_id: str):
         }
 
         dms = db.query(models.DecisionMaker).filter(models.DecisionMaker.campaign_id == campaign_id).all()
-        print(f"Drafting for {len(dms)} validated stakeholders.")
+        logger.info(f"[GHOSTWRITER] Generating personalized content for {len(dms)} validated stakeholders.")
 
         for dm in dms:
-            # Skip if already drafted
+            # Skip if already drafted (Idempotency Check)
             if db.query(models.EmailDraft).filter(models.EmailDraft.decision_maker_id == dm.id).first():
                 continue
 
@@ -60,7 +60,7 @@ def draft_emails_worker(self, campaign_id: str):
             if not target_co: continue
 
             try:
-                print(f"[GHOSTWRITER] Creating personalized draft for {dm.name} at {target_co.name}...")
+                logger.debug(f"[GHOSTWRITER] Drafting for {dm.name} at {target_co.name}")
                 draft_data = draft_personalized_email(
                     user_intel,
                     {"name": dm.name, "position": dm.position},
@@ -78,20 +78,20 @@ def draft_emails_worker(self, campaign_id: str):
                     db.add(new_draft)
                     dm.status = "DRAFTED"
                     db.commit()
-                    print(f"[GHOSTWRITER] Success: Draft saved for {dm.name}")
+                    logger.info(f"[GHOSTWRITER] Success: Draft persistent for {dm.name}")
                 else:
-                    print(f"[GHOSTWRITER] Warning: Agent returned empty draft for {dm.name}")
+                    logger.warning(f"[GHOSTWRITER] Null Draft: Agent returned empty payload for {dm.name}")
             except Exception as draft_e:
-                print(f"Failure drafting email for {dm.name}: {draft_e}")
+                logger.error(f"Drafting Failure for {dm.name}: {draft_e}")
                 db.rollback()
 
             gc.collect()
 
         campaign.status = models.CampaignStatus.COMPLETED
         db.commit()
-        print(f"[MISSION CONTROL] Campaign {campaign_id} fully deployed and completed.")
+        logger.info(f"[MISSION CONTROL] Campaign {campaign_id} fully stabilized and completed.")
     except Exception as e:
-        print(f"Error in Email Drafter: {e}")
+        logger.error(f"Critical error in Email Ghostwriter Cluster: {e}", exc_info=True)
         db.rollback()
         self.retry(exc=e)
     finally:
@@ -99,7 +99,10 @@ def draft_emails_worker(self, campaign_id: str):
 
 
 def draft_followup_worker(dm_id: str):
-    """Drafts a persistent follow-up when intent is Neutral."""
+    """
+    Persistent Nudging Engine.
+    Drafts persistent follow-up emails when prospect intent is classified as Neutral or ambiguous.
+    """
     db = SessionLocal()
     try:
         dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
@@ -137,13 +140,16 @@ def draft_followup_worker(dm_id: str):
             db.add(new_draft)
             dm.status = f"FOLLOWUP_{dm.followup_count}_DRAFTED"
             db.commit()
-            print(f"[FOLLOW-UP] Persistence triggered for {dm.name} (#{dm.followup_count})")
+            logger.info(f"[FOLLOW-UP] Persistence triggered for {dm.name} (Nudge #{dm.followup_count})")
     finally:
         db.close()
 
 
 def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
-    """Drafts the initial discovery call request."""
+    """
+    Discovery Protocol Engine.
+    Drafts the formal discovery call request after successful interest classification or auto-booking coordination.
+    """
     should_close = False
     if db is None:
         db = SessionLocal()
@@ -194,9 +200,10 @@ def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
             dm.status = "DISCOVERY_CALL"
             if should_close:
                 db.commit()
-            print(f"[DISCOVERY] Draft created for {dm.name} and status updated to DISCOVERY_CALL")
+            logger.info(f"[DISCOVERY] Draft persistent for {dm.name} | Protocol: DISCOVERY_CALL")
     except Exception as e:
         if should_close: db.rollback()
+        logger.error(f"Discovery Protocol Failure for DM {dm_id}: {e}", exc_info=True)
         raise e
     finally:
         if should_close:

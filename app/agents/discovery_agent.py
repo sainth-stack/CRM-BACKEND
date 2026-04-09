@@ -4,9 +4,11 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 import os
 from dotenv import load_dotenv
+from app.core.logging_config import logger
 
 load_dotenv()
 
+# Specialized LLM for coordinate extraction and strategic content synthesis
 llm = ChatOpenAI(
     model="gpt-4o-mini", 
     temperature=0,
@@ -46,11 +48,17 @@ Return exactly the requested JSON schema.
 """
 
 def extract_schedule_info(reply_text: str, current_date: str, location_context: str):
+    """
+    Temporal Intelligence Protocol.
+    Parses prospect communication to extract precise meeting coordinates (date, time, timezone).
+    Translates relative linguistic offsets (e.g., 'next Tuesday') into absolute ISO-8601 timestamps.
+    """
     structured_llm = llm.with_structured_output(ScheduleExtraction)
     prompt = ChatPromptTemplate.from_template(SCHEDULING_PROMPT)
     chain = prompt | structured_llm
     
     try:
+        logger.info("[DISCOVERY] Extracting scheduling coordinates from prospect reply...")
         extraction = chain.invoke({
             "reply_text": reply_text, 
             "current_date": current_date,
@@ -58,7 +66,7 @@ def extract_schedule_info(reply_text: str, current_date: str, location_context: 
         })
         return extraction.model_dump()
     except Exception as e:
-        print(f"Schedule Extraction Error: {e}")
+        logger.error(f"[DISCOVERY] Coordinate extraction failure: {e}")
         return None
 
 DISCOVERY_DRAFTER_PROMPT = """You are a World-Class Strategic Deal Closer.
@@ -88,13 +96,18 @@ class DiscoveryEmailResponse(BaseModel):
     body: str = Field(description="The organic email body")
 
 def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, target_company: str, last_interest: str, booked_link: str = None):
+    """
+    Strategic Coordination Synthesis.
+    Drafts high-fidelity communication to finalize discovery meeting coordinates.
+    Handles both initial interest responses and finalized booking confirmation dispatches.
+    """
     structured_llm = llm.with_structured_output(DiscoveryEmailResponse)
     
     booking_context = ""
     narrative_instruction = "Acknowledge their interest and request their preferred timing or a few available slots next week to sync up for a 15-minute discovery call. Mention we will handle the bridge coordinates once they share a time."
     
     if booked_link:
-        # Finalized coordinate injection
+        # Finalized coordinate injection for confirmed sessions
         booking_context = f"MISSION CRITICAL: Coordination success. Discovery slot confirmed. Coordinates: {booked_link}."
         narrative_instruction = f"Inform them that you have successfully SECURED the discovery slot. Provide the confirmed meeting bridge coordinates ({booked_link}) and express that you are looking forward to the alignment session."
 
@@ -102,6 +115,7 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
     chain = prompt | structured_llm
     
     try:
+        logger.info(f"[DISCOVERY] Synthesizing strategic discovery response for {dm_name} at {target_company}...")
         response = chain.invoke({
             "user_company_name": user_intel.get("name", ""),
             "user_company_offerings": user_intel.get("offerings", ""),
@@ -115,5 +129,6 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
         })
         return response.model_dump()
     except Exception as e:
-        print(f"Discovery Draft Error: {e}")
+        logger.error(f"[DISCOVERY] Strategic drafting mission failure: {e}")
         return None
+

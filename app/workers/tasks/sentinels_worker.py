@@ -16,16 +16,20 @@ import pytz
 import re
 from datetime import UTC
 from app.workers.config.celery_app import celery_app
+from app.core.logging_config import logger
 
 
 def poll_inbox_task(user_id: str):
-    """Background Sentinel: Polls for replies for a SPECIFIC USER sector."""
-    print(f"[SENTINEL] Scanning inbox for user sector {user_id}...")
+    """
+    User-Sector Inbox Sentinel.
+    Polls the Gmail inbox for a specific user to detect prospect replies, classify intent, and trigger protocol transitions.
+    """
+    logger.info(f"[SENTINEL] Scanning inbox for user sector {user_id}...")
     db = SessionLocal()
     try:
         creds = TokenService.get_google_credentials(db, user_id)
         if not creds:
-            print(f"[SENTINEL] Aborting: No outreach capability established for user {user_id}.")
+            logger.warning(f"[SENTINEL] Aborting: No outreach capability established for user {user_id}.")
             return
 
         provider = GmailProvider(creds)
@@ -50,9 +54,10 @@ def poll_inbox_task(user_id: str):
                     ).first()
                     if dm and not dm.thread_id:
                         dm.thread_id = reply.get("thread_id")
-                        print(f"[SENTINEL] Active mission link established via legacy coordinate for {dm.name}")
+                        logger.info(f"[SENTINEL] Mission link established via email coordinate for {dm.name}")
 
             if dm:
+                # Idempotency Gate: Prevent duplicate processing of the same message
                 existing_log = db.query(models.CommunicationLog).filter(
                     models.CommunicationLog.message_id == reply.get("message_id"),
                     models.CommunicationLog.direction == "RECEIVED"
@@ -60,7 +65,7 @@ def poll_inbox_task(user_id: str):
                 if existing_log:
                     continue
 
-                print(f"[SENTINEL] Match Found: {dm.name} from {dm.target_company.name}")
+                logger.info(f"[SENTINEL] Reply Detected: {dm.name} associated with {dm.target_company.name}")
 
                 last_sent = db.query(models.CommunicationLog).filter(
                     models.CommunicationLog.dm_id == dm.id,
@@ -69,11 +74,12 @@ def poll_inbox_task(user_id: str):
 
                 original_text = last_sent.body if last_sent else "Initial context missing."
 
+                # AI Intelligence: Intent Classification
                 classification = classify_reply_intent(original_text, reply["body"])
                 intent = classification["intent"]
                 reason = classification["reasoning"]
                 dm.reply_intent = intent
-                print(f"[SENTINEL] Intent for {dm.name}: {intent} ({reason})")
+                logger.info(f"[SENTINEL] Intent classified for {dm.name}: {intent} | Analysis: {reason}")
 
                 new_log = models.CommunicationLog(
                     campaign_id=dm.campaign_id,
@@ -86,8 +92,9 @@ def poll_inbox_task(user_id: str):
                 db.add(new_log)
                 db.flush()
 
+                # Phase 4 Protocol: Automated Scheduling Coordination
                 if dm.status in ["DISCOVERY_CALL", "WAITING_FOR_REPLY"]:
-                    print(f"[DISCOVERY] Extracting coordinates from {dm.name}'s reply...")
+                    logger.info(f"[DISCOVERY] Extracting scheduling coordinates from {dm.name}'s reply...")
                     today_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d")
                     extract = extract_schedule_info(
                         reply["body"], today_str,
@@ -96,7 +103,7 @@ def poll_inbox_task(user_id: str):
 
                     if extract and extract.get("date") and extract.get("time"):
                         raw_tz = (extract.get("timezone") or "IST").upper()
-                        print(f"[DISCOVERY] Extracted Coordinate: {extract['date']} @ {extract['time']} {raw_tz}")
+                        logger.info(f"[DISCOVERY] Extracted Coordinate: {extract['date']} @ {extract['time']} {raw_tz}")
                         try:
                             TZ_MAP = {
                                 "IST": "Asia/Kolkata", "PST": "America/Los_Angeles", "PDT": "America/Los_Angeles",
@@ -111,7 +118,7 @@ def poll_inbox_task(user_id: str):
                             utc_dt = localized_dt.astimezone(pytz.UTC)
                             utc_iso = utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                            print(f"[DISCOVERY] Dispatching Cal.com Reservation: {utc_iso}")
+                            logger.info(f"[DISCOVERY] Dispatching Auto-Booking via Cal.com: {utc_iso}")
                             booking = cal_provider.book_meeting(email=dm.email, name=dm.name, start_time=utc_iso)
 
                             if booking:
@@ -124,6 +131,8 @@ def poll_inbox_task(user_id: str):
 
                                 target_co = dm.target_company
                                 if target_co: target_co.status = "MEETING_BOOKED"
+                                
+                                # Terminate competing leads within the same organization
                                 others = db.query(models.DecisionMaker).filter(
                                     models.DecisionMaker.target_company_id == target_co.id,
                                     models.DecisionMaker.id != dm.id
@@ -133,7 +142,7 @@ def poll_inbox_task(user_id: str):
                                     hubspot_provider.update_lead_status(other.hubspot_id, "Terminated (Internal Lead Secured)")
 
                                 hubspot_provider.update_lead_status(dm.hubspot_id, f"Meeting Booked: {dm.scheduled_time} IST")
-                                print(f"[DISCOVERY] SUCCESS: Secured meeting for {dm.name} at {dm.meeting_link}")
+                                logger.info(f"[DISCOVERY] SUCCESS: Secured meeting for {dm.name} | URL: {dm.meeting_link}")
 
                                 confirmation = draft_discovery_request(
                                     user_intel={
@@ -158,63 +167,74 @@ def poll_inbox_task(user_id: str):
                                     )
                                     dm.last_message_id = msg_data["id"]
                                     dm.thread_id = msg_data["thread_id"]
-                                    print(f"[DISCOVERY] Confirmation deployed to {dm.name}.")
+                                    logger.info(f"[DISCOVERY] Final confirmation deployed to {dm.name}.")
                             else:
-                                print(f"[DISCOVERY] Booking failed. Potential conflict or invalid slot.")
+                                logger.warning(f"[DISCOVERY] Booking failed. Potential calendar conflict detected.")
                         except Exception as e:
-                            print(f"[DISCOVERY] Booking Engine Failure: {e}")
+                            logger.error(f"[DISCOVERY] Booking Engine Critical Failure: {e}", exc_info=True)
                     else:
-                        print(f"[DISCOVERY] Extraction failed. Awaiting human-in-the-loop coordination.")
+                        logger.info(f"[DISCOVERY] Precision extraction failed. Awaiting human-in-the-loop intervention.")
                 else:
                     process_intent_transition(db, dm, intent)
 
         db.commit()
     except Exception as e:
-        print(f"[SENTINEL] Operational Error: {e}")
+        logger.error(f"[SENTINEL] Operational failure during inbox sweep: {e}", exc_info=True)
         db.rollback()
     finally:
         db.close()
 
 
 def process_intent_transition(db, dm, intent):
-    """Executes the business logic of Phase 2 transitions."""
+    """
+    State-Machine Transition Engine.
+    Executes business logic and protocol shifts based on AI-classified prospect intent.
+    """
     from app.workers.tasks.ghostwriter_worker import draft_followup_worker, draft_discovery_worker
 
     if intent == "POSITIVE":
         if dm.status not in ["MEETING_BOOKED", "DISCOVERY_CALL", "WAITING_FOR_REPLY"]:
-            print(f"[DISCOVERY] Positive intent detected for {dm.name}. Initiating Inquiry Draft & Company Lock...")
+            logger.info(f"[DISCOVERY] Positive intent detected for {dm.name}. Locking company and drafting discovery package.")
             dm.status = "DISCOVERY_CALL"
             target_co = dm.target_company
             if target_co:
                 target_co.status = "DISCOVERY_CALL"
+                # Consolidate outreach: stop other leads at this company
                 others = db.query(models.DecisionMaker).filter(
                     models.DecisionMaker.target_company_id == target_co.id,
                     models.DecisionMaker.id != dm.id
                 ).all()
                 for other in others:
                     if other.status not in ["TERMINATED", "MEETING_BOOKED"]:
-                        print(f"[DISCOVERY] Suppressing internal competitor: {other.name}")
+                        logger.debug(f"[DISCOVERY] Suppressing concurrent stakeholders: {other.name}")
                         other.status = "TERMINATED"
                         hubspot_provider.update_lead_status(other.hubspot_id, "Terminated (Internal Lead Secured)")
             draft_discovery_worker(dm.id, db=db)
     elif intent == "NEGATIVE":
+        logger.info(f"[INTENT] Terminating outreach for {dm.name} due to explicit rejection.")
         dm.status = "TERMINATED"
         hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated")
     elif intent == "NEUTRAL":
         if dm.followup_count < 11:
+            logger.info(f"[INTENT] Neutral engagement from {dm.name}. Triggering persistence nudge #{dm.followup_count + 1}")
             draft_followup_worker(dm.id)
         else:
+            logger.info(f"[INTENT] Exhausted follow-up threshold for {dm.name}. Terminating mission.")
             dm.status = "TERMINATED"
-            hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (Exhausted 11 Follow-ups)")
+            hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (Exhausted Threshold)")
 
 
 @celery_app.task
 def poll_all_users_task():
-    """Governing task: mobilizing inbox sentinel for all user sectors."""
+    """
+    Master Dispatcher: Inbox Sentinel.
+    Iterates through all active user sectors to initiate the sentinel sweep.
+    """
     db = SessionLocal()
     try:
         users = db.query(models.User).all()
         for user in users:
+            # trial enforcement
             if user.is_demo and user.demo_expires_at:
                 if user.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
                     continue
@@ -224,7 +244,10 @@ def poll_all_users_task():
 
 
 def check_upcoming_meetings_task():
-    """Sentinel for meeting reminders."""
+    """
+    Meeting Proximity Sentinel.
+    Monitors all booked meetings and dispatches automated reminders at the 24h and 1h coordinates.
+    """
     db = SessionLocal()
     try:
         now = datetime.datetime.now(UTC)
@@ -248,7 +271,7 @@ def check_upcoming_meetings_task():
 
 
 def _send_reminder(db, dm, reminder_type: str):
-    """Dispatches a meeting reminder email."""
+    """Dispatches a professional meeting reminder package."""
     subject = f"Reminder: Discovery Call with {dm.campaign.user_intel.company_name} ({reminder_type} to go)"
     body = f"Hi {dm.name},\n\nThis is a quick reminder for our discovery call scheduled in {reminder_type}.\n\n"
     if dm.scheduling_note and "Conflict" in dm.scheduling_note:
@@ -257,12 +280,15 @@ def _send_reminder(db, dm, reminder_type: str):
     creds = TokenService.get_google_credentials(db, dm.campaign.user_id)
     email_service.send_email(dm.email, subject, body, creds=creds, thread_id=dm.thread_id)
     hubspot_provider.update_lead_status(dm.hubspot_id, f"{reminder_type} Reminder Sent")
-    print(f"[SENTINEL] {reminder_type} Reminder sent to {dm.name}")
+    logger.info(f"[SENTINEL] {reminder_type} Reminder deployed for stakeholder {dm.name}")
 
 
 def check_inactivity_reminders_task():
-    """Silence Sentinel: Checks for non-responsive prospects and triggers nudges."""
-    print("[SENTINEL] Auditing prospect silence levels...")
+    """
+    Silence Detection Sentinel.
+    Audits all active mission sectors for non-responsive prospects and automates re-engagement nudges.
+    """
+    logger.info("[SENTINEL] Auditing prospect silence levels across active sectors...")
     db = SessionLocal()
     try:
         from datetime import timedelta
@@ -295,14 +321,14 @@ def check_inactivity_reminders_task():
 
         db.commit()
     except Exception as e:
-        print(f"[SENTINEL] Inactivity Audit Error: {e}")
+        logger.error(f"[SENTINEL] Inactivity Audit Critical Failure: {e}", exc_info=True)
         db.rollback()
     finally:
         db.close()
 
 
 def _process_inactivity_transition(db, dm, last_sent_log):
-    """Executes the automated reminder sequence."""
+    """Executes the automated nudging sequence logic."""
     current_status = dm.status
     target_status = None
     hs_label = None
@@ -315,8 +341,8 @@ def _process_inactivity_transition(db, dm, last_sent_log):
         hs_label = "Reminder 2 Sent"
     elif current_status == "REMINDER_2_SENT":
         dm.status = "TERMINATED"
-        hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (No Reply)")
-        print(f"[SENTINEL] Terminating silent prospect: {dm.name}")
+        hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (System Timeout)")
+        logger.info(f"[SENTINEL] Mission Timeout: Terminating silence for {dm.name}")
         return
 
     if target_status:
@@ -339,18 +365,18 @@ def _process_inactivity_transition(db, dm, last_sent_log):
             dm.last_message_id = msg_data["id"]
             dm.thread_id = msg_data["thread_id"]
             hubspot_provider.update_lead_status(dm.hubspot_id, hs_label)
-            print(f"[SENTINEL] Silence broken: {hs_label} deployed to {dm.name}")
+            logger.info(f"[SENTINEL] Silence transition: {hs_label} deployed to {dm.name}")
         except Exception as e:
-            print(f"[SENTINEL] Failed to deploy nudge to {dm.name}: {e}")
+            logger.error(f"[SENTINEL] Failed to deploy re-engagement nudge to {dm.name}: {e}")
 
 
 @celery_app.task
 def check_all_meetings_task():
-    """Governing task: mobilizing meeting reminders for all user sectors."""
+    """Master Dispatcher: Meeting Sentinel."""
     check_upcoming_meetings_task()
 
 
 @celery_app.task
 def check_all_inactivity_task():
-    """Governing task: mobilizing silence sentinel for all user sectors."""
+    """Master Dispatcher: Silence Sentinel."""
     check_inactivity_reminders_task()

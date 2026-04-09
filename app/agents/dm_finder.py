@@ -7,10 +7,11 @@ import json
 import os
 import re
 from dotenv import load_dotenv
+from app.core.logging_config import logger
 
 load_dotenv()
 
-# We use gpt-4o-mini for efficient extraction and auditing
+# High-fidelity LLM for efficient stakeholder extraction and auditing
 llm = ChatOpenAI(
     model="gpt-4o-mini", 
     temperature=0,
@@ -27,24 +28,27 @@ class DMFinderResponse(BaseModel):
     decision_makers: List[DecisionMakerSchema] = Field(description="List of validated high-level stakeholders")
 
 def clean_linkedin_url(url: str) -> str:
-    """Strips tracking parameters from LinkedIn URLs."""
+    """
+    LinkedIn Coordinate Normalization.
+    Strips tracking parameters and ephemeral tokens from LinkedIn URLs to ensure persistent identification.
+    """
     if not url: return "unknown"
-    # Basic regex to keep the core profile path
     match = re.search(r'(https?://[a-z]+\.linkedin\.com/in/[a-zA-Z0-9_-]+)', url)
     return match.group(1) if match else url
 
 def find_decision_makers(company_name: str, location: str):
     """
-    Inputs: Registered company name and city/region.
-    Logic:
-    1. Two-pass search (C-Suite vs leadership) using Tavily Advanced & DDGS with Location Fencing.
-    2. LLM-based extraction, high-fidelity audit (Current vs Former), and deduplication.
-    3. Yields Top 3 most senior stakeholders.
+    Stakeholder Identification Protocol.
+    Executes a high-fidelity targeted search for executive leadership within a specific company and geography.
+    Process:
+    1. Targeted Query Strategy: Uses Boolean operators and site-specific fencing.
+    2. Parallel Search Execution: Mobilizes multiple search clusters concurrently.
+    3. 'Default Reject' Auditing: Uses AI to verify current role, seniority, and brand association.
+    4. Provides the Top 3 most senior and verified stakeholders.
     """
-    print(f" [DM Finder] Starting localized stakeholder research for: {company_name} in {location}")
+    logger.info(f"[DM FINDER] Starting localized stakeholder research for: {company_name} in {location}")
     
-    # 1. Targeted Query Strategy (Strict Identifier)
-    # Using 'intitle' on LinkedIn profiles forces the company name to be a core part of the person's identity or headline.
+    # 1. Targeted LinkedIn Query Strategy
     query = f'site:linkedin.com/in intitle:"{company_name}" "{location}" ("CEO" OR "CTO" OR "Founder" OR "Managing Director" OR "VP" OR "Director")'
     
     all_raw_results = []
@@ -58,10 +62,10 @@ def find_decision_makers(company_name: str, location: str):
                 all_raw_results.append(r)
                 seen_urls.add(r['url'])
     except Exception as e:
-        print(f" [DM Finder] Search failed for query '{query}': {e}")
+        logger.error(f"[DM FINDER] Search execution failed for query '{query}': {e}")
             
     if not all_raw_results:
-        print(f" [DM Finder] Zero candidates found for {company_name} in {location}")
+        logger.warning(f"[DM FINDER] Zero candidates found for {company_name} in {location}")
         return []
 
     # 3. LLM Audit with 'Default Reject' Protocol
@@ -90,7 +94,7 @@ def find_decision_makers(company_name: str, location: str):
     LIMIT: Return Top 3 unique, verified-current EXECUTIVES only.
     """
     
-    # Use a safe slice to avoid context limits
+    # Slice to respect LLM context context limits
     all_raw_results = all_raw_results if isinstance(all_raw_results, list) else []
     results_to_process = all_raw_results[:20]
     
@@ -100,23 +104,23 @@ def find_decision_makers(company_name: str, location: str):
     ]
     
     try:
-        print(f" [DM Finder] Auditing {len(results_to_process)} snippets for {company_name} ({location})...")
+        logger.info(f"[DM FINDER] Auditing {len(results_to_process)} snippets for {company_name} ({location})...")
         response = structured_llm.invoke(messages)
         
         final_dms = []
         for dm in response.decision_makers:
-            # We enforce the 85 point floor as requested to ensure executive seniority
+            # We enforce the 85 point seniority floor to ensure executive-level decision making capability
             if dm.seniority_score >= 85:
                 dm_dict = dm.model_dump()
                 dm_dict['similarity_score'] = dm.seniority_score
                 dm_dict['linkedin'] = clean_linkedin_url(dm.linkedin)
                 final_dms.append(dm_dict)
         
-        # Ensure Top 3
+        # Rank by seniority score and return Top 3
         top_3 = sorted(final_dms, key=lambda x: x['similarity_score'], reverse=True)[:3]
-        print(f" [DM Finder] Success: Verified {len(top_3)} high-level executives for {company_name}.")
+        logger.info(f"[DM FINDER] Success: Verified {len(top_3)} high-level executives for {company_name}")
         return top_3
         
     except Exception as e:
-        print(f" [DM Finder] LLM Verification failed: {e}")
+        logger.error(f"[DM FINDER] AI Stakeholder Audit failed: {e}", exc_info=True)
         return []

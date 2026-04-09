@@ -3,18 +3,28 @@ import base64
 import json
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
+from app.core.logging_config import logger
 
 class GmailProvider:
+    """
+    Sovereign Gmail Integration Layer.
+    Provides high-fidelity abstractions for scanning, reading, and managing corporate email communications
+    for a specific user sector using established OAuth2 credentials.
+    """
     def __init__(self, creds: Credentials = None):
         """
-        Initializes the GMail provider for a specific sector (user).
-        The creds are usually generated dynamically via the TokenService.
+        Initializes the Gmail provider for a specific sector (user).
+        Credentials are authenticated and provisioned dynamically via the TokenService.
         """
         self.creds = creds
         
     def get_latest_replies(self):
-        """Scans the inbox for recent prospect replies."""
+        """
+        Inbox Sentinel Logic.
+        Scans the INBOX for recent messages, extracts structured payload data, and decodes content for AI intent classification.
+        """
         if not self.creds:
+            logger.warning("[GMAIL-IN] Aborting inbox scan: Null credentials provided.")
             return []
 
         try:
@@ -69,16 +79,20 @@ class GmailProvider:
             return replies
 
         except Exception as e:
-            print(f"[GMAIL-IN] Scanner Failure: {e}")
+            logger.error(f"[GMAIL-IN] Scanner Critical Failure: {e}", exc_info=True)
             return []
 
     def mark_as_read(self, message_id):
-        """Removes the UNREAD label from a message."""
+        """
+        Communication Protocol: Inbox Housekeeping.
+        Removes the UNREAD label from a specific message to synchronize state across clients.
+        """
         if not self.creds: return
         try:
             service = build('gmail', 'v1', credentials=self.creds)
             service.users().messages().batchModify(userId='me', body={'ids': [message_id], 'removeLabelIds': ['UNREAD']}).execute()
-        except: pass
+        except Exception as e:
+            logger.debug(f"[GMAIL-OUT] State sync error: {e}")
 
 # Export a simple factory or class for use within the worker/service layers
 # The credentials will be injected by the TokenService in those contexts.

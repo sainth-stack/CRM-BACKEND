@@ -18,8 +18,8 @@ from app.core.security import (
 )
 from app.core.token_service import TokenService
 from app.core.email_service import email_service
-from slowapi import Limiter
 from slowapi.util import get_remote_address
+from app.core.logging_config import logger
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -82,7 +82,10 @@ async def login(request: Request, credentials: LoginRequest = Body(...), db: Ses
 
 @router.post("/manual-add-user")
 async def manual_add_user(request: LoginRequest, db: Session = Depends(get_db)):
-    """Secret endpoint for admin to add users since public sign-up is disabled."""
+    """
+    Direct Identity Provisioning.
+    Allows administrative persistence of new user profiles without public sign-up flows.
+    """
     existing_user = db.query(models.User).filter(models.User.email == request.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="User already exists")
@@ -98,7 +101,10 @@ async def manual_add_user(request: LoginRequest, db: Session = Depends(get_db)):
 @router.post("/demo/signup")
 @limiter.limit("5/minute")   # Bot-flood shield: 5 demo signups/minute per IP
 async def demo_signup(request: Request, credentials: LoginRequest = Body(...), db: Session = Depends(get_db)):
-    """Public onboarding for 5-day trial identities."""
+    """
+    Trial Identity Mobilization.
+    Initializes a temporary 5-day assessment account and dispatches a verification coordinate (OTP).
+    """
     existing_user = db.query(models.User).filter(models.User.email == credentials.email).first()
     if existing_user:
         # Boundary Enforcement: Prevent Trial Renewal Loops
@@ -123,18 +129,18 @@ async def demo_signup(request: Request, credentials: LoginRequest = Body(...), d
     db.add(user)
     db.commit()
     
-    try:
-        from app.core.email_service import email_service
-        email_service.send_otp_email(user.email, otp)
     except Exception as e:
-        print(f"[DEMO] OTP Dispatch Error: {e}")
+        logger.error(f"[DEMO] Identity verification dispatch failure: {e}")
         # In production, we might want to log this but continue
         
     return {"message": "Identity verification mobilized. Please check your email for the code."}
 
 @router.post("/demo/verify")
 async def verify_demo_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
-    """Finalizes demo identity creation and activates the 5-day boundary."""
+    """
+    Trial Boundary Activation.
+    Validates the provided OTP and activates the 5-day temporal boundary for the trial identity.
+    """
     user = db.query(models.User).filter(models.User.email == request.email).first()
     if not user or not user.otp_code or user.otp_code != request.otp:
         raise HTTPException(status_code=400, detail="Invalid verification code.")
@@ -184,7 +190,10 @@ class ForgotPasswordRequest(BaseModel):
 @router.post("/forgot-password")
 @limiter.limit("5/minute")   # Enumeration shield: 5 reset requests/minute per IP
 async def forgot_password(request: Request, payload: ForgotPasswordRequest = Body(...), db: Session = Depends(get_db)):
-    """Generates an OTP and dispatches it via GMail for identity verification."""
+    """
+    Identity Recovery Initialization.
+    Dispatches a secure 6-digit verification code to the registered email to authorize password restoration.
+    """
     user = db.query(models.User).filter(models.User.email == payload.email).first()
     if not user:
         # Explicitly checking for user as requested for clearer UX feedback
@@ -199,10 +208,8 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest = Bod
     user.otp_expiry = datetime.datetime.now(UTC) + timedelta(minutes=10)
     db.commit()
 
-    try:
-        email_service.send_otp_email(payload.email, otp)
     except Exception as e:
-        print(f"[AUTH] OTP Dispatch Error: {e}")
+        logger.error(f"[AUTH] Identity verification dispatch failure: {e}")
         raise HTTPException(status_code=500, detail="Identity portal communication failed.")
 
     return {"message": "Identity verification code mobilized to your vaulted email."}
@@ -213,7 +220,10 @@ class VerifyOTPRequest(BaseModel):
 
 @router.post("/verify-otp")
 async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
-    """Validates the 6-digit code and authorizes a temporary reset session."""
+    """
+    Verification Coordinate Validation.
+    Confirms the legitimacy of the verification code and issues a temporary reset authorization session.
+    """
     user = db.query(models.User).filter(models.User.email == request.email).first()
     if not user or not user.otp_code or user.otp_code != request.otp:
         raise HTTPException(status_code=400, detail="Invalid verification code.")
@@ -235,7 +245,10 @@ class ResetPasswordRequest(BaseModel):
 
 @router.post("/reset-password")
 async def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
-    """Executes the cryptographic update to user credentials."""
+    """
+    Cryptographic Credential Restoration.
+    Updates the user's hashed password and terminates all pre-existing sessions to ensure identity integrity.
+    """
     if request.new_password != request.confirm_password:
         raise HTTPException(status_code=400, detail="Passwords do not match.")
 
@@ -266,7 +279,10 @@ async def reset_password(request: ResetPasswordRequest, db: Session = Depends(ge
 
 @router.get("/me")
 async def get_me(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Protected route to return the current user's profile with capability status."""
+    """
+    Identity Profile Audit.
+    Retrieves the authenticated actor's profile, including role-based capabilities and trial boundary status.
+    """
     has_mailbox = db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == current_user.id).first() is not None
     is_expired = False
     if current_user.is_demo and current_user.demo_expires_at:
@@ -299,7 +315,10 @@ async def provision_admin(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Sovereign Provisioning: Super Admin only can create Admins."""
+    """
+    Sovereign Asset Provisioning.
+    Authorizes a Super Admin to establish new Administrative sectors with explicit user creation quotas.
+    """
     if current_user.role != models.UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Sovereign authority required for this operation.")
         
@@ -338,9 +357,9 @@ async def provision_admin(
                 creds=creds
             )
             email_sent = True
-            print(f"[PROVISION] Dispatch mission successful for {new_admin.email}")
+            logger.info(f"[PROVISION] Autonomous dispatch successful for Admin {new_admin.email}")
     except Exception as e:
-        print(f"[PROVISION] Autonomous dispatch failure: {e}")
+        logger.error(f"[PROVISION] Autonomous dispatch failure for Admin {new_admin.email}: {e}")
         # Note: We prioritize identity creation; dispatch failure is non-terminal for the process
         
     return {
@@ -353,7 +372,10 @@ async def list_admins(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Sovereign Visibility: Super Admin can see all Admins and their quotas."""
+    """
+    Administrative Hierarchy Audit.
+    Provides the Super Admin with comprehensive visibility into all managed sectors and their respective quotas.
+    """
     if current_user.role != models.UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Sovereign authority required.")
         
@@ -382,7 +404,10 @@ async def update_admin_quota(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Sovereign Control: Super Admin can modify an Admin's user creation limit."""
+    """
+    Sovereign Quota Management.
+    Permits the adjustment of Administrative recruitment limits to scale operations within a specific sector.
+    """
     if current_user.role != models.UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Sovereign authority required.")
         
@@ -412,7 +437,10 @@ async def decommission_admin(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Sovereign Decommission: Super Admin can permanently remove an Admin."""
+    """
+    Sovereign Decommission Protocol.
+    Permanently revokes Administrative authority and terminates the associated sector.
+    """
     if current_user.role != models.UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Sovereign authority required.")
         
@@ -447,7 +475,10 @@ async def provision_user(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Administrative Provisioning: Admins can create Users up to their provisioned limit."""
+    """
+    Operational Identity Provisioning.
+    Allows Administrators to establish new User identities within their provisioned sector quota.
+    """
     if current_user.role not in [models.UserRole.ADMIN, models.UserRole.SUPER_ADMIN]:
         raise HTTPException(status_code=403, detail="Administrative authority required.")
         
@@ -500,9 +531,9 @@ async def provision_user(
                 creds=creds
             )
             email_sent = True
-            print(f"[PROVISION] Dispatch mission successful for {new_user.email}")
+            logger.info(f"[PROVISION] Autonomous dispatch successful for User {new_user.email}")
     except Exception as e:
-        print(f"[PROVISION] Autonomous dispatch failure: {e}")
+        logger.error(f"[PROVISION] Autonomous dispatch failure for User {new_user.email}: {e}")
         
     return {
         "message": "User identity provisioned successfully.",
@@ -514,7 +545,10 @@ async def list_managed_users(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Sector Visibility: Admins can see all users they've provisioned."""
+    """
+    Operational Sector Audit.
+    Retrieves a listing of all User identities active within the Administrator's jurisdiction.
+    """
     if current_user.role not in [models.UserRole.ADMIN, models.UserRole.SUPER_ADMIN]:
         raise HTTPException(status_code=403, detail="Administrative authority required.")
         
@@ -543,7 +577,10 @@ async def decommission_user(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Sector Decommission: Admins can remove users they provisioned."""
+    """
+    Operational Decommission Protocol.
+    Permanently revokes User authority and terminates the associated identity sector.
+    """
     if current_user.role not in [models.UserRole.ADMIN, models.UserRole.SUPER_ADMIN]:
         raise HTTPException(status_code=403, detail="Administrative authority required.")
         
@@ -569,7 +606,10 @@ async def decommission_user(
 
 @router.get("/google/url")
 async def get_google_auth_url(current_user: models.User = Depends(get_current_user)):
-    """Generates the secure Google OAuth2 portal URL for mailbox authorization."""
+    """
+    Authorization Gateway Initialization.
+    Generates the high-fidelity Google OAuth2 URL required to grant the system mailbox capabilities.
+    """
     from app.core.auth import GoogleAuthService
     return {"url": GoogleAuthService.get_authorization_url(email=current_user.email)}
 
@@ -592,26 +632,26 @@ async def connect_google_mailbox(
 
     # 1. Exchange Code for Persistent Refresh Token
     from app.core.auth import GoogleAuthService
-    print(f"[AUTH] MOBILIZING CODE EXCHANGE. User Identity: {current_user.email}, Redirect: {redirect_uri}")
+    logger.info(f"[AUTH] MOBILIZING CODE EXCHANGE. User Identity: {current_user.email}, Redirect: {redirect_uri}")
     try:
         mailbox_data = await GoogleAuthService.verify_auth_code_for_mailbox(code, redirect_uri=redirect_uri)
     except Exception as e:
-        print(f"[REJECTED] Handshake Collision: {e}")
+        logger.error(f"[REJECTED] Handshake Collision for {current_user.email}: {e}")
         raise
         
     refresh_token = mailbox_data.get("refresh_token")
     email = mailbox_data.get("email")
-    print(f"[AUTH] CAPTURED HANDSHAKE. Authorized Identity: {email}")
+    logger.info(f"[AUTH] CAPTURED HANDSHAKE. Authorized Identity: {email}")
 
     if not email or email.lower() != current_user.email.lower():
-        print(f"[IDENTITY MISMATCH] User: {current_user.email}, Authorized: {email}")
+        logger.warning(f"[IDENTITY MISMATCH] Sector User: {current_user.email}, Authorized Identity: {email}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Identity mismatch. Professional authorization failed. You must connect the mailbox associated with your registered identity: {current_user.email}."
         )
 
     if not refresh_token:
-        print(f"[VAULT FAILURE] Refresh token missing for {email}")
+        logger.error(f"[VAULT FAILURE] Refresh token missing for authorized identity {email}")
         raise HTTPException(
             status_code=400, 
             detail="Failed to capture refresh token. Please ensure you've granted email permissions and try 'Consent' prompt."
@@ -627,11 +667,11 @@ async def connect_google_mailbox(
     encrypted_token = encrypt_token(refresh_token)
 
     if oauth_acc:
-        print(f"[VAULT UPDATE] Updating capability for {email}")
+        logger.info(f"[VAULT UPDATE] Updating established capability for {email}")
         oauth_acc.email_address = email
         oauth_acc.encrypted_refresh_token = encrypted_token
     else:
-        print(f"[VAULT NEW] Synchronizing new capability for {email}")
+        logger.info(f"[VAULT NEW] Synchronizing new mailbox capability for {email}")
         oauth_acc = models.OAuthAccount(
             user_id=current_user.id,
             provider="google",
@@ -641,7 +681,7 @@ async def connect_google_mailbox(
         db.add(oauth_acc)
 
     db.commit()
-    print(f"[SUCCESS] CAPABILITY VAULTED FOR {email}")
+    logger.info(f"[SUCCESS] CAPABILITY VAULTED AND SYNCHRONIZED FOR {email}")
     return {"message": "Mailbox synchronization active. Capability vaulted successfully.", "email": email}
 
 @capability_router.delete("/mailbox")
@@ -649,7 +689,10 @@ async def disconnect_mailbox(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Decommission mailbox capability for the current user."""
+    """
+    Capability Decommissioning.
+    Permanently revokes the system's authorization to access the user's mailbox.
+    """
     oauth_acc = db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == current_user.id).first()
     if oauth_acc:
         db.delete(oauth_acc)

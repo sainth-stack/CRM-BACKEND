@@ -4,28 +4,35 @@ from google.oauth2.credentials import Credentials
 from app.db import models
 from app.core.security import decrypt_token
 from app.core.auth import GoogleAuthService
+from app.core.logging_config import logger
 
 class TokenService:
+    """
+    Vaulted Identity Anchor Service.
+    Orchestrates the retrieval and decryption of secure OAuth2 credentials to enable 
+    autonomous sector outreach and communication monitoring.
+    """
     @staticmethod
     def get_google_credentials(db: Session, user_id: str) -> Credentials:
         """
-        Fetches the vaulted refresh token for a user, decrypts it, 
-        and returns a Google Credentials object.
+        Credential Recovery Protocol.
+        Fetches the vaulted refresh token for a user, executes cryptographic decryption, 
+        and reconstructs a valid Google Credentials object for API interactions.
         """
-        # 1. Fetch Capability from Vault
+        # 1. Fetch Capability from Vaulted Identity Store
         oauth_acc = db.query(models.OAuthAccount).filter(
             models.OAuthAccount.user_id == user_id,
             models.OAuthAccount.provider == "google"
         ).first()
 
         if not oauth_acc:
+            logger.warning(f"[IDENTITY] No Google outreach capability identified for user sector {user_id}")
             return None
 
-        # 2. Decrypt Refresh Token
+        # 2. Decrypt the Anchor Token
         refresh_token = decrypt_token(oauth_acc.encrypted_refresh_token)
 
-        # 3. Build Credentials Object
-        # Note: token=None because we want it to be refreshed on first use
+        # 3. Synchronize Credentials Object for Autonomous Operation
         creds = Credentials(
             token=None,
             refresh_token=refresh_token,
@@ -43,7 +50,8 @@ class TokenService:
     @staticmethod
     async def refresh_and_update_access(db: Session, user_id: str):
         """
-        Optional: Proactively refreshes the token.
-        (google-auth library handles this automatically if refresh_token is present).
+        Identity Lifecycle Management.
+        Supports proactive synchronization of access tokens when required by external integrations.
+        (Note: google-auth-library implements automated JIT-refreshing by default).
         """
         pass

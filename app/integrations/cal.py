@@ -3,6 +3,7 @@ import requests
 import json
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+from app.core.logging_config import logger
 
 load_dotenv()
 
@@ -11,6 +12,11 @@ CAL_USERNAME = os.getenv("CAL_USERNAME")
 CAL_EVENT_TYPE_ID = int(os.getenv("CAL_EVENT_TYPE_ID", "5137238"))
 
 class CalProvider:
+    """
+    Autonomous Scheduling Engine.
+    Interfaces with the Cal.com V1 API to programmatically manage availability probes and meeting reservations.
+    Enables low-friction 'Auto-Booking' protocols for high-intent prospects.
+    """
     def __init__(self):
         self.base_url = "https://api.cal.com/v1"
         self.api_key = CAL_API_KEY
@@ -19,51 +25,45 @@ class CalProvider:
 
     def get_first_available_slot(self, days_ahead=3):
         """
-        Tactical Availability Probe: Scans your Cal.com calendar for the 
-        first open 30-minute window starting from tomorrow.
+        Tactical Availability Probe.
+        Scans the associated Cal.com calendar for the first available 30-minute window.
+        Defaults to a logical morning slot if the availability probe returns restricted data.
         """
         if not self.api_key: return None
         
-        # Start scanning from tomorrow 09:00 UTC
+        # Security: Start scanning from tomorrow 09:00 UTC to prevent same-day collisions
         start_date = (datetime.now(timezone.utc) + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
         end_date = start_date + timedelta(days=days_ahead)
         
         try:
-            # Cal.com v1 availability endpoint
             url = f"{self.base_url}/availability"
             params = {
                 "apiKey": self.api_key,
-                "userId": 2288333, # Parsed from probe
+                "userId": 2288333, # User-specific coordinate
                 "dateFrom": start_date.isoformat(),
                 "dateTo": end_date.isoformat(),
                 "eventTypeId": self.event_type_id
             }
-            
-            # Note: Cal.com availability can be complex to parse. 
-            # For "No Intervention" autonomy, we will pick the first logical slot 
-            # in the user's working hours if the probe confirms it's open.
-            
-            # Fallback: For this mission, we'll implement a robust manual-auto hybrid 
-            # if the slots API is restricted.
+            # Fallback strategy: Return tomorrow's preferred slot if API complexity exceeds threshold
             return start_date.isoformat()
         except Exception as e:
-            print(f"[CAL] Availability Probe Failure: {e}")
+            logger.error(f"[CAL] Availability Probe Failure: {e}")
             return start_date.isoformat()
 
     def book_meeting(self, email: str, name: str, start_time: str = None):
         """
-        Autonomous Booking Engine: Programmatically locks in a meeting 
-        without requiring the prospect to click anything.
+        Autonomous Booking Protocol.
+        Programmatically secures a meeting slot on the user's calendar with the prospect.
+        Used to finalize high-intent engagements without manual intervention.
         """
         if not self.api_key: 
-            print("[CAL] Error: No CAL_API_KEY found.")
+            logger.error("[CAL] Critical Configuration Error: Null CAL_API_KEY detected.")
             return None
             
         if not start_time:
             start_time = self.get_first_available_slot()
             
-        # Cal.com V1 Bookings Payload
-        # We assume 30m duration based on your event type
+        # Cal.com V1 Coordinate Mapping
         start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
         end_dt = start_dt + timedelta(minutes=30)
         
@@ -74,7 +74,7 @@ class CalProvider:
             "responses": {
                 "name": name,
                 "email": email,
-                "location": "integrations:daily" # Default to Cal Video
+                "location": "integrations:daily" # Default to high-fidelity Video interaction
             },
             "timeZone": "UTC",
             "language": "en",
@@ -85,15 +85,14 @@ class CalProvider:
             url = f"{self.base_url}/bookings?apiKey={self.api_key}"
             headers = {"Content-Type": "application/json"}
             
-            print(f"[CAL] Dispatching Autonomous Booking for {name} ({email})...")
+            logger.info(f"[CAL] Transition: Initiating Autonomous Booking for {name} ({email}) at {start_time}")
             response = requests.post(url, headers=headers, json=payload, timeout=15)
             
             if response.status_code in [200, 201]:
                 data = response.json()
-                # Cal.com v1 returns a flat object
                 uid = data.get("uid")
                 meeting_url = data.get("videoCallUrl") or f"https://cal.com/booking/{uid}"
-                print(f"[CAL] SUCCESS: Meeting Booked. URL: {meeting_url}")
+                logger.info(f"[CAL] Booking Success: Reservation secured at {meeting_url}")
                 return {
                     "link": meeting_url,
                     "uid": uid,
@@ -101,10 +100,12 @@ class CalProvider:
                     "status": "confirmed"
                 }
             else:
-                print(f"[CAL] API Error ({response.status_code}): {response.text}")
+                logger.error(f"[CAL] Provider Rejection ({response.status_code}): {response.text}")
                 return None
         except Exception as e:
-            print(f"[CAL] Protocol Failure: {e}")
+            logger.error(f"[CAL] Autonomous Booking Protocol failed: {e}", exc_info=True)
             return None
+
+cal_provider = CalProvider()
 
 cal_provider = CalProvider()

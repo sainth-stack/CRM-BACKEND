@@ -23,8 +23,8 @@ import os
 # Initialize Enterprise Logging
 logger = setup_logging()
 
-# --- Rate Limiter (IP-based, Redis-backed) ---
-limiter = Limiter(key_func=get_remote_address, storage_uri=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+# --- Rate Limiter (IP-based, Cloud-backed for scalability) ---
+limiter = Limiter(key_func=get_remote_address, storage_uri=os.getenv("REDIS_URL"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -138,6 +138,7 @@ from app.core.sanitizer import sanitize_text
 @app.post("/campaigns", response_model=CampaignResponse)
 @limiter.limit("5/minute")
 def create_campaign(
+    request: Request,
     campaign: CampaignCreate, 
     background_tasks: BackgroundTasks, 
     db: Session = Depends(get_db),
@@ -279,6 +280,7 @@ def delete_campaign(
 @app.put("/campaigns/{campaign_id}/status", response_model=CampaignResponse)
 @limiter.limit("15/minute")
 def update_campaign_status(
+    request: Request,
     campaign_id: str, 
     status: str = Query(..., alias="status"), 
     db: Session = Depends(get_db),
@@ -447,6 +449,7 @@ def update_draft(
 @app.post("/drafts/{draft_id}/send")
 @limiter.limit("10/minute")
 def send_draft(
+    request: Request,
     draft_id: str, 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)

@@ -26,8 +26,8 @@ from app.core.logging_config import logger
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
-# Module-level limiter (shares state with main app via Redis)
-limiter = Limiter(key_func=get_remote_address, storage_uri=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+# Module-level limiter (shares state with main app via Cloud Redis)
+limiter = Limiter(key_func=get_remote_address, storage_uri=os.getenv("REDIS_URL"))
 
 class LoginRequest(BaseModel):
     email: str
@@ -85,18 +85,18 @@ async def login(request: Request, credentials: LoginRequest = Body(...), db: Ses
 
 @router.post("/manual-add-user")
 @limiter.limit("5/minute")
-async def manual_add_user(request: LoginRequest, db: Session = Depends(get_db)):
+async def manual_add_user(request: Request, payload: LoginRequest, db: Session = Depends(get_db)):
     """
     Direct Identity Provisioning.
     Allows administrative persistence of new user profiles without public sign-up flows.
     """
-    existing_user = db.query(models.User).filter(models.User.email == request.email).first()
+    existing_user = db.query(models.User).filter(models.User.email == payload.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="User already exists")
     
     user = models.User(
-        email=request.email,
-        hashed_password=get_password_hash(request.password)
+        email=payload.email,
+        hashed_password=get_password_hash(payload.password)
     )
     db.add(user)
     db.commit()
@@ -225,13 +225,13 @@ class VerifyOTPRequest(BaseModel):
 
 @router.post("/verify-otp")
 @limiter.limit("10/minute")
-async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
+async def verify_otp(request: Request, payload: VerifyOTPRequest, db: Session = Depends(get_db)):
     """
     Verification Coordinate Validation.
     Confirms the legitimacy of the verification code and issues a temporary reset authorization session.
     """
-    user = db.query(models.User).filter(models.User.email == request.email).first()
-    if not user or not user.otp_code or user.otp_code != request.otp:
+    user = db.query(models.User).filter(models.User.email == payload.email).first()
+    if not user or not user.otp_code or user.otp_code != payload.otp:
         raise HTTPException(status_code=400, detail="Invalid verification code.")
 
     # Time-based validation
@@ -251,21 +251,21 @@ class ResetPasswordRequest(BaseModel):
 
 @router.post("/reset-password")
 @limiter.limit("10/minute")
-async def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
+async def reset_password(request: Request, payload: ResetPasswordRequest, db: Session = Depends(get_db)):
     """
     Cryptographic Credential Restoration.
     Updates the user's hashed password and terminates all pre-existing sessions to ensure identity integrity.
     """
-    if request.new_password != request.confirm_password:
+    if payload.new_password != payload.confirm_password:
         raise HTTPException(status_code=400, detail="Passwords do not match.")
 
     try:
         from app.core.security import SECRET_KEY, ALGORITHM
         import jwt
-        payload = jwt.decode(request.reset_token, SECRET_KEY, algorithms=[ALGORITHM])
-        if payload.get("purpose") != "password_reset":
+        decoded_payload = jwt.decode(payload.reset_token, SECRET_KEY, algorithms=[ALGORITHM])
+        if decoded_payload.get("purpose") != "password_reset":
             raise HTTPException(status_code=401, detail="Unauthorized reset session.")
-        user_id = payload.get("sub")
+        user_id = decoded_payload.get("sub")
     except Exception:
         raise HTTPException(status_code=401, detail="Reset session expired or invalid.")
 
@@ -274,7 +274,7 @@ async def reset_password(request: ResetPasswordRequest, db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="Identity profile not found.")
 
     # Commit secure hashed credentials
-    user.hashed_password = get_password_hash(request.new_password)
+    user.hashed_password = get_password_hash(payload.new_password)
     user.otp_code = None # Invalidate OTP after success
     user.otp_expiry = None
     db.commit()
@@ -479,7 +479,8 @@ class UserProvisionRequest(BaseModel):
 @router.post("/management/users")
 @limiter.limit("5/minute")
 async def provision_user(
-    request: UserProvisionRequest, 
+    request: Request,
+    payload: UserProvisionRequest, 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
@@ -504,13 +505,13 @@ async def provision_user(
                 detail=f"User provision limit reached ({fresh_admin.user_limit}). Contact Super Admin for sector expansion."
             )
             
-    existing = db.query(models.User).filter(models.User.email == request.email).first()
+    existing = db.query(models.User).filter(models.User.email == payload.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Identity portal already contains this email.")
         
     new_user = models.User(
-        email=request.email,
-        hashed_password=get_password_hash(request.password),
+        email=payload.email,
+        hashed_password=get_password_hash(payload.password),
         role=models.UserRole.USER,
         created_by_id=current_user.id,
         signup_source="manual"
@@ -535,7 +536,7 @@ async def provision_user(
             email_service.send_provisioning_email(
                 to_email=new_user.email,
                 role="User",
-                password=request.password,
+                password=payload.password,
                 creds=creds
             )
             email_sent = True
@@ -551,6 +552,7 @@ async def provision_user(
 @router.get("/management/users")
 @limiter.limit("15/minute")
 async def list_managed_users(
+    request: Request,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
     page: int = Query(1, ge=1, description="Page number"),
@@ -597,6 +599,7 @@ async def list_managed_users(
 @router.delete("/management/users/{user_id}")
 @limiter.limit("5/minute")
 async def decommission_user(
+    request: Request,
     user_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)

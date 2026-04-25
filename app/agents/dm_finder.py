@@ -4,10 +4,10 @@ from app.integrations.search import search_provider
 from pydantic import BaseModel, Field
 from typing import List
 import json
-import os
 import re
 from dotenv import load_dotenv
 from app.core.logging_config import logger
+from app.core.llm_resilience import run_openai_guarded
 
 load_dotenv()
 
@@ -105,7 +105,11 @@ def find_decision_makers(company_name: str, location: str):
     
     try:
         logger.info(f"[DM FINDER] Auditing {len(results_to_process)} snippets for {company_name} ({location})...")
-        response = structured_llm.invoke(messages)
+        response = run_openai_guarded(
+            "dm_finder_audit",
+            lambda: structured_llm.invoke(messages),
+            fallback=DMFinderResponse(decision_makers=[]),
+        )
         
         final_dms = []
         for dm in response.decision_makers:

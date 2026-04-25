@@ -37,6 +37,11 @@ def research_user_company_worker(self, campaign_id: str):
             logger.warning(f"No user intel profile for campaign {campaign_id}.")
             return
 
+        from app.workers.utils import acquire_lease, release_lease
+        worker_id = f"worker:{self.request.id}"
+        if not acquire_lease(db, campaign_id, worker_id):
+            return
+
         logger.info(f"Starting deep research for campaign {campaign_id} on {intel.website}")
         research_data = research_user_company(intel.website)
         if research_data:
@@ -46,9 +51,15 @@ def research_user_company_worker(self, campaign_id: str):
             intel.offerings = json.dumps(research_data.get("core_offerings"))
             intel.deep_research = research_data.get("deep_research")
             db.commit()
+            
+            # Explicit Lease Release: Handoff to next cluster
+            release_lease(db, campaign_id, worker_id)
             check_phase_1_completion(campaign_id)
     except Exception as e:
         logger.error(f"User Research Critical Error for campaign {campaign_id}: {e}", exc_info=True)
+        # Clear lease on failure to allow retry/recovery
+        try: release_lease(db, campaign_id, f"worker:{self.request.id}")
+        except: pass
         self.retry(exc=e)
     finally:
         db.close()
@@ -65,11 +76,14 @@ def check_phase_1_completion(campaign_id: str):
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         intel = campaign.user_intel
 
-        # Criteria: Deep Research Validation Gate
-        if intel and intel.deep_research and intel.deep_research not in [
-            "Analysis pending deep synchronization.",
-            "Identity verified through site architecture."
-        ]:
+        # Criteria: Deep Research Validation Gate & Status Guard
+        if (
+            campaign.status == models.CampaignStatus.RESEARCHING_USER_COMPANY and
+            intel and intel.deep_research and intel.deep_research not in [
+                "Analysis pending deep synchronization.",
+                "Identity verified through site architecture."
+            ]
+        ):
             logger.info(f"[MISSION CONTROL] User Intel Phase Complete for {campaign_id}. Dispatching Discovery Cluster.")
             campaign.status = models.CampaignStatus.FINDING_TARGET_COMPANIES
             db.commit()

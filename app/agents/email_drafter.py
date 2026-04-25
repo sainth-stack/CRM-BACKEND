@@ -1,8 +1,8 @@
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-import os
 from dotenv import load_dotenv
 from app.core.logging_config import logger
+from app.core.llm_resilience import run_openai_guarded
 
 load_dotenv()
 
@@ -44,7 +44,10 @@ STRICT CONSTRAINTS:
 """
 
 FOLLOW_UP_PROMPT = """You are a World-Class Persistence Ghostwriter.
-Your task is to draft a short, convincing follow-up email to a prospect who previously replied neutrally.
+Your task is to draft a short, convincing follow-up email.
+
+MODE: {outreach_mode}
+(Mode 'NUDGE' = persistence on a thread. Mode 'COORDINATION' = auto-booking failed, need to ask for their time manually).
 
 Our Company Info:
 - Name: {user_company_name}
@@ -57,20 +60,20 @@ Decision Maker Info:
 Communication History (Most recent first):
 {thread_history}
 
-Current Progress: This is Follow-up #{followup_number} of 11.
+{progress_context}
 
 STRATEGY:
-- Be polite and persistent, not pushy.
-- Directly address the prospect's previous neutral points or hesitant tone.
-- Re-iterate why {user_company_name} is a strategic match for {dm_company} based on your previous research.
+- Be polite and professional.
+    - If MODE is 'COORDINATION': Politely ask them to share 2-3 time slots that work for them next week for a 15-min discovery call.
+- If MODE is 'NUDGE': Directly address the prospect's previous neutral points. Re-iterate strategic match.
 - The goal is a "Discovery Call".
 
 STRICT CONSTRAINTS:
 1. NO PLACEHOLDERS.
 2. NO bracketed signatures. Just the company name "{user_company_name}".
 3. Keep length under 100 words.
-5. STRICT FORMATTING: Do NOT use mid-paragraph line breaks. Each paragraph must be a single continuous string. Only use double line breaks (\n\n) to separate sections.
-6. Return ONLY the JSON with subject and body.
+4. STRICT FORMATTING: Do NOT use mid-paragraph line breaks. Each paragraph must be a single continuous string. Only use double line breaks (\n\n) to separate sections.
+5. Return ONLY the JSON with subject and body.
 """
 
 from pydantic import BaseModel, Field
@@ -91,22 +94,26 @@ def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_nam
     
     try:
         logger.info(f"[GHOSTWRITER] Drafting initial outreach for stakeholders at {target_company_name}...")
-        data = chain.invoke({
-            "user_company_name": user_intel.get("company_name", ""),
-            "user_company_moto": user_intel.get("moto", ""),
-            "user_company_offerings": ", ".join(user_intel.get("offerings", [])),
-            "user_company_research": user_intel.get("deep_research", ""),
-            "dm_name": dm_info.get("name", ""),
-            "dm_position": dm_info.get("position", ""),
-            "dm_company": target_company_name,
-            "target_company_research": target_company_research
-        })
-        return data.model_dump()
+        data = run_openai_guarded(
+            "email_draft_generation",
+            lambda: chain.invoke({
+                "user_company_name": user_intel.get("company_name", ""),
+                "user_company_moto": user_intel.get("moto", ""),
+                "user_company_offerings": ", ".join(user_intel.get("offerings", [])),
+                "user_company_research": user_intel.get("deep_research", ""),
+                "dm_name": dm_info.get("name", ""),
+                "dm_position": dm_info.get("position", ""),
+                "dm_company": target_company_name,
+                "target_company_research": target_company_research
+            }),
+            fallback=None,
+        )
+        return data.model_dump() if data else None
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Outreach drafting critical failure: {e}", exc_info=True)
         return None
 
-def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: str, thread_history: str, followup_number: int):
+def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: str, thread_history: str, followup_number: int, manual_scheduling: bool = False):
     """
     Strategic Persistence Engineering.
     Drafts high-context follow-up communication designed to address prospect concerns while maintaining outreach momentum.
@@ -115,17 +122,26 @@ def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: s
     prompt = ChatPromptTemplate.from_template(FOLLOW_UP_PROMPT)
     chain = prompt | structured_llm
     
+    mode = "COORDINATION" if manual_scheduling else "NUDGE"
+    progress = f"Current Progress: This is Follow-up #{followup_number} of 11." if not manual_scheduling else "Context: Manual scheduling request."
+
     try:
-        logger.info(f"[GHOSTWRITER] Drafting follow-up #{followup_number} for {dm_info.get('name')}...")
-        data = chain.invoke({
-            "user_company_name": user_intel.get("company_name", ""),
-            "user_company_research": user_intel.get("deep_research", ""),
-            "dm_name": dm_info.get("name", ""),
-            "dm_company": target_company_name,
-            "thread_history": thread_history,
-            "followup_number": followup_number
-        })
-        return data.model_dump()
+        logger.info(f"[GHOSTWRITER] Drafting {mode} email for {dm_info.get('name')} (Followup #{followup_number})...")
+        data = run_openai_guarded(
+            "followup_draft_generation",
+            lambda: chain.invoke({
+                "outreach_mode": mode,
+                "user_company_name": user_intel.get("company_name", ""),
+                "user_company_research": user_intel.get("deep_research", ""),
+                "dm_name": dm_info.get("name", ""),
+                "dm_company": target_company_name,
+                "thread_history": thread_history,
+                "followup_number": followup_number,
+                "progress_context": progress
+            }),
+            fallback=None,
+        )
+        return data.model_dump() if data else None
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Follow-up drafting failure: {e}")
         return None
@@ -155,7 +171,13 @@ def draft_nudge_email(dm_name: str, user_company_name: str):
     chain = prompt | structured_llm
     try:
         logger.info(f"[GHOSTWRITER] Generating inbox nudge for {dm_name}...")
-        response = chain.invoke({"dm_name": dm_name, "user_company_name": user_company_name})
+        response = run_openai_guarded(
+            "nudge_generation",
+            lambda: chain.invoke({"dm_name": dm_name, "user_company_name": user_company_name}),
+            fallback=None,
+        )
+        if not response:
+            return f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"
         return response.body if hasattr(response, 'body') else f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Nudge generation compromised: {e}")

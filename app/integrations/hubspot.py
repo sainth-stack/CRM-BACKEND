@@ -18,12 +18,27 @@ class HubSpotProvider:
         # Valid HubSpot Lead Statuses for this client's portal
         self.STATUS_MAP = {
             "Initial Email Sent": "ATTEMPTED_TO_CONTACT",
+            "REMINDER_1_SENT Sent": "ATTEMPTED_TO_CONTACT",
+            "REMINDER_2_SENT Sent": "ATTEMPTED_TO_CONTACT",
             "Reply Received": "IN_PROGRESS",
             "Neutral Reply": "IN_PROGRESS",
+            "Discovery Invitation Sent": "CONNECTED",
+            "Discovery Reminder Sent": "CONNECTED",
+            "Discovery Expired": "IN_PROGRESS",
+            "On Hold (Peer Engaged)": "CONNECTED",
+            "Hold Released": "IN_PROGRESS",
+            "Reactivated": "IN_PROGRESS",
             "DISCOVERY_CALL": "CONNECTED",
             "Discovery Protocol": "CONNECTED",
+            "Meeting Booked": "OPEN_DEAL",
             "Booked": "OPEN_DEAL",
             "Terminated": "UNQUALIFIED",
+            "Terminated (System Timeout)": "UNQUALIFIED",
+            "Terminated (Discovery Timeout)": "UNQUALIFIED",
+            "Terminated (Negative Reply)": "UNQUALIFIED",
+            "Terminated (Invalid Schedule)": "UNQUALIFIED",
+            "Terminated (Internal Lead Secured)": "UNQUALIFIED",
+            "Terminated (Exhausted Threshold)": "UNQUALIFIED",
             "Rejected": "UNQUALIFIED",
             "NEW": "NEW"
         }
@@ -76,7 +91,5 @@ class HubSpotProvider:
             logger.info(f"[HUBSPOT] Status Synchronized: {hubspot_id} -> {hs_status} (State: {status})")
         except Exception as e:
             logger.error(f"[HUBSPOT] Status synchronization error: {e}")
-
-hubspot_provider = HubSpotProvider()
 
 hubspot_provider = HubSpotProvider()

@@ -1,13 +1,13 @@
 import os
 import json
 import requests
-import re
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from app.core.logging_config import logger
+from app.core.llm_resilience import run_openai_guarded
 
 # LangChain / OpenAI
 from langchain_openai import ChatOpenAI
@@ -100,18 +100,25 @@ class CompanyFinderPipeline:
             logger.debug(f"[ZENSERP] Page {page} fetch error: {e}")
             return []
 
-    def stage_1_recon(self, industry: str, location: str, size: str) -> list:
+    def stage_1_recon(self, industry: str, location: str, size: str, start_page: int = 0) -> list:
         """
         Phase 1: Search Reconnaissance.
         Mobilizes multi-threaded search queries to gather raw LinkedIn company snapshots.
         """
         query = f'site:linkedin.com/company "{industry}" "{location}"'
         if size: query += f' "{size}"'
-        logger.info(f"[PIPELINE] Stage 1: Parallel Zenserp Recon for query sector '{query}'")
+        
+        # Determine target range to avoid redundant credit spend
+        end_page = 3
+        if start_page >= end_page:
+            logger.info(f"[PIPELINE] Idempotency Hit: All {end_page} pages already processed. Skipping Recon.")
+            return []
+            
+        logger.info(f"[PIPELINE] Stage 1: Parallel Zenserp Recon for query sector '{query}' (Pages {start_page} to {end_page-1})")
         all_results = []
         headers = {"apikey": ZENSERP_API_KEY} if ZENSERP_API_KEY else {}
         with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [executor.submit(self.fetch_zenserp_page, query, p, headers) for p in range(3)]
+            futures = [executor.submit(self.fetch_zenserp_page, query, p, headers) for p in range(start_page, end_page)]
             for f in as_completed(futures):
                 all_results.extend(f.result())
         return all_results
@@ -131,7 +138,12 @@ class CompanyFinderPipeline:
 4. IDENTITY LOCK: Even if a result points to a LinkedIn profile, capture that company as a unique entity. Do NOT reject actual companies just because they are hosted on LinkedIn. 
 5. Return a clean, unique list of brand identities."""
         try:
-            return structured_llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=json.dumps(raw_results, indent=2))]).companies
+            result = run_openai_guarded(
+                "company_deduplication",
+                lambda: structured_llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=json.dumps(raw_results, indent=2))]),
+                fallback=DeduplicationResult(companies=[]),
+            )
+            return result.companies
         except Exception as e:
             logger.error(f"[PIPELINE] Deduplication audit critical failure: {e}")
             return []
@@ -174,7 +186,11 @@ class CompanyFinderPipeline:
             try:
                 identity_auditor = self.llm.with_structured_output(WebsiteExtraction)
                 audit_prompt = f"Identify the OFFICIAL corporate homepage for '{company_name}' from these results. Ignore LinkedIn/News."
-                selection = identity_auditor.invoke([SystemMessage(content=audit_prompt), HumanMessage(content=json.dumps(identity_results, indent=2))])
+                selection = run_openai_guarded(
+                    "company_identity_selection",
+                    lambda: identity_auditor.invoke([SystemMessage(content=audit_prompt), HumanMessage(content=json.dumps(identity_results, indent=2))]),
+                    fallback=WebsiteExtraction(official_url=None, reasoning="Fallback due to temporarily unavailable identity auditor"),
+                )
                 if selection and selection.official_url:
                     site = self.sanitize_landing_page(selection.official_url)
                     logger.info(f"[IDENTITY] Verified: {company_name} -> {site}")
@@ -212,7 +228,22 @@ FINAL DECISION: Only is_valid_lead if Requirement Justification is strong AND th
         msg = f"Company: {res_data['name']}\nWebsite: {res_data['website']}\nOfferings: {off_str}\nResearch:\n{context}"
         
         try:
-            return structured_llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=msg)])
+            return run_openai_guarded(
+                "company_validation",
+                lambda: structured_llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=msg)]),
+                fallback=CompanyValidation(
+                    name=res_data['name'],
+                    is_industry_match=False,
+                    is_valid_lead=False,
+                    has_demonstrated_requirement=False,
+                    requirement_justification="Fallback due to temporarily unavailable validation service",
+                    synergy_score=0,
+                    company_type="Validation Unavailable",
+                    employee_count="N/A",
+                    is_offering_synergy=False,
+                    is_primary_operator=False,
+                ),
+            )
         except Exception as e:
             logger.error(f"[PIPELINE] Validation failure for {res_data['name']}: {e}")
             return CompanyValidation(name=res_data['name'], is_industry_match=False, is_valid_lead=False, has_demonstrated_requirement=False, requirement_justification="Sync Error", synergy_score=0, company_type="Sync Error", employee_count="N/A", is_offering_synergy=False, is_primary_operator=False)
@@ -226,14 +257,19 @@ FINAL DECISION: Only is_valid_lead if Requirement Justification is strong AND th
         prompt = f"Transform the following research artifacts for {name} into a clean, human-readable prose intelligence report. Focus on their operational nature and potential needs."
         messages = [SystemMessage(content="Professional Intelligence Analyst."), HumanMessage(content=prompt + "\n" + json.dumps(raw_research, indent=2))]
         try:
-            return self.llm.invoke(messages).content.strip()
+            response = run_openai_guarded(
+                "company_research_synthesis",
+                lambda: self.llm.invoke(messages),
+                fallback=None,
+            )
+            return response.content.strip() if response else "Analysis pending."
         except Exception as e:
             logger.error(f"[PIPELINE] Intelligence synthesis failure: {e}")
             return "Analysis pending."
 
 # --- PROD INTERFACE ---
 
-def find_target_companies(target_criteria: dict, user_offerings: list):
+def find_target_companies(target_criteria: dict, user_offerings: list, start_page: int = 0):
     """
     Main Orchestrator: Target Company Identification Agent.
     Executes a multi-stage discovery pipeline to identify, research, and validate high-quality leads.
@@ -243,8 +279,8 @@ def find_target_companies(target_criteria: dict, user_offerings: list):
     industry = target_criteria.get("industry", "Manufacturing")
     location = target_criteria.get("location", "UK")
     size = target_criteria.get("employee_count", "")
-
-    raw_candidates = pipeline.stage_1_recon(industry, location, size)
+    
+    raw_candidates = pipeline.stage_1_recon(industry, location, size, start_page=start_page)
     if not raw_candidates: return
 
     unique_companies = pipeline.stage_2_dedup(raw_candidates)

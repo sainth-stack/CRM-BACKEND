@@ -129,7 +129,9 @@ class CallingAgent:
         if not (phonenumbers and pytz):
             raise RuntimeError("Compliance Failure: Tier-4 Jurisdictional libraries mandatory.")
 
-        self.client = Client(self.account_sid, self.auth_token)
+        from twilio.http.http_client import TwilioHttpClient
+        http_client = TwilioHttpClient(timeout=10)
+        self.client = Client(self.account_sid, self.auth_token, http_client=http_client)
         self.cluster = DistributedCluster()
         self.validator = RequestValidator(self.auth_token)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=50) # High-scale scaling

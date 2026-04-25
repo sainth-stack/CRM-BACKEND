@@ -1,4 +1,5 @@
 import os
+import datetime
 from app.core.logging_config import logger
 import requests
 from typing import Dict, Any, Optional
@@ -22,14 +23,25 @@ MAILBOX_SCOPES = [
 
 class GoogleAuthService:
     @staticmethod
-    def get_authorization_url(email: str = None) -> str:
+    def get_authorization_url(user_id: str, email: str = None) -> str:
         """
         Generates a secure Google OAuth2 portal URL for mailbox synchronization.
-        Uses manual construction to ensure compatibility with stateless entries
-        and to avoid PKCE conflicts during the cross-component handshake.
+        Implements CSRF protection via a cryptographically secure state token.
         """
         from urllib.parse import urlencode
+        import secrets
+        from app.core.security import _get_redis
         
+        # Generate a secure state token and vault it in Redis
+        state = secrets.token_urlsafe(32)
+        r = _get_redis()
+        if r:
+            # State valid for 15 minutes
+            r.setex(f"oauth_state:{user_id}", 900, state)
+        else:
+            logger.critical("[AUTH] Redis unreachable. State verification protocols suspended.")
+            raise HTTPException(status_code=503, detail="Security infrastructure unreachable.")
+
         config_params = {
             "client_id": GOOGLE_CLIENT_ID,
             "redirect_uri": GOOGLE_REDIRECT_URI,
@@ -37,7 +49,8 @@ class GoogleAuthService:
             "scope": " ".join(MAILBOX_SCOPES),
             "access_type": "offline",
             "include_granted_scopes": "true",
-            "prompt": "consent"
+            "prompt": "consent",
+            "state": state
         }
         
         if email:
@@ -45,6 +58,28 @@ class GoogleAuthService:
             
         base_endpoint = "https://accounts.google.com/o/oauth2/v2/auth"
         return f"{base_endpoint}?{urlencode(config_params)}"
+
+    @staticmethod
+    def validate_state(user_id: str, incoming_state: str) -> bool:
+        """
+        Validates the OAuth2 state token to prevent CSRF and session injection.
+        """
+        from app.core.security import _get_redis
+        r = _get_redis()
+        if not r:
+            return False
+            
+        stored_state = r.get(f"oauth_state:{user_id}")
+        if not stored_state:
+            return False
+            
+        # Constant time comparison is overkill for this context but secrets.compare_digest is best practice
+        import secrets
+        is_valid = secrets.compare_digest(stored_state.decode() if isinstance(stored_state, bytes) else stored_state, incoming_state)
+        
+        # Single-use: Consume the state immediately
+        r.delete(f"oauth_state:{user_id}")
+        return is_valid
 
     @staticmethod
     async def verify_id_token(token: str) -> Dict[str, Any]:
@@ -71,10 +106,8 @@ class GoogleAuthService:
         For use during the "Connect Mailbox" flow.
         """
         try:
-            # Note: The redirect_uri must match exactly what was sent to Google originally.
-            # Manual Redirect (Barrier) uses GOOGLE_REDIRECT_URI.
-            # Popup Hook (Button) uses 'postmessage'.
-            target_redirect = redirect_uri or GOOGLE_REDIRECT_URI
+            # Standardize on the environment-configured redirect URI
+            target_redirect = GOOGLE_REDIRECT_URI
             
             # Initialize the flow
             flow = Flow.from_client_config(
@@ -83,7 +116,7 @@ class GoogleAuthService:
                         "client_id": GOOGLE_CLIENT_ID,
                         "client_secret": GOOGLE_CLIENT_SECRET,
                         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                        "token_uri": "https://accounts.google.com/o/oauth2/token",
+                        "token_uri": "https://oauth2.googleapis.com/token",
                     }
                 },
                 scopes=MAILBOX_SCOPES,
@@ -101,8 +134,10 @@ class GoogleAuthService:
 
             user_info_response = requests.get(
                 "https://www.googleapis.com/oauth2/v3/userinfo",
-                headers={"Authorization": f"Bearer {credentials.token}"}
+                headers={"Authorization": f"Bearer {credentials.token}"},
+                timeout=10
             )
+            user_info_response.raise_for_status()
             user_info = user_info_response.json()
 
             return {

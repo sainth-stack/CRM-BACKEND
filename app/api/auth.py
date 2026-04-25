@@ -1,6 +1,7 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Request, Query
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import aliased
 from typing import Dict, Any
 from pydantic import BaseModel, EmailStr
 import datetime
@@ -12,6 +13,7 @@ from app.core.security import (
     create_access_token, 
     create_refresh_token, 
     get_current_user, 
+    decrypt_token,
     encrypt_token, 
     verify_password, 
     get_password_hash,
@@ -29,9 +31,19 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 # Module-level limiter (shares state with main app via Cloud Redis)
 limiter = Limiter(key_func=get_remote_address, storage_uri=os.getenv("REDIS_URL"))
 
+
+def _lock_query(query):
+    bind = query.session.bind
+    if bind is not None and bind.dialect.name != "sqlite":
+        return query.with_for_update()
+    return query
+
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 class VerifyOTPRequest(BaseModel):
     email: str
@@ -83,25 +95,6 @@ async def login(request: Request, credentials: LoginRequest = Body(...), db: Ses
         }
     }
 
-@router.post("/manual-add-user")
-@limiter.limit("5/minute")
-async def manual_add_user(request: Request, payload: LoginRequest, db: Session = Depends(get_db)):
-    """
-    Direct Identity Provisioning.
-    Allows administrative persistence of new user profiles without public sign-up flows.
-    """
-    existing_user = db.query(models.User).filter(models.User.email == payload.email).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="User already exists")
-    
-    user = models.User(
-        email=payload.email,
-        hashed_password=get_password_hash(payload.password)
-    )
-    db.add(user)
-    db.commit()
-    return {"message": "User added successfully"}
-
 @router.post("/demo/signup")
 @limiter.limit("5/minute")   # Bot-flood shield: 5 demo signups/minute per IP
 async def demo_signup(request: Request, credentials: LoginRequest = Body(...), db: Session = Depends(get_db)):
@@ -111,16 +104,13 @@ async def demo_signup(request: Request, credentials: LoginRequest = Body(...), d
     """
     existing_user = db.query(models.User).filter(models.User.email == credentials.email).first()
     if existing_user:
-        # Boundary Enforcement: Prevent Trial Renewal Loops
-        if existing_user.is_demo:
-            raise HTTPException(
-                status_code=400, 
-                detail="Identity already registered for a professional assessment. Please sign in to continue or contact sales@ai-priori.com for extension."
-            )
-        raise HTTPException(status_code=400, detail="Identitiy already exists. Please sign in or use a different email.")
+        # Boundary Enforcement: Prevent Trial Renewal Loops & Identity Enumeration
+        # Return a generic success message to prevent leaking registration state
+        return {"message": "Identity mobilization initialized. If this is a new identity, check your email for the verification coordinate."}
     
-    # Generate 6-digit OTP for initial verification
-    otp = str(random.randint(100000, 999999))
+    # Generate 6-digit cryptographically secure OTP for initial verification
+    import secrets
+    otp = str(secrets.randbelow(900000) + 100000)
 
     user = models.User(
         email=credentials.email,
@@ -199,14 +189,12 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest = Bod
     """
     user = db.query(models.User).filter(models.User.email == payload.email).first()
     if not user:
-        # Explicitly checking for user as requested for clearer UX feedback
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail="Identity verification failed: User account does not exist."
-        )
+        # Prevent Identity Enumeration: Return success even if account doesn't exist
+        return {"message": "If this identity is registered, a verification code has been mobilized to the associated email."}
 
-    # Generate 6-digit high-variance OTP
-    otp = str(random.randint(100000, 999999))
+    # Generate 6-digit high-variance cryptographically secure OTP
+    import secrets
+    otp = str(secrets.randbelow(900000) + 100000)
     user.otp_code = otp
     user.otp_expiry = datetime.datetime.now(UTC) + timedelta(minutes=10)
     db.commit()
@@ -273,16 +261,62 @@ async def reset_password(request: Request, payload: ResetPasswordRequest, db: Se
     if not user:
         raise HTTPException(status_code=404, detail="Identity profile not found.")
 
-    # Commit secure hashed credentials
+    # Prepare secure hashed credentials. We only commit after session revocation
+    # succeeds so the endpoint cannot return failure after persisting the password.
     user.hashed_password = get_password_hash(payload.new_password)
     user.otp_code = None # Invalidate OTP after success
     user.otp_expiry = None
-    db.commit()
+    db.flush()
     
     # Dispatch Kill-Switch: Terminate all pre-existing stateless JWTs globally
     revoke_sessions(user.id)
+    db.commit()
 
     return {"message": "Identity credentials updated. You may now initialize a secure session."}
+
+@router.post("/refresh")
+async def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
+    """
+    Session Continuity Protocol.
+    Exchanges a valid long-lived refresh token for a new fat JWT access token.
+    """
+    try:
+        from app.core.security import SECRET_KEY, ALGORITHM
+        import jwt
+        payload = jwt.decode(request.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type.")
+            
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token payload.")
+            
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="Identity profile no longer exists.")
+
+        # Re-issue High-Fidelity Stateless Session
+        access_token = create_access_token(data={
+            "sub": user.id, 
+            "email": user.email,
+            "role": user.role.value,
+            "created_by_id": user.created_by_id,
+            "user_limit": user.user_limit,
+            "is_demo": user.is_demo,
+            "demo_expires_at": user.demo_expires_at.isoformat() if user.demo_expires_at else None,
+            "has_used_trial_quota": user.has_used_trial_quota,
+            "provider": user.provider
+        })
+        
+        return {
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh session expired. Please log in again.")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh session.")
 
 @router.get("/me")
 async def get_me(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -290,7 +324,8 @@ async def get_me(current_user: models.User = Depends(get_current_user), db: Sess
     Identity Profile Audit.
     Retrieves the authenticated actor's profile, including role-based capabilities and trial boundary status.
     """
-    has_mailbox = db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == current_user.id).first() is not None
+    oauth_account = db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == current_user.id).first()
+    has_mailbox = oauth_account is not None
     is_expired = False
     if current_user.is_demo and current_user.demo_expires_at:
         is_expired = current_user.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC)
@@ -302,6 +337,12 @@ async def get_me(current_user: models.User = Depends(get_current_user), db: Sess
         "user_limit": current_user.user_limit,
         "provider": current_user.provider,
         "has_mailbox": has_mailbox,
+        "mailbox_health": {
+            "status": oauth_account.mailbox_health_status if oauth_account else "NOT_CONNECTED",
+            "last_checked_at": oauth_account.mailbox_last_checked_at if oauth_account else None,
+            "last_error": oauth_account.mailbox_last_error if oauth_account else None,
+            "email_address": oauth_account.email_address if oauth_account else None,
+        },
         "is_demo": current_user.is_demo,
         "demo_expires_at": current_user.demo_expires_at,
         "is_expired": is_expired,
@@ -386,11 +427,20 @@ async def list_admins(
     if current_user.role != models.UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Sovereign authority required.")
         
-    admins = db.query(models.User).filter(models.User.role == models.UserRole.ADMIN).all()
+    from sqlalchemy import func
+    managed_user = aliased(models.User)
+    # High-Performance Aggregate Audit: Fetch all admins and their user counts in a single SQL operation
+    stats = db.query(
+        models.User, 
+        func.count(managed_user.id).label('user_count')
+    ).outerjoin(
+        managed_user, managed_user.created_by_id == models.User.id
+    ).filter(
+        models.User.role == models.UserRole.ADMIN
+    ).group_by(models.User.id).all()
+
     result = []
-    for adm in admins:
-        # Calculate current user consumption for this admin
-        user_count = db.query(models.User).filter(models.User.created_by_id == adm.id).count()
+    for adm, user_count in stats:
         result.append({
             "id": adm.id,
             "email": adm.email,
@@ -490,46 +540,48 @@ async def provision_user(
     """
     if current_user.role not in [models.UserRole.ADMIN, models.UserRole.SUPER_ADMIN]:
         raise HTTPException(status_code=403, detail="Administrative authority required.")
-        
-    # Boundary Enforcement for Admins
-    if current_user.role == models.UserRole.ADMIN:
-        # Dynamic Query: Fetch explicit fresh state to prevent stale JWT claim bypass
-        fresh_admin = db.query(models.User).filter(models.User.id == current_user.id).first()
-        if not fresh_admin:
-            raise HTTPException(status_code=401, detail="Administrator identity invalid.")
-            
-        user_count = db.query(models.User).filter(models.User.created_by_id == current_user.id).count()
-        if user_count >= fresh_admin.user_limit:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"User provision limit reached ({fresh_admin.user_limit}). Contact Super Admin for sector expansion."
-            )
-            
-    existing = db.query(models.User).filter(models.User.email == payload.email).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Identity portal already contains this email.")
-        
-    new_user = models.User(
-        email=payload.email,
-        hashed_password=get_password_hash(payload.password),
-        role=models.UserRole.USER,
-        created_by_id=current_user.id,
-        signup_source="manual"
-    )
-    db.add(new_user)
-    db.flush()
-    
-    log = models.AdministrativeLog(
-        actor_id=current_user.id,
-        target_id=new_user.id,
-        action="PROVISION",
-        details=f"Provisioned User {new_user.email} under Admin {current_user.email}"
-    )
-    db.add(log)
+
+    email_sent = False
+    with db.begin_nested():
+        if current_user.role == models.UserRole.ADMIN:
+            fresh_admin = _lock_query(
+                db.query(models.User).filter(models.User.id == current_user.id)
+            ).first()
+            if not fresh_admin:
+                raise HTTPException(status_code=401, detail="Administrator identity invalid.")
+
+            user_count = db.query(models.User).filter(models.User.created_by_id == current_user.id).count()
+            if user_count >= fresh_admin.user_limit:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"User provision limit reached ({fresh_admin.user_limit}). Contact Super Admin for sector expansion."
+                )
+
+        existing = db.query(models.User).filter(models.User.email == payload.email).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Identity portal already contains this email.")
+
+        new_user = models.User(
+            email=payload.email,
+            hashed_password=get_password_hash(payload.password),
+            role=models.UserRole.USER,
+            created_by_id=current_user.id,
+            signup_source="manual"
+        )
+        db.add(new_user)
+        db.flush()
+
+        log = models.AdministrativeLog(
+            actor_id=current_user.id,
+            target_id=new_user.id,
+            action="PROVISION",
+            details=f"Provisioned User {new_user.email} under Admin {current_user.email}"
+        )
+        db.add(log)
+
     db.commit()
     
     # Autonomous Provisioning Dispatch
-    email_sent = False
     try:
         creds = TokenService.get_google_credentials(db, current_user.id)
         if creds:
@@ -574,17 +626,24 @@ async def list_managed_users(
     # Mathematical Offset Calculation
     total = query.count()
     skip = (page - 1) * page_size
-    users = query.order_by(models.User.created_at.desc()).offset(skip).limit(page_size).all()
+    from sqlalchemy import func
+    # High-Performance Aggregate Audit: Fetch users and their campaign counts in a single SQL operation
+    stats = query.outerjoin(
+        models.Campaign, models.User.id == models.Campaign.user_id
+    ).with_entities(
+        models.User, 
+        func.count(models.Campaign.id).label('campaign_count')
+    ).group_by(models.User.id).order_by(models.User.created_at.desc()).offset(skip).limit(page_size).all()
     
     result = []
-    for u in users:
-        # Metrics: Campaign Activity
-        campaign_count = db.query(models.Campaign).filter(models.Campaign.user_id == u.id).count()
+    for u, campaign_count in stats:
+        has_mailbox = db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == u.id).first() is not None
         result.append({
             "id": u.id,
             "email": u.email,
             "campaign_count": campaign_count,
             "is_demo": u.is_demo,
+            "has_mailbox": has_mailbox,
             "created_at": u.created_at
         })
 
@@ -638,7 +697,7 @@ async def get_google_auth_url(current_user: models.User = Depends(get_current_us
     Generates the high-fidelity Google OAuth2 URL required to grant the system mailbox capabilities.
     """
     from app.core.auth import GoogleAuthService
-    return {"url": GoogleAuthService.get_authorization_url(email=current_user.email)}
+    return {"url": GoogleAuthService.get_authorization_url(user_id=current_user.id, email=current_user.email)}
 
 capability_router = APIRouter(prefix="/connect", tags=["Capability & Mailbox"])
 
@@ -653,32 +712,43 @@ async def connect_google_mailbox(
     Exchanges an OAuth code for a refresh token and vaults it using AES-256.
     """
     code = payload.get("code")
+    state = payload.get("state")
     redirect_uri = payload.get("redirect_uri")
+    
     if not code:
         raise HTTPException(status_code=400, detail="Mailbox authorization code missing.")
+        
+    # Phase 1: OAuth2 Integrity Audit (CSRF Prevention)
+    from app.core.auth import GoogleAuthService
+    if not state or not GoogleAuthService.validate_state(current_user.id, state):
+        logger.warning(f"[SECURITY] OAuth State Mismatch for user_id={current_user.id}. Intercepting potential CSRF attempt.")
+        raise HTTPException(
+            status_code=403, 
+            detail="Authorization session expired or integrity check failed. Please restart the connection flow."
+        )
 
     # 1. Exchange Code for Persistent Refresh Token
     from app.core.auth import GoogleAuthService
-    logger.info(f"[AUTH] MOBILIZING CODE EXCHANGE. User Identity: {current_user.email}, Redirect: {redirect_uri}")
+    logger.info(f"[AUTH] MOBILIZING CODE EXCHANGE. user_id={current_user.id}")
     try:
         mailbox_data = await GoogleAuthService.verify_auth_code_for_mailbox(code, redirect_uri=redirect_uri)
     except Exception as e:
-        logger.error(f"[REJECTED] Handshake Collision for {current_user.email}: {e}")
+        logger.error(f"[REJECTED] Handshake Collision for user_id={current_user.id}: {e}")
         raise
         
     refresh_token = mailbox_data.get("refresh_token")
     email = mailbox_data.get("email")
-    logger.info(f"[AUTH] CAPTURED HANDSHAKE. Authorized Identity: {email}")
+    logger.info(f"[AUTH] CAPTURED HANDSHAKE. email={email}, has_refresh={bool(refresh_token)}")
 
     if not email or email.lower() != current_user.email.lower():
-        logger.warning(f"[IDENTITY MISMATCH] Sector User: {current_user.email}, Authorized Identity: {email}")
+        logger.warning(f"[IDENTITY MISMATCH] User {current_user.email} tried to connect mailbox {email}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Identity mismatch. Professional authorization failed. You must connect the mailbox associated with your registered identity: {current_user.email}."
+            detail=f"Identity mismatch. You must connect the mailbox associated with your account: {current_user.email}. (Detected: {email})"
         )
 
     if not refresh_token:
-        logger.error(f"[VAULT FAILURE] Refresh token missing for authorized identity {email}")
+        logger.error(f"[VAULT FAILURE] Refresh token missing for user_id={current_user.id}")
         raise HTTPException(
             status_code=400, 
             detail="Failed to capture refresh token. Please ensure you've granted email permissions and try 'Consent' prompt."
@@ -694,16 +764,22 @@ async def connect_google_mailbox(
     encrypted_token = encrypt_token(refresh_token)
 
     if oauth_acc:
-        logger.info(f"[VAULT UPDATE] Updating established capability for {email}")
+        logger.info(f"[VAULT UPDATE] Updating established capability for user_id={current_user.id}")
         oauth_acc.email_address = email
         oauth_acc.encrypted_refresh_token = encrypted_token
+        oauth_acc.mailbox_health_status = "HEALTHY"
+        oauth_acc.mailbox_last_checked_at = datetime.datetime.now(UTC).replace(tzinfo=None)
+        oauth_acc.mailbox_last_error = None
     else:
         logger.info(f"[VAULT NEW] Synchronizing new mailbox capability for {email}")
         oauth_acc = models.OAuthAccount(
             user_id=current_user.id,
             provider="google",
             email_address=email,
-            encrypted_refresh_token=encrypted_token
+            encrypted_refresh_token=encrypted_token,
+            mailbox_health_status="HEALTHY",
+            mailbox_last_checked_at=datetime.datetime.now(UTC).replace(tzinfo=None),
+            mailbox_last_error=None,
         )
         db.add(oauth_acc)
 
@@ -717,11 +793,28 @@ async def disconnect_mailbox(
     current_user: models.User = Depends(get_current_user)
 ):
     """
-    Capability Decommissioning.
+    Capability Decommissioning Protocol.
     Permanently revokes the system's authorization to access the user's mailbox.
+    Triggers an upstream revocation request to Google's OAuth2 cluster to terminate the refresh token.
     """
     oauth_acc = db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == current_user.id).first()
     if oauth_acc:
+        try:
+            # Upstream Revocation: Ensure the token is neutralized at the source
+            refresh_token = decrypt_token(oauth_acc.encrypted_refresh_token)
+            import requests
+            revoke_resp = requests.post(
+                "https://oauth2.googleapis.com/revoke",
+                params={"token": refresh_token},
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            if revoke_resp.status_code == 200:
+                logger.info(f"[AUTH] Upstream revocation successful for {oauth_acc.email_address}")
+            else:
+                logger.warning(f"[AUTH] Upstream revocation returned non-200 status: {revoke_resp.status_code}")
+        except Exception as e:
+            logger.error(f"[AUTH] Failed to execute upstream revocation for {current_user.id}: {e}")
+
         db.delete(oauth_acc)
         db.commit()
-    return {"message": "Mailbox decommissioned successfully."}
+    return {"message": "Mailbox decommissioned successfully and authorization revoked upstream."}

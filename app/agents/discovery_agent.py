@@ -2,9 +2,9 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-import os
 from dotenv import load_dotenv
 from app.core.logging_config import logger
+from app.core.llm_resilience import run_openai_guarded
 from app.core.sanitizer import sanitize_for_llm
 
 load_dotenv()
@@ -41,7 +41,7 @@ INSTRUCTIONS:
 2. TIME EXTRACTION: Convert to 24-hour HH:MM format (e.g., 10 PM -> 22:00, 11 AM -> 11:00).
 3. TIMEZONE EXTRACTION: 
    - If IST, PST, etc. are mentioned, USE THEM. 
-   - If no timezone is mentioned, default to the local time of {location_context}.
+   - If no timezone is mentioned, return timezone as null.
 4. RESOLUTION: If they propose multiple slots, pick the absolute earliest valid slot.
 5. VALIDATION: If the reply is just interest and has NO date/time, return both date and time as null.
 
@@ -61,12 +61,16 @@ def extract_schedule_info(reply_text: str, current_date: str, location_context: 
     try:
         logger.info("[DISCOVERY] Extracting scheduling coordinates from prospect reply...")
         safe_reply = sanitize_for_llm(reply_text, context_limit=2000)
-        extraction = chain.invoke({
-            "reply_text": safe_reply, 
-            "current_date": current_date,
-            "location_context": location_context
-        })
-        return extraction.model_dump()
+        extraction = run_openai_guarded(
+            "discovery_schedule_extraction",
+            lambda: chain.invoke({
+                "reply_text": safe_reply,
+                "current_date": current_date,
+                "location_context": location_context
+            }),
+            fallback=None,
+        )
+        return extraction.model_dump() if extraction else None
     except Exception as e:
         logger.error(f"[DISCOVERY] Coordinate extraction failure: {e}")
         return None
@@ -119,19 +123,22 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
     try:
         logger.info(f"[DISCOVERY] Synthesizing strategic discovery response for {dm_name} at {target_company}...")
         safe_interest = sanitize_for_llm(last_interest, context_limit=3000)
-        response = chain.invoke({
-            "user_company_name": user_intel.get("name", ""),
-            "user_company_offerings": user_intel.get("offerings", ""),
-            "user_company_research": user_intel.get("deep_research", ""),
-            "dm_name": dm_name,
-            "dm_position": dm_position,
-            "target_company": target_company,
-            "last_interest_context": safe_interest,
-            "booking_context": booking_context,
-            "narrative_instruction": narrative_instruction
-        })
-        return response.model_dump()
+        response = run_openai_guarded(
+            "discovery_draft_generation",
+            lambda: chain.invoke({
+                "user_company_name": user_intel.get("name", ""),
+                "user_company_offerings": user_intel.get("offerings", ""),
+                "user_company_research": user_intel.get("deep_research", ""),
+                "dm_name": dm_name,
+                "dm_position": dm_position,
+                "target_company": target_company,
+                "last_interest_context": safe_interest,
+                "booking_context": booking_context,
+                "narrative_instruction": narrative_instruction
+            }),
+            fallback=None,
+        )
+        return response.model_dump() if response else None
     except Exception as e:
         logger.error(f"[DISCOVERY] Strategic drafting mission failure: {e}")
         return None
-

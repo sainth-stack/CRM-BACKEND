@@ -22,15 +22,17 @@ from app.workers.tasks.ghostwriter_worker import (
     draft_discovery_worker,
 )
 
+# --- Outbound Dispatch --- 
+from app.workers.tasks.outbound_worker import send_draft_worker
+
 # --- Sentinels (APScheduler cron hooks) ---
 from app.workers.tasks.sentinels_worker import (
     poll_inbox_task,
     poll_all_users_task,
     check_upcoming_meetings_task,
-    check_inactivity_reminders_task,
-    check_all_meetings_task,
     check_all_inactivity_task,
-    process_intent_transition,
+    reactivate_terminated_prospects_task,
+    outreach_orchestrator_worker,
 )
 
 # --- Sweeper (Startup resurrection) ---
@@ -44,12 +46,12 @@ __all__ = [
     "draft_emails_worker",
     "draft_followup_worker",
     "draft_discovery_worker",
+    "send_draft_worker",
     "poll_inbox_task",
     "poll_all_users_task",
     "check_upcoming_meetings_task",
-    "check_inactivity_reminders_task",
-    "check_all_meetings_task",
     "check_all_inactivity_task",
-    "process_intent_transition",
+    "reactivate_terminated_prospects_task",
+    "outreach_orchestrator_worker",
     "sweep_stuck_campaigns_task",
 ]

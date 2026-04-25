@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, joinedload
-from app.db.database import get_db, engine
+from app.db.database import get_db
 from app.db import models
 from app.api import auth
 from app.core.security import get_current_user
@@ -12,11 +12,17 @@ from slowapi.errors import RateLimitExceeded
 from starlette.requests import Request
 import uuid
 import datetime
+from datetime import UTC
 import ipaddress
 import urllib.parse
 from contextlib import asynccontextmanager
 from app.workers import sweep_stuck_campaigns_task
 from app.core.logging_config import setup_logging
+from app.services.draft_dispatch import (
+    _apply_sent_draft_effects,
+    queue_draft_dispatch,
+)
+from app.workers.tasks.outbound_worker import send_draft_worker
 import gc
 import os
 
@@ -37,17 +43,19 @@ async def lifespan(app: FastAPI):
     logger.info("Decommissioning API server... performing memory sweep.")
     gc.collect()
 
-# Create tables if they don't exist
-models.Base.metadata.create_all(bind=engine)
-
-# --- CORS (Env-configured, production-safe) ---
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
-
 app = FastAPI(title="Outreach v3 API", lifespan=lifespan)
 
-# Attach rate limiter state and error handler
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# --- Observability Middleware ---
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"[GATEWAY] Incoming {request.method} request to {request.url.path}")
+    response = await call_next(request)
+    logger.info(f"[GATEWAY] Completed {request.method} {request.url.path} | Status: {response.status_code}")
+    return response
+
+# --- CORS (Env-configured, production-safe) ---
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+ALLOWED_ORIGINS = [FRONTEND_URL, "http://localhost:5173"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,6 +64,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Attach rate limiter state and error handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.include_router(auth.router)
 app.include_router(auth.capability_router)
@@ -83,55 +95,84 @@ class BatchDeleteRequest(BaseModel):
 
 def get_visibility_filter(db: Session, current_user: models.User):
     """Enforces the Zero-Trust multi-tenant data isolation boundary."""
-    if current_user.role == models.UserRole.SUPER_ADMIN:
+    if str(current_user.role).lower().split('.')[-1] == "super_admin":
         raise HTTPException(status_code=403, detail="Sovereign authority cannot access localized operational data.")
-    elif current_user.role == models.UserRole.ADMIN:
+    elif str(current_user.role).lower().split('.')[-1] == "admin":
         target_user_ids = db.query(models.User.id).filter(models.User.created_by_id == current_user.id)
         return models.Campaign.user_id.in_(target_user_ids)
     return models.Campaign.user_id == current_user.id
 
+
+def _lock_query(query):
+    bind = query.session.bind
+    if bind is not None and bind.dialect.name != "sqlite":
+        return query.with_for_update()
+    return query
+
 # --- SSRF Protection Utility ---
-def validate_url_for_ssrf(url: str) -> str:
-    """
-    Blocks Server-Side Request Forgery attacks on user-submitted URLs.
-    Rejects private IPs, loopback, cloud metadata endpoints, and non-HTTP schemes.
-    """
-    try:
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ["http", "https"]:
-            raise HTTPException(status_code=400, detail="Only HTTP/HTTPS URLs are permitted.")
-        hostname = parsed.hostname
-        if not hostname:
-            raise HTTPException(status_code=400, detail="Invalid URL: missing hostname.")
-        # Block raw private IP submissions
-        try:
-            ip = ipaddress.ip_address(hostname)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                raise HTTPException(status_code=400, detail="Internal network URLs are not permitted.")
-        except ValueError:
-            pass  # Hostname string — not a raw IP, safe to proceed
-        return url
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid URL format.")
+from app.core.security import validate_url_for_ssrf
 
 
 @app.get("/health/email")
-def email_health_check():
+def email_health_check(current_user: models.User = Depends(get_current_user)):
     """
-    Diagnostic Sector Operations.
-    Verifies the Gmail OAuth2 configuration and environmental readiness of the active sector.
+    Sector Health Status.
+    Authorized diagnostic check. Limited to Super Admins to prevent infrastructure metadata leakage.
     """
+    if current_user.role != models.UserRole.SUPER_ADMIN:
+        return {"status": "OK", "mode": "STRICT_GMAIL_NATIVE"}
+
     import os
     config_status = {
         "GMAIL_TOKEN_JSON": "SET" if os.getenv("GMAIL_TOKEN_JSON") else "MISSING",
         "GMAIL_CREDENTIALS_JSON": "SET" if os.getenv("GMAIL_CREDENTIALS_JSON") else "MISSING",
-        "EMAIL_USER": os.getenv("EMAIL_USER", "MISSING"),
-        "NEON_DB_URL": "SET" if os.getenv("NEON_DB_URL") else "MISSING",
-        "OPENAI_API_KEY": "SET" if os.getenv("OPENAI_API_KEY") else "MISSING",
+        "EMAIL_USER": "CONFIGURED" if os.getenv("EMAIL_USER") else "MISSING",
+        "NEON_DB_URL": "CONNECTED" if os.getenv("NEON_DB_URL") else "MISSING",
+        "REDIS_INFRA": "ACTIVE" if os.getenv("REDIS_URL") else "FALLBACK_LOCAL"
     }
-    return {"config": config_status, "mode": "STRICT_GMAIL_NATIVE"}
+    
+    # Live Ping
+    from app.core.security import _get_redis
+    r = _get_redis()
+    config_status["REDIS_LIVENESS"] = "PONG" if r else "UNREACHABLE"
+    
+    return {"status": "HEALTHY", "config": config_status}
+
+
+@app.get("/health/dependencies")
+def dependency_health_check(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Dependency health snapshot for operators.
+    Gives the current actor a safe readout of the backing services that drive outreach execution.
+    """
+    from app.core.security import _get_redis
+
+    mailbox_connected = (
+        db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == current_user.id).first() is not None
+    )
+    redis_client = _get_redis()
+
+    payload = {
+        "status": "healthy" if redis_client else "degraded",
+        "dependencies": {
+            "redis": "up" if redis_client else "down",
+            "gmail_mailbox": "connected" if mailbox_connected else "disconnected",
+            "gmail_system_vault": "configured" if os.getenv("GMAIL_TOKEN_JSON") else "missing",
+            "hubspot": "configured" if os.getenv("HUBSPOT_ACCESS_TOKEN") else "missing",
+            "cal": "configured" if os.getenv("CAL_API_KEY") and os.getenv("CAL_EVENT_TYPE_ID") else "missing",
+        },
+    }
+
+    if current_user.role == models.UserRole.SUPER_ADMIN:
+        payload["environment"] = {
+            "frontend_url": "configured" if os.getenv("FRONTEND_URL") else "default",
+            "neon_db_url": "configured" if os.getenv("NEON_DB_URL") else "missing",
+        }
+
+    return payload
 
 from app.core.sanitizer import sanitize_text
 
@@ -150,7 +191,7 @@ def create_campaign(
     Input parameters are normalized via the Sanitization Engine to mitigate injection risks.
     """
     # Hierarchy boundary: Only localized operators can initialize executions
-    if current_user.role != models.UserRole.USER:
+    if str(current_user.role).lower().split('.')[-1] != "user":
         raise HTTPException(status_code=403, detail="Only Localized Users can mobilize new campaigns.")
 
     # 0. High-Fidelity Input Sanitization
@@ -198,7 +239,10 @@ def create_campaign(
             )
     
     # Apply SSRF protection on user-submitted URL
-    validated_url = validate_url_for_ssrf(campaign.user_url)
+    raw_url = campaign.user_url.strip()
+    if not raw_url.startswith(("http://", "https://")):
+        raw_url = f"https://{raw_url}"
+    validated_url, _ = validate_url_for_ssrf(raw_url)
 
     # 2. Instantly persist Mission Origin
     intel = models.UserCompanyIntel(
@@ -346,13 +390,13 @@ def get_campaign(
     """
     Deep Intelligence Audit.
     Retrieves comprehensive metadata, discovered stakeholders, and communication history for a specific campaign.
-    """
-    # N+1 Fix: Single query with all relationships eager-loaded
+    """    # N+1 Fix: Single query with all relationships eager-loaded
     db_campaign = db.query(models.Campaign).options(
         joinedload(models.Campaign.user_intel),
         joinedload(models.Campaign.target_companies),
         joinedload(models.Campaign.dms).joinedload(models.DecisionMaker.logs),
-        joinedload(models.Campaign.drafts)
+        joinedload(models.Campaign.dms).joinedload(models.DecisionMaker.drafts),
+        joinedload(models.Campaign.dms).joinedload(models.DecisionMaker.transitions),
     ).filter(
         models.Campaign.id == campaign_id,
         get_visibility_filter(db, current_user)
@@ -360,38 +404,119 @@ def get_campaign(
     if not db_campaign:
         raise HTTPException(status_code=404, detail="Campaign not found in your intelligence sector")
     
-    # Enrich with details based on status
+    # 1. Map Target Companies
     target_companies = []
     for tc in db_campaign.target_companies:
         tc_dict = tc.__dict__.copy()
         tc_dict.pop("_sa_instance_state", None)
         target_companies.append(tc_dict)
         
+    # 2. Cluster Outbound Protocols (Nesting Drafts under DMs)
     dms = []
     for dm in db_campaign.dms:
         dm_dict = dm.__dict__.copy()
         dm_dict.pop("_sa_instance_state", None)
-        import datetime
         
-        # Include communication logs
-        logs = []
-        for log in dm.logs:
-            ld = log.__dict__.copy()
-            ld.pop("_sa_instance_state", None)
-            logs.append(ld)
-        dm_dict["logs"] = logs
+        # A. Attach Communication Logs
+        dm_dict["logs"] = [
+            {k: v for k, v in log.__dict__.items() if k != "_sa_instance_state"} 
+            for log in sorted(dm.logs, key=lambda l: l.received_at or datetime.datetime.min, reverse=True)
+        ]
+        
+        # B. Attach Channels Specific Drafts (Taking newest only)
+        email_draft = sorted(dm.drafts, key=lambda x: x.created_at or datetime.datetime.min, reverse=True)[0] if dm.drafts else None
+        dm_dict["email_draft"] = {k: v for k, v in email_draft.__dict__.items() if k != "_sa_instance_state"} if email_draft else None
+        
+        # C. Strategic Recommendation Engine (V8 Consolidated Email Pattern)
+        recommendation = { "channel": "email", "reason": "System initializing..." }
+        
+        # D. High-Fidelity Lifecycle Timeline Construction
+        timeline = []
+        state = dm.state or models.ProspectState.NEW
+        
+        # Build deterministic timeline segments based on state machine position
+        timeline.append({"step": "Research", "status": "done"})
+        
+        if state == models.ProspectState.NEW:
+            timeline.append({"step": "Outreach Initialization", "status": "active"})
+        elif state == models.ProspectState.DRAFTED:
+            timeline.append({"step": "Initial Outreach", "status": "active"})
+        else:
+            timeline.append({"step": "Initial Outreach", "status": "done"})
+
+        if dm.reminder_count > 0:
+            timeline.append({"step": f"Reminder {dm.reminder_count}", "status": "done"})
+
+        if state == models.ProspectState.ON_HOLD:
+            timeline.append({"step": "On Hold", "status": "active"})
+
+        if state in [
+            models.ProspectState.INITIAL_SENT,
+            models.ProspectState.WAITING_FOR_REPLY,
+            models.ProspectState.REMINDER_1_SENT,
+            models.ProspectState.REMINDER_2_SENT,
+            models.ProspectState.FOLLOWUP_ACTIVE,
+        ]:
+            timeline.append({"step": "Waiting for Reply", "status": "active"})
+
+        if state == models.ProspectState.NEUTRAL:
+            timeline.append({"step": "Neutral Reply", "status": "active"})
+
+        if dm.followup_count > 0:
+            timeline.append({"step": f"Follow-up {dm.followup_count}", "status": "done"})
+
+        if state in [models.ProspectState.DISCOVERY_CALL, models.ProspectState.WAITING_FOR_REPLY]:
+            timeline.append({"step": "Positive Intent Detected", "status": "done"})
+            timeline.append({"step": "Discovery Call Coordination", "status": "active"})
+        elif state == models.ProspectState.DISCOVERY_EXPIRED:
+            timeline.append({"step": "Positive Intent Detected", "status": "done"})
+            timeline.append({"step": "Discovery Call Coordination", "status": "done"})
+            timeline.append({"step": "Discovery Expired", "status": "active"})
+        elif state == models.ProspectState.MEETING_BOOKED:
+            timeline.append({"step": "Positive Intent Detected", "status": "done"})
+            timeline.append({"step": "Discovery Call Coordination", "status": "done"})
+            timeline.append({"step": "Meeting Scheduled", "status": "done"})
+        elif state == models.ProspectState.TERMINATED:
+            timeline.append({"step": "Terminated", "status": "error"})
+            if dm.retry_after and dm.termination_reason != models.ProspectTerminationReason.INTERNAL_LEAD_SECURED:
+                timeline.append({"step": "Retry Queue", "status": "active"})
+
+        dm_dict["timeline"] = timeline
+        dm_dict["state"] = state
+        dm_dict["intent"] = dm.intent_last
+        dm_dict["next_action_at"] = dm.next_action_at
+        dm_dict["retry_after"] = dm.retry_after
+        dm_dict["hold_release_at"] = dm.hold_release_at
+        dm_dict["hold_source_dm_id"] = dm.hold_source_dm_id
+        dm_dict["termination_reason"] = dm.termination_reason.value if dm.termination_reason else None
+        dm_dict["scheduled_time"] = dm.scheduled_time_utc
+        dm_dict["transition_events"] = [
+            {
+                "from_state": tr.from_state.value if tr.from_state else None,
+                "to_state": tr.to_state.value if tr.to_state else None,
+                "from_status": tr.from_status,
+                "to_status": tr.to_status,
+                "reason": tr.reason,
+                "actor": tr.actor,
+                "created_at": tr.created_at,
+            }
+            for tr in sorted(dm.transitions, key=lambda t: t.created_at or datetime.datetime.min, reverse=True)[:10]
+        ]
+
+        if email_draft:
+            recommendation = {
+                "channel": "email",
+                "reason": f"Active protocol: {state.value if hasattr(state, 'value') else state}"
+            }
+        else:
+             recommendation = {
+                "channel": "email",
+                "reason": "Awaiting protocol generation..."
+            }
+            
+        dm_dict["outreach_recommendation"] = recommendation
         dms.append(dm_dict)
         
-    drafts = []
-    # Force Reverse-Chronological Draft Sequence (Newest first)
-    from datetime import UTC
-    sorted_drafts = sorted(db_campaign.drafts, key=lambda x: x.created_at if x.created_at else datetime.datetime.min.replace(tzinfo=UTC), reverse=True)
-    
-    for d in sorted_drafts:
-        d_dict = d.__dict__.copy()
-        d_dict.pop("_sa_instance_state", None)
-        drafts.append(d_dict)
-
     result = {
         "id": db_campaign.id,
         "name": db_campaign.name,
@@ -400,16 +525,22 @@ def get_campaign(
         "query": db_campaign.user_query,
         "target_industry": db_campaign.target_industry,
         "target_location": db_campaign.target_location,
-        "user_intel": db_campaign.user_intel.__dict__ if db_campaign.user_intel else None,
+        "user_intel": {k: v for k, v in db_campaign.user_intel.__dict__.items() if k != "_sa_instance_state"} if db_campaign.user_intel else None,
         "target_companies_count": len([c for c in db_campaign.target_companies if getattr(c, 'status', 'NEW') != "REJECTED"]),
         "target_companies": target_companies,
         "dms_count": len(db_campaign.dms),
         "dms": dms,
-        "drafts_count": len(db_campaign.drafts),
-        "drafts": drafts,
+        "drafts": sorted(
+            [
+                {k: v for k, v in draft.__dict__.items() if k != "_sa_instance_state"}
+                for dm in db_campaign.dms
+                for draft in dm.drafts
+            ],
+            key=lambda x: x.get("created_at") or datetime.datetime.min,
+            reverse=True,
+        ),
+        "drafts_count": sum(len(dm.drafts) for dm in db_campaign.dms),
     }
-    # Remove SQLAlchemy internal state
-    if result["user_intel"]: result["user_intel"].pop("_sa_instance_state", None)
     
     return result
 
@@ -426,16 +557,17 @@ def update_draft(
     current_user: models.User = Depends(get_current_user)
 ):
     """
-    Content Refinement Protocol.
+    Email Protocol Refinement.
     Updates the subject or body of an outreach draft prior to tactical deployment.
     """
-    # Sector Query Boundary: Ensure draft belongs to a campaign governed by the actor
-    db_draft = db.query(models.EmailDraft).join(models.Campaign).filter(
-        models.EmailDraft.id == draft_id,
-        get_visibility_filter(db, current_user)
+    db_draft = _lock_query(
+        db.query(models.EmailDraft).join(models.Campaign).filter(
+            models.EmailDraft.id == draft_id,
+            get_visibility_filter(db, current_user)
+        )
     ).first()
     if not db_draft:
-        raise HTTPException(status_code=404, detail="Draft not found")
+        raise HTTPException(status_code=404, detail="Email Draft not found")
     
     db_draft.subject = update.subject
     db_draft.body = update.body
@@ -444,7 +576,28 @@ def update_draft(
         db_draft.dm.email = update.email
         
     db.commit()
-    return {"message": "Draft updated successfully"}
+    return {"message": "Email Draft updated successfully"}
+
+@app.post("/drafts/{draft_id}/approve")
+def approve_draft(
+    draft_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Engagement Protocol Authorization.
+    Authorizes a specific draft for tactical deployment.
+    """
+    db_draft = db.query(models.EmailDraft).join(models.Campaign).filter(
+        models.EmailDraft.id == draft_id,
+        get_visibility_filter(db, current_user)
+    ).first()
+    if not db_draft:
+        raise HTTPException(status_code=404, detail="Email Draft not found")
+    
+    db_draft.is_approved = True
+    db.commit()
+    return {"message": "Email Draft authorized for deployment."}
 
 @app.post("/drafts/{draft_id}/send")
 @limiter.limit("10/minute")
@@ -455,81 +608,63 @@ def send_draft(
     current_user: models.User = Depends(get_current_user)
 ):
     # Sector Query Boundary: Hard IDOR prevention & Hierarchical Trust
-    db_draft = db.query(models.EmailDraft).join(models.Campaign).filter(
-        models.EmailDraft.id == draft_id,
-        get_visibility_filter(db, current_user)
+    db_draft = _lock_query(
+        db.query(models.EmailDraft).join(models.Campaign).filter(
+            models.EmailDraft.id == draft_id,
+            get_visibility_filter(db, current_user)
+        )
     ).first()
     if not db_draft:
         raise HTTPException(status_code=404, detail="Email engagement protocol not found.")
+
+    if db_draft.status == "SENT" and db_draft.message_id:
+        return {"message": "Engagement protocol already deployed."}
     
     # 1. Coordinate Validation
     prospect_email = db_draft.dm.email if db_draft.dm else None
     if not prospect_email:
         raise HTTPException(status_code=400, detail="Deployment coordinate (Email) missing. Please refine and synchronize stakeholder data.")
         
-    from app.core.email_service import email_service
-    
+    # 1.1 Approval Boundary Enforcement
+    if not db_draft.is_approved:
+        raise HTTPException(status_code=403, detail="Operational Gate: Explicit approval required prior to live email engagement.")
+
+    queue_state = queue_draft_dispatch(
+        db,
+        db_draft,
+        queued_at=datetime.datetime.now(UTC).replace(tzinfo=None),
+    )
+    if queue_state == "already_sent":
+        return {"message": "Engagement protocol already deployed."}
+    if queue_state == "in_progress":
+        raise HTTPException(status_code=429, detail="Operational Lock: This draft is currently being deployed by another worker.")
+    if queue_state == "requires_review":
+        raise HTTPException(
+            status_code=409,
+            detail="Operational Review Required: Previous deployment attempt is still unresolved for this draft."
+        )
+
+    db.commit()
     try:
-        # 2. Coordinate Threading
-        thread_id = db_draft.dm.thread_id
-        
-        from app.core.token_service import TokenService
-        # 3. Strategic Deployment with campaign-specific credentials
-        creds = TokenService.get_google_credentials(db, db_draft.campaign.user_id)
-        msg_data = email_service.send_email(
-            to_email=prospect_email,
-            subject=db_draft.subject,
-            body=db_draft.body,
-            creds=creds,
-            thread_id=thread_id
+        send_draft_worker.delay(draft_id)
+    except Exception as exc:
+        db.rollback()
+        recovery_draft = _lock_query(
+            db.query(models.EmailDraft).join(models.Campaign).filter(
+                models.EmailDraft.id == draft_id,
+                get_visibility_filter(db, current_user)
+            )
+        ).first()
+        if recovery_draft and recovery_draft.status != "SENT":
+            recovery_draft.dispatch_state = "FAILED"
+            recovery_draft.dispatch_error = f"Failed to enqueue outbound delivery: {str(exc)}"[:1000]
+            db.commit()
+        logger.error(f"[DISPATCH] Failed to enqueue draft {draft_id}: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Outbound dispatch infrastructure is temporarily unavailable. Please retry shortly.",
         )
-        msg_id = msg_data["id"]
-        thread_id = msg_data["thread_id"]
-        
-        # 4. Log to Communication History
-        from datetime import UTC
-        import datetime
-        new_log = models.CommunicationLog(
-            campaign_id=db_draft.campaign_id,
-            dm_id=db_draft.decision_maker_id,
-            direction="SENT",
-            subject=db_draft.subject,
-            body=db_draft.body,
-            message_id=msg_id
-        )
-        db.add(new_log)
-        
-        # 5. Status & CRM Synchronization
-        if db_draft.dm:
-            dm = db_draft.dm
-            dm.last_message_id = msg_id
-            dm.thread_id = thread_id
-            if dm.status == "DISCOVERY_CALL":
-                hs_status = "Discovery Invitation Sent"
-                dm.status = "WAITING_FOR_REPLY" # Shared state for 'Wait' but UI will use pulse logic
-            elif db_draft.followup_index == 0:
-                hs_status = "Initial Email Sent"
-                dm.status = "INITIAL_SENT"
-            else:
-                idx = db_draft.followup_index
-                dm.followup_count = idx
-                suffix = "st" if idx == 1 else "nd" if idx == 2 else "rd" if idx == 3 else "th"
-                hs_status = f"{idx}{suffix} Follow Up Sent"
-                dm.status = f"FOLLOWUP_{idx}_SENT"
-            
-            # Update HubSpot CRM
-            from app.integrations.hubspot import hubspot_provider
-            hubspot_provider.update_lead_status(dm.hubspot_id, hs_status)
-            
-        db_draft.status = "SENT"
-        db_draft.message_id = msg_id
-        db_draft.sent_at = datetime.datetime.now(UTC)
-            
-        db.commit()
-        return {"message": f"Engagement protocol mobilized. HubSpot status updated to '{hs_status if db_draft.dm else 'N/A'}'."}
-    except Exception as e:
-        logger.error(f"Tactical Deployment Failure for draft {draft_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Tactical deployment failed: {str(e)}")
+    return {"message": "Engagement protocol queued for deployment."}
 
 @app.get("/prospects/{dm_id}")
 def get_prospect_details(

@@ -10,28 +10,27 @@ DATABASE_URL = os.getenv("NEON_DB_URL") or os.getenv("DATABASE_URL")
 if DATABASE_URL:
     DATABASE_URL = DATABASE_URL.strip("'").strip('"')
 
-# Global persistence anchoring
+# Enforce Neon DB / PostgreSQL Connectivity
 if not DATABASE_URL:
-    logger.warning("NEON_DB_URL not found. Mobilizing local SQLite fallback for runtime initialization.")
-    DATABASE_URL = "sqlite:///./fallback.db"
+    logger.critical("FATAL: NEON_DB_URL not detected. Database initialization aborted. Please verify environment variables.")
+    raise ValueError("Database configuration missing: NEON_DB_URL must be defined.")
 
-# High-concurrency connection configuration
+# High-concurrency connection configuration (Sized for distributed worker clusters)
 engine_args = {
     "pool_pre_ping": True, # Connection integrity verification
     "pool_recycle": 1800,  # Periodic connection recycling for serverless longevity
-    "pool_size": 10,       # Concurrent pool capacity for parallel agentic processes
-    "max_overflow": 20,    # Dynamic overflow capacity for transactional bursts
+    "pool_size": 20,       # Increased capacity for parallel agentic processes
+    "max_overflow": 40,    # Enhanced dynamic overflow for transactional bursts
     "pool_timeout": 30,    # Max wait latency for pool acquisition
 }
 
-if DATABASE_URL.startswith("postgresql"):
-    # Persistence Keepalive configuration for Neon/Serverless PostgreSQL
-    engine_args["connect_args"] = {
-        "keepalives": 1,
-        "keepalives_idle": 30,
-        "keepalives_interval": 10,
-        "keepalives_count": 5
-    }
+# Persistence Keepalive configuration for Neon/Serverless PostgreSQL
+engine_args["connect_args"] = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 5
+}
 
 engine = create_engine(
     DATABASE_URL,

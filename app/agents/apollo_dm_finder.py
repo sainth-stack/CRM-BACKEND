@@ -1,18 +1,28 @@
 import os
-import json
 import requests
-from typing import List, Dict, Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from app.core.circuit_breaker import (
+    CircuitBreakerConfig,
+    circuit_is_open,
+    record_circuit_failure,
+    record_circuit_success,
+)
+from app.core.llm_resilience import run_openai_guarded
 from app.core.logging_config import logger
 
 load_dotenv()
 
 # --- CONFIGURATION ---
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+APOLLO_CIRCUIT = CircuitBreakerConfig(
+    name="apollo:people_search",
+    failure_threshold=3,
+    recovery_timeout_seconds=300,
+)
 
 class ContactInfo(BaseModel):
     name: str
@@ -51,10 +61,14 @@ class ApolloDMAgent:
         sys_prompt = "You are a Chief Revenue Officer. Given an industryvertical, list the 5 most common high-level job titles that represent strategic decision makers (buyers) in that specific industry."
         
         try:
-            mapping = structured_llm.invoke([
-                SystemMessage(content=sys_prompt),
-                HumanMessage(content=f"Industry: {industry}")
-            ])
+            mapping = run_openai_guarded(
+                "apollo_persona_mapping",
+                lambda: structured_llm.invoke([
+                    SystemMessage(content=sys_prompt),
+                    HumanMessage(content=f"Industry: {industry}")
+                ]),
+                fallback=PersonaMap(target_titles=["CEO", "Founder", "VP of Operations", "Director", "Owner"]),
+            )
             return mapping.target_titles
         except Exception as e:
             logger.error(f"[APOLLO AGENT] Persona mapping failed: {e}")
@@ -85,16 +99,27 @@ class ApolloDMAgent:
             "Cache-Control": "no-cache"
         }
 
+        is_open, state = circuit_is_open(APOLLO_CIRCUIT)
+        if is_open:
+            logger.warning(
+                "[APOLLO AGENT] Circuit open for Apollo people search. Skipping lookup for %s. Last failure: %s",
+                domain,
+                state.get("last_failure"),
+            )
+            return []
+
         try:
             logger.info(f"[APOLLO AGENT] Executing lookup for {domain} with titles: {target_titles}")
             response = requests.post(self.api_url, json=payload, headers=headers, timeout=15)
             
             if response.status_code == 429:
                 logger.warning("[APOLLO AGENT] Rate limit hit. Protocol: Throttled.")
+                record_circuit_failure(APOLLO_CIRCUIT, "Apollo API rate limit exceeded.")
                 return []
             
             response.raise_for_status()
             data = response.json()
+            record_circuit_success(APOLLO_CIRCUIT)
             
             raw_people = data.get("people", [])
             final_contacts = []
@@ -127,6 +152,10 @@ class ApolloDMAgent:
             # Return Top 3 unique high-level contacts
             return sorted(final_contacts, key=lambda x: x.relevance_score, reverse=True)[:3]
 
+        except requests.RequestException as e:
+            record_circuit_failure(APOLLO_CIRCUIT, str(e))
+            logger.error(f"[APOLLO AGENT] Handsake failed for {domain}: {e}")
+            return []
         except Exception as e:
             logger.error(f"[APOLLO AGENT] Handsake failed for {domain}: {e}")
             return []

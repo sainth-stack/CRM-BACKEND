@@ -1,15 +1,68 @@
 import os
 import jwt
+import socket
+import ipaddress
+import urllib.parse
 from datetime import datetime, timedelta, UTC
 from typing import Optional, Dict, Any
 from cryptography.fernet import Fernet
-from fastapi import HTTPException, status, Depends
+from fastapi import HTTPException, status, Depends, Request
 from fastapi.security import OAuth2PasswordBearer
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from app.db import models
 from app.db.database import get_db
 from app.core.logging_config import logger
+
+def validate_url_for_ssrf(url: str) -> tuple[str, str]:
+    """
+    Sovereign SSRF Audit Layer (TOCTOU-Resistant).
+    Rejects private IPs, loopback, and cloud metadata endpoints.
+    Mandates DNS resolution and returns the validated IP to prevent DNS Rebinding.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ["http", "https"]:
+            raise HTTPException(status_code=400, detail="Tactical error: Only HTTP/HTTPS protocols are permitted.")
+        
+        hostname = parsed.hostname
+        if not hostname:
+            raise HTTPException(status_code=400, detail="Invalid coordinate: missing hostname.")
+        
+        # Phase 1: Direct IP Check & DNS Resolution Audit (Dual-Stack)
+        try:
+            # Check if hostname is already a valid IP
+            ip_obj = ipaddress.ip_address(hostname)
+            resolved_ips = [hostname]
+        except ValueError:
+            # Resolve hostname to all available IPs (IPv4 & IPv6)
+            try:
+                addr_info = socket.getaddrinfo(hostname, None)
+                resolved_ips = list(set(info[4][0] for info in addr_info))
+            except socket.gaierror:
+                raise HTTPException(status_code=400, detail="Coordinate resolution failed. Domain unreachable.")
+
+        # Phase 2: Security Boundary Enforcement (Audit all resolved coordinates)
+        validated_ip = None
+        for ip in resolved_ips:
+            # Normalize IPv6 link-local/scope identifiers if present
+            clean_ip = ip.split('%')[0] if '%' in ip else ip
+            curr_ip_obj = ipaddress.ip_address(clean_ip)
+            
+            if curr_ip_obj.is_private or curr_ip_obj.is_loopback or curr_ip_obj.is_link_local or curr_ip_obj.is_reserved:
+                 logger.warning(f"[SECURITY] SSRF ATTEMPT BLOCKED: {hostname} resolved to internal/restricted IP {ip}")
+                 raise HTTPException(status_code=400, detail="Restricted Sector: Internal IP access prohibited.")
+            
+            # Prefer IPv4 for outbound compatibility if available
+            if not validated_ip or (curr_ip_obj.version == 4 and ipaddress.ip_address(validated_ip).version == 6):
+                validated_ip = ip
+
+        return url, validated_ip
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"SSRF Audit Failure: {e}")
+        raise HTTPException(status_code=400, detail="Invalid URL format or security protocol failure.")
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
@@ -28,7 +81,7 @@ if not SECRET_KEY:
     raise RuntimeError("Security Infrastructure Failure: 'JWT_SECRET' environment variable is required.")
 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 24 hours
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 # Encryption setup for persistent OAuth refresh tokens
@@ -54,10 +107,9 @@ def decrypt_token(encrypted_token: str) -> str:
             detail="Failed to decrypt secure token"
         )
 
-# Distributed Session Revocation Cache (Redis-backed, in-memory fallback)
-# Stores revocation timestamps keyed by user_id to invalidate JWTs issued before the last reset.
-_REVOCATION_FALLBACK: dict = {}  # Used only if Redis is unreachable
-logger.debug("[SECURITY] Session revocation cache initialized.")
+# Distributed Session Revocation Cache (Redis-backed)
+# Stores revocation timestamps to invalidate JWTs globally across the cluster.
+logger.debug("[SECURITY] Session revocation infrastructure active.")
 
 def _get_redis():
     """Retrieves an active Redis client connection for distributed operations."""
@@ -74,23 +126,53 @@ def revoke_sessions(user_id: str):
     Distributed Session Termination.
     Instantly terminates all pre-existing JWTs for a user across the entire server cluster.
     """
-    revocation_time = int(datetime.now(UTC).timestamp())
     r = _get_redis()
     if r:
-        # TTL: 8 days (exceeds max potential JWT lifetime)
-        r.setex(f"revoked:{user_id}", 60 * 60 * 24 * 8, revocation_time)
+        revocation_time = datetime.now(UTC).timestamp()
+        r.setex(f"revoked:{user_id}", 60 * 60 * 24 * 8, str(revocation_time))
         logger.info(f"[SECURITY] Distributed session revocation active for user {user_id}")
     else:
-        _REVOCATION_FALLBACK[user_id] = revocation_time
-        logger.warning(f"[SECURITY] Redis unavailable — revocation stored in-memory for user {user_id} (single-pod scale only).")
+        logger.critical(f"[SECURITY] MISSION FAILURE: Redis unreachable. Partial revocation for {user_id} - Security integrity compromised.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Security infrastructure temporarily unavailable. Please try again shortly."
+        )
 
-def _get_revocation_time(user_id: str) -> int:
-    """Retrieves the last recorded revocation timestamp for a user identity."""
+def acquire_lock(lock_key: str, ttl: int = 300) -> bool:
+    """
+    Distributed Task Locking.
+    Ensures that a specific operational boundary (e.g., polling an inbox or sending a nudge)
+    is owned by exactly one worker instance at any given time.
+    """
+    r = _get_redis()
+    if not r:
+        logger.error(f"[LOCK] Redis unavailable. Refusing to acquire lock for {lock_key}.")
+        return False
+    
+    # NX=True ensures the key is only set if it does not already exist
+    return bool(r.set(f"lock:{lock_key}", "locked", ex=ttl, nx=True))
+
+def release_lock(lock_key: str):
+    """
+    Lock Decommissioning.
+    Explicitly releases a distributed lock to allow subsequent task execution.
+    """
+    r = _get_redis()
+    if r:
+        r.delete(f"lock:{lock_key}")
+
+def _get_revocation_time(user_id: str) -> float:
+    """Retrieves the last recorded high-precision revocation timestamp for a user identity."""
     r = _get_redis()
     if r:
         val = r.get(f"revoked:{user_id}")
-        return int(val) if val else 0
-    return _REVOCATION_FALLBACK.get(user_id, 0)
+        return float(val) if val else 0.0
+    
+    logger.critical("[SECURITY] Redis unreachable during identity verification.")
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Security infrastructure verification pending. Redis coordinate unreachable."
+    )
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Generates a high-fidelity JWT access token for stateful session management."""
@@ -102,7 +184,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     
     to_encode.update({
         "exp": expire,
-        "iat": int(datetime.now(UTC).timestamp())
+        "iat": datetime.now(UTC).timestamp() # Use float iat for high-precision revocation match
     })
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -114,7 +196,7 @@ def create_refresh_token(data: dict) -> str:
     to_encode.update({
         "exp": expire, 
         "type": "refresh",
-        "iat": int(datetime.now(UTC).timestamp())
+        "iat": datetime.now(UTC).timestamp()
     })
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -152,28 +234,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
                     headers={"WWW-Authenticate": "Bearer"}
                 )
             
-        role_claim = payload.get("role")
-        if role_claim is None:
-            # Persistent Identity Resolution
-            user = db.query(models.User).filter(models.User.id == user_id).first()
-            if user is None:
-                raise credentials_exception
-        else:
-            # Stateless Synthetic Identity Resolution
-            user = models.User(
-                id=user_id,
-                email=payload.get("email"),
-                role=models.UserRole(role_claim),
-                created_by_id=payload.get("created_by_id"),
-                user_limit=payload.get("user_limit", 0),
-                is_demo=payload.get("is_demo", False),
-                has_used_trial_quota=payload.get("has_used_trial_quota", False),
-                provider=payload.get("provider")
-            )
-            demo_expires_at_str = payload.get("demo_expires_at")
-            if demo_expires_at_str:
-                user.demo_expires_at = datetime.fromisoformat(demo_expires_at_str)
-                
+        # Canonical Identity Resolution: Always load from DB to ensure fresh state (Role, Quota, Demo expiry)
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if user is None:
+            raise credentials_exception
+            
     except jwt.PyJWTError:
         raise credentials_exception
 

@@ -1,5 +1,8 @@
 from celery import Celery, Task
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -12,8 +15,29 @@ class CampaignBaseTask(Task):
     gives the user a clear error state instead of an infinite loading spinner.
     """
     abstract = True
-
+    
+    def __call__(self, *args, **kwargs):
+        """
+        Task Lifecycle Hook: Injects the campaign_id into the thread-local context
+        before execution begins. This enables the logging filter to capture and 
+        tag all logs with the appropriate trace ID automatically.
+        """
+        from app.core.logging_config import campaign_id_var
+        
+        # Heuristic: campaign_id is almost always the first positional argument
+        # or an explicit keyword argument in this architecture.
+        campaign_id = args[0] if args else kwargs.get("campaign_id")
+        
+        token = campaign_id_var.set(campaign_id)
+        try:
+            return super().__call__(*args, **kwargs)
+        finally:
+            campaign_id_var.reset(token)
     def on_failure(self, exc, task_id, args, kwargs, einfo):
+        """
+        Terminal Failure Handler: Ensures campaigns don't stay in 'PENDING' forever
+        if a worker crashes or retries are exhausted.
+        """
         from app.db.database import SessionLocal
         from app.db import models
 
@@ -48,7 +72,9 @@ celery_app = Celery(
         "app.workers.tasks.intel_worker",
         "app.workers.tasks.discovery_worker",
         "app.workers.tasks.ghostwriter_worker",
+        "app.workers.tasks.outbound_worker",
         "app.workers.tasks.sentinels_worker",
+        "app.workers.tasks.sweeper_worker",
     ],
     task_cls=CampaignBaseTask
 )
@@ -66,18 +92,32 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True
 )
 
+# --- SSL Security Overlay for Secure Redis (Upstash/rediss) ---
+if redis_url.startswith("rediss"):
+    celery_app.conf.update(
+        broker_use_ssl={"ssl_cert_reqs": "none"},
+        redis_backend_use_ssl={"ssl_cert_reqs": "none"}
+    )
+
 celery_app.conf.beat_schedule = {
     "poll-inboxes-every-2-minutes": {
         "task": "app.workers.tasks.sentinels_worker.poll_all_users_task",
         "schedule": 120.0,
     },
     "check-meetings-every-10-minutes": {
-        "task": "app.workers.tasks.sentinels_worker.check_all_meetings_task",
+        "task": "app.workers.tasks.sentinels_worker.check_upcoming_meetings_task",
         "schedule": 600.0,
     },
-    "check-inactivity-every-hour": {
+    "check-inactivity-every-5-minutes": {
         "task": "app.workers.tasks.sentinels_worker.check_all_inactivity_task",
-        "schedule": 3600.0,
+        "schedule": 300.0,
+    },
+    "reactivate-terminated-every-6-hours": {
+        "task": "app.workers.tasks.sentinels_worker.reactivate_terminated_prospects_task",
+        "schedule": 21600.0,
+    },
+    "sweep-stuck-campaigns-every-10-minutes": {
+        "task": "app.workers.tasks.sweeper_worker.sweep_stuck_campaigns_task",
+        "schedule": 600.0,
     },
 }
-

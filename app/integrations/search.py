@@ -42,16 +42,26 @@ class SearchProvider:
 
     def search_ddgs(self, query: str):
         """
-        Executes an agile search via DuckDuckGo.
+        Executes an agile search via DuckDuckGo with exponential backoff.
         Serves as the primary redundancy layer for the discovery engine.
         """
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=15))
-            return [{"title": r['title'], "url": r['href'], "content": r['body'], "score": 0.5} for r in results]
-        except Exception as e:
-            logger.error(f"DuckDuckGo fallback search failure: {e}")
-            return []
+        import time
+        max_retries = 3
+        base_delay = 2
+        for attempt in range(max_retries):
+            try:
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query, max_results=15))
+                return [{"title": r['title'], "url": r['href'], "content": r['body'], "score": 0.5} for r in results]
+            except Exception as e:
+                if "429" in str(e) and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"DuckDuckGo rate limited. Retrying in {delay}s (Attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(delay)
+                    continue
+                logger.error(f"DuckDuckGo fallback search failure: {e}")
+                break
+        return []
 
     def parallel_search(self, query: str, include_domains: list = None):
         """

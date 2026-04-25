@@ -15,9 +15,10 @@ credentials.json
 token.json
 *.pem
 
-# Database artifacts
+# Database and Log artifacts
 *.db
 *.sqlite3
+*.log
 
 # Distribution / packaging
 dist/
@@ -37,3 +38,6 @@ Thumbs.db
 # IDE specific files
 .vscode/
 .idea/
+
+# Local tests
+tests/

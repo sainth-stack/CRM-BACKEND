@@ -3,6 +3,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 import enum
 from app.core.logging_config import logger
+from app.core.llm_resilience import run_openai_guarded
 
 # Specialized LLM for sentiment and intent analysis
 llm = ChatOpenAI(
@@ -57,10 +58,17 @@ def classify_reply_intent(original_email: str, prospect_reply: str) -> dict:
     
     try:
         logger.info("[INTENT] Analyzing prospect reply for sentiment signals...")
-        result = chain.invoke({
-            "original_email": original_email,
-            "prospect_reply": prospect_reply
-        })
+        result = run_openai_guarded(
+            "intent_classification",
+            lambda: chain.invoke({
+                "original_email": original_email,
+                "prospect_reply": prospect_reply
+            }),
+            fallback={"intent": "NEUTRAL", "reasoning": "Fallback due to temporarily unavailable classification service"},
+        )
+        if isinstance(result, dict):
+            logger.info(f"[INTENT] Classification complete: {result.get('intent')}")
+            return result
         logger.info(f"[INTENT] Classification complete: {result.intent}")
         return result.model_dump()
     except Exception as e:

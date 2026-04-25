@@ -4,9 +4,9 @@ from app.integrations.search import search_provider
 from curl_cffi import requests
 import json
 import re
-import os
 from dotenv import load_dotenv
 from app.core.logging_config import logger
+from app.core.llm_resilience import run_openai_guarded
 from app.core.sanitizer import sanitize_html, sanitize_for_llm
 
 load_dotenv()
@@ -63,11 +63,25 @@ def scrape_homepage_lite(url: str):
     Identity Marker Extraction.
     Executes a high-fidelity headless fetch to capture primary corporate metadata and discover functional sitemap verticals.
     """
+    from app.core.security import validate_url_for_ssrf
     try:
         if not url.startswith('http'):
             url = f"https://{url}"
         
-        response = requests.get(url, impersonate="chrome", timeout=10)
+        # Security: SSRF Boundary Audit (TOCTOU-Resistant)
+        safe_url, validated_ip = validate_url_for_ssrf(url)
+        
+        parsed = urlparse(safe_url)
+        hostname = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        
+        # Force resolution to the validated IP to prevent DNS Rebinding
+        response = requests.get(
+            safe_url, 
+            impersonate="chrome", 
+            timeout=10,
+            resolve={f"{hostname}:{port}": validated_ip}
+        )
         if response.status_code == 200:
             html = response.text
             title = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE)
@@ -147,10 +161,22 @@ def research_user_company(company_url: str):
     try:
         logger.info(f"[USER INTEL] Synchronizing intelligence for {domain}...")
         safe_context = sanitize_for_llm(master_context, context_limit=15000)
-        data = chain.invoke({
-            "company_url": domain, 
-            "search_results": safe_context
-        })
+        data = run_openai_guarded(
+            "user_intel_extraction",
+            lambda: chain.invoke({
+                "company_url": domain,
+                "search_results": safe_context
+            }),
+            fallback=None,
+        )
+        if not data:
+            return {
+                "exact_company_name": domain.split('.')[0].capitalize(),
+                "website": company_url,
+                "moto": "N/A",
+                "core_offerings": ["Digital Solutions"],
+                "deep_research": "Identity verified through site architecture.",
+            }
         return data.model_dump()
     except Exception as e:
         logger.error(f"[USER INTEL] Intelligence extraction failed for {domain}: {e}", exc_info=True)

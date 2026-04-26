@@ -70,6 +70,18 @@ class OAuthAccount(Base):
     
     user = relationship("User", back_populates="oauth_accounts")
 
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash = Column(String, unique=True, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
+    expires_at = Column(DateTime, index=True)
+    is_revoked = Column(Boolean, default=False)
+    
+    user = relationship("User", backref="refresh_tokens")
+
 class CampaignStatus(str, enum.Enum):
     PENDING = "PENDING"
     RESEARCHING_USER_COMPANY = "RESEARCHING_USER_COMPANY"

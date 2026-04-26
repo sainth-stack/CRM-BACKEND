@@ -1,3 +1,4 @@
+# Email Drafting Agent
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ llm = ChatOpenAI(
     frequency_penalty=0,
     presence_penalty=0,
     seed=42,
+    request_timeout=25
 )
 
 EMAIL_DRAFTER_PROMPT = """You are a World-Class Ghostwriter for cold outreach.
@@ -32,7 +34,7 @@ Decision Maker Info:
 - Target Company Research: {target_company_research}
 
 STRICT CONSTRAINTS:
-1. NO PLACEHOLDERS (like [Name], [Company Name], [Your Name], [Your Position], etc.). If a piece of data is missing, adapt the narrative to avoid mentioning it. 
+1. NO PLACEHOLDERS (like [Name], [Company Name], [Your Name], [Your Name], etc.). If a piece of data is missing, adapt the narrative to avoid mentioning it. 
 2. DO NOT include bracketed signature blocks. End the email professionally using the "{user_company_name}" name only.
 3. The tone must be professional but empathetic. No corporate jargon.
 4. Reference specific facts from the Target Company Research (e.g., recent news, specialized products).
@@ -83,11 +85,7 @@ class EmailDraftResponse(BaseModel):
     body: str = Field(description="The full, hyper-personalized email body")
 
 def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_name: str, target_company_research: str):
-    """
-    Hyper-Personalized Outreach Synthesis.
-    Constructs a strategic outreach draft by cross-referencing user value drivers with target company intelligence.
-    Ensures zero-placeholder compliance and professional brand alignment.
-    """
+    """Generates a hyper-personalized outreach draft for a stakeholder."""
     structured_llm = llm.with_structured_output(EmailDraftResponse)
     prompt = ChatPromptTemplate.from_template(EMAIL_DRAFTER_PROMPT)
     chain = prompt | structured_llm
@@ -114,10 +112,7 @@ def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_nam
         return None
 
 def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: str, thread_history: str, followup_number: int, manual_scheduling: bool = False):
-    """
-    Strategic Persistence Engineering.
-    Drafts high-context follow-up communication designed to address prospect concerns while maintaining outreach momentum.
-    """
+    """Drafts contextual follow-up emails based on previous thread history."""
     structured_llm = llm.with_structured_output(EmailDraftResponse)
     prompt = ChatPromptTemplate.from_template(FOLLOW_UP_PROMPT)
     chain = prompt | structured_llm
@@ -151,10 +146,7 @@ class NudgeDraftResponse(BaseModel):
     body: str = Field(description="The short nudge body")
 
 def draft_nudge_email(dm_name: str, user_company_name: str):
-    """
-    Inactivity Resurrection Protocol.
-    Generates ultra-short inbox nudges for non-responsive prospects to bring the thread to priority visibility.
-    """
+    """Generates short inbox nudges for non-responsive prospects."""
     structured_llm = llm.with_structured_output(NudgeDraftResponse)
     prompt = ChatPromptTemplate.from_template("""
     You are a polite business assistant. 

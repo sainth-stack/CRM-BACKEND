@@ -4,23 +4,24 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+import httplib2
+from typing import Any
 from app.core.logging_config import logger
 
 class EmailService:
     """
-    Production-grade stateless email service for multi-tenant outreach.
-    Orchestrates GMail API interactions for campaign outreach, identity verification, 
-    and administrative provisioning. Requires external injection of OAuth2 Credentials.
+    Service layer for GMail API interactions including campaign outreach, 
+    OTP verification, and account setup.
     """
+    def __init__(self):
+        # Operational Efficiency: Memoize GMail service objects to avoid redundant discovery parsing
+        self._service_cache = {}
     
     def send_email(self, to_email: str, subject: str, body: str, creds: Credentials, thread_id: str = None) -> dict:
-        """
-        Campaign Outreach Dispatch.
-        Routes distribution through the provided user sector credentials with support for thread-based engagement.
-        """
+        """Dispatches outreach emails through the user's connected mailbox."""
         if not creds:
-            logger.error("Security Error: Outreach capability blocked. No mailbox synchronization identified.")
-            raise Exception("Security Error: Outreach capability blocked. No mailbox synchronization identified for this user.")
+            logger.error(f"Email failed: No credentials for {to_email}")
+            raise Exception("No mailbox credentials identified.")
         
         try:
             return self._send_via_gmail(to_email, subject, body, creds, thread_id)
@@ -28,9 +29,23 @@ class EmailService:
             logger.error(f"[EMAIL] Outreach Dispatch Failure to {to_email}: {e}", exc_info=True)
             raise e
 
+    def _get_service(self, creds: Credentials) -> Any:
+        """ Identity-Anchored Service Provisioning with Discovery Caching. """
+        # Identify the session by its refresh_token or temporary access token
+        cache_key = hash(creds.refresh_token or creds.token)
+        
+        if cache_key in self._service_cache:
+            return self._service_cache[cache_key]
+        
+        # Build new service with explicit 10s boundary
+        http = httplib2.Http(timeout=10)
+        service = build('gmail', 'v1', credentials=creds, http=http)
+        self._service_cache[cache_key] = service
+        return service
+
     def _send_via_gmail(self, to_email: str, subject: str, body: str, creds: Credentials, thread_id: str = None) -> dict:
-        """Official Google API Bridge for high-fidelity outreach and threading."""
-        service = build('gmail', 'v1', credentials=creds)
+        """Official Google API Bridge for high-fidelity outreach and threading with a 10s timeout guard."""
+        service = self._get_service(creds)
         
         message = MIMEMultipart()
         message['To'] = to_email
@@ -63,10 +78,10 @@ class EmailService:
             sent_msg = service.users().messages().send(userId='me', body=data).execute()
             msg_id = sent_msg.get('id')
             new_thread_id = sent_msg.get('threadId')
-            logger.info(f"[GMAIL] Mission Success: Dispatched to {to_email} (Msg ID: {msg_id}, Thread ID: {new_thread_id})")
+            logger.info(f"[GMAIL] Sent: {to_email} (ID: {msg_id})")
             return {"id": msg_id, "thread_id": new_thread_id}
         except Exception as e:
-            logger.error(f"[GMAIL] API Error during outreach to {to_email}: {e}")
+            logger.error(f"[GMAIL] Failed to send to {to_email}: {e}")
             raise e
 
     def send_verification_email(self, to_email: str, otp: str):
@@ -103,13 +118,12 @@ class EmailService:
         """
         return self._send_via_gmail(to_email, subject, body, creds)
 
-    def send_provisioning_email(self, to_email: str, role: str, password: str, creds: Credentials):
+    def send_provisioning_email(self, to_email: str, role: str, setup_url: str, creds: Credentials):
         """
         Operator Provisioning Dispatch.
         Dispatches authoritative welcome and initial credentials to newly established Administrative or User sectors.
         """
         subject = f"Mission Provisioning: {role.replace('_', ' ').title()} Access Authorized"
-        login_url = os.getenv("FRONTEND_URL", "http://localhost:5173") + "/login"
         
         # Brand Alignment Palette
         COLOR_PRIMARY = "#FE1919"
@@ -135,38 +149,35 @@ class EmailService:
                 <p style="margin-top: 5px; color: #64748b; font-size: 14px;">Sector clearance level: <strong>{role.replace('_', ' ').upper()}</strong></p>
             </div>
             
-            <p style="line-height: 1.6; color: #475569; font-size: 15px;">Your operational credentials for the <strong>AI-PRIORI</strong> Intelligence Sector have been initialized. Authorized access is now granted to your register identity.</p>
+            <p style="line-height: 1.6; color: #475569; font-size: 15px;">Your operational credentials for the <strong>AI-PRIORI</strong> Intelligence Sector have been initialized. Authorized access is now granted to your registered identity.</p>
             
             <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 20px; padding: 30px; margin: 35px 0;">
                 <table style="width: 100%; border-collapse: collapse;">
                     <tr>
-                        <td style="padding-bottom: 20px;">
+                        <td>
                             <span style="font-size: 10px; font-weight: 800; color: #94a3b8; text-transform: uppercase; letter-spacing: 1.5px; display: block; margin-bottom: 5px;">Authorized Identity</span>
                             <span style="font-size: 16px; font-weight: 700; color: {COLOR_DARK};">{to_email}</span>
                         </td>
                     </tr>
-                    <tr>
-                        <td>
-                            <span style="font-size: 10px; font-weight: 800; color: #94a3b8; text-transform: uppercase; letter-spacing: 1.5px; display: block; margin-bottom: 5px;">Security Handshake</span>
-                            <span style="font-size: 18px; font-weight: 800; color: {COLOR_PRIMARY}; font-family: 'Courier New', Courier, monospace; letter-spacing: 1px;">{password}</span>
-                        </td>
-                    </tr>
                 </table>
             </div>
+
+            <p style="line-height: 1.6; color: #475569; font-size: 14px; text-align: center;">To secure your sector and initialize your mission, you must establish your private security credentials.</p>
             
-            <div style="text-align: center; margin-top: 45px;">
-                <a href="{login_url}" style="background-color: {COLOR_DARK}; color: #ffffff; padding: 18px 40px; border-radius: 14px; text-decoration: none; font-weight: 800; font-size: 14px; text-transform: uppercase; letter-spacing: 2px; display: inline-block; box-shadow: 0 10px 15px -3px rgba(17, 24, 39, 0.2);">Initialize Session</a>
+            <div style="text-align: center; margin-top: 35px;">
+                <a href="{setup_url}" style="background-color: {COLOR_DARK}; color: #ffffff; padding: 18px 40px; border-radius: 14px; text-decoration: none; font-weight: 800; font-size: 14px; text-transform: uppercase; letter-spacing: 2px; display: inline-block; box-shadow: 0 10px 15px -3px rgba(17, 24, 39, 0.2);">Setup Account & Login</a>
             </div>
             
             <div style="margin-top: 50px; padding-top: 25px; border-top: 1px solid #f1f5f9; text-align: center;">
                 <p style="font-size: 11px; color: #94a3b8; line-height: 1.8; margin: 0;">
-                    <strong>Mission-Critical Notice:</strong> This is an encrypted dispatch from the AI-PRIORI Governance Sector. <br>
+                    <strong>Security Notice:</strong> This setup link will expire in 24 hours. <br>
                     Unauthorized access to this identity or platform is strictly prohibited and monitored.
                 </p>
                 <div style="margin-top: 15px; font-size: 10px; color: #cbd5e1; font-weight: 700; letter-spacing: 3px; text-transform: uppercase;">
                     Precision Sector Intelligence
                 </div>
             </div>
+        </div>
         </div>
         """
         return self._send_via_gmail(to_email, subject, body, creds)

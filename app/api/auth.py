@@ -17,7 +17,9 @@ from app.core.security import (
     encrypt_token, 
     verify_password, 
     get_password_hash,
-    revoke_sessions
+    revoke_sessions,
+    hash_token,
+    REFRESH_TOKEN_EXPIRE_DAYS
 )
 from app.core.token_service import TokenService
 from app.core.email_service import email_service
@@ -38,6 +40,25 @@ def _lock_query(query):
         return query.with_for_update()
     return query
 
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+def issue_refresh_token(db: Session, user_id: str) -> str:
+    """
+    Identity Anchor Generation.
+    Generates a secure JWT refresh token and persists its SHA-256 fingerprint in the database.
+    """
+    token = create_refresh_token(data={"sub": user_id})
+    expires_at = datetime.datetime.now(UTC) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    
+    db_token = models.RefreshToken(
+        user_id=user_id,
+        token_hash=hash_token(token),
+        expires_at=expires_at
+    )
+    db.add(db_token)
+    db.commit()
+    return token
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -51,7 +72,7 @@ class VerifyOTPRequest(BaseModel):
 
 @router.post("/login")
 @limiter.limit("10/minute")  # Brute-force shield: 10 attempts/minute per IP
-async def login(request: Request, credentials: LoginRequest = Body(...), db: Session = Depends(get_db)):
+def login(request: Request, credentials: LoginRequest = Body(...), db: Session = Depends(get_db)):
     """
     Standard Email/Password Sign-In.
     Verifies credentials and issues a JWT session.
@@ -71,19 +92,12 @@ async def login(request: Request, credentials: LoginRequest = Body(...), db: Ses
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Issue Internal Stateless Session (Fat JWT Payload)
+    # Issue Internal Stateless Session (Slim JWT)
     access_token = create_access_token(data={
         "sub": user.id, 
-        "email": user.email,
-        "role": user.role.value,
-        "created_by_id": user.created_by_id,
-        "user_limit": user.user_limit,
-        "is_demo": user.is_demo,
-        "demo_expires_at": user.demo_expires_at.isoformat() if user.demo_expires_at else None,
-        "has_used_trial_quota": user.has_used_trial_quota,
-        "provider": user.provider
+        "role": user.role.value
     })
-    refresh_token = create_refresh_token(data={"sub": user.id})
+    refresh_token = issue_refresh_token(db, user.id)
 
     return {
         "access_token": access_token,
@@ -91,13 +105,18 @@ async def login(request: Request, credentials: LoginRequest = Body(...), db: Ses
         "token_type": "bearer",
         "user": {
             "id": user.id,
-            "email": user.email
+            "email": user.email,
+            "role": user.role.value,
+            "is_demo": user.is_demo,
+            "demo_expires_at": user.demo_expires_at.isoformat() if user.demo_expires_at else None,
+            "user_limit": user.user_limit,
+            "provider": user.provider
         }
     }
 
 @router.post("/demo/signup")
 @limiter.limit("5/minute")   # Bot-flood shield: 5 demo signups/minute per IP
-async def demo_signup(request: Request, credentials: LoginRequest = Body(...), db: Session = Depends(get_db)):
+def demo_signup(request: Request, credentials: LoginRequest = Body(...), db: Session = Depends(get_db)):
     """
     Trial Identity Mobilization.
     Initializes a temporary 5-day assessment account and dispatches a verification coordinate (OTP).
@@ -117,7 +136,7 @@ async def demo_signup(request: Request, credentials: LoginRequest = Body(...), d
         hashed_password=get_password_hash(credentials.password),
         is_demo=True,
         signup_source="demo",
-        otp_code=otp,
+        otp_code=get_password_hash(otp),
         otp_expiry=datetime.datetime.now(UTC) + timedelta(minutes=15)
     )
     db.add(user)
@@ -132,13 +151,13 @@ async def demo_signup(request: Request, credentials: LoginRequest = Body(...), d
     return {"message": "Identity verification mobilized. Please check your email for the code."}
 
 @router.post("/demo/verify")
-async def verify_demo_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
+def verify_demo_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
     """
     Trial Boundary Activation.
     Validates the provided OTP and activates the 5-day temporal boundary for the trial identity.
     """
     user = db.query(models.User).filter(models.User.email == request.email).first()
-    if not user or not user.otp_code or user.otp_code != request.otp:
+    if not user or not user.otp_code or not verify_password(request.otp, user.otp_code):
         raise HTTPException(status_code=400, detail="Invalid verification code.")
     
     if not user.otp_expiry or user.otp_expiry.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
@@ -150,19 +169,12 @@ async def verify_demo_otp(request: VerifyOTPRequest, db: Session = Depends(get_d
     user.otp_expiry = None
     db.commit()
     
-    # Issue initial session (Stateless Structure)
+    # Issue initial session (Slim JWT)
     access_token = create_access_token(data={
         "sub": user.id, 
-        "email": user.email,
-        "role": user.role.value,
-        "created_by_id": user.created_by_id,
-        "user_limit": user.user_limit,
-        "is_demo": user.is_demo,
-        "demo_expires_at": user.demo_expires_at.isoformat() if user.demo_expires_at else None,
-        "has_used_trial_quota": user.has_used_trial_quota,
-        "provider": user.provider
+        "role": user.role.value
     })
-    refresh_token = create_refresh_token(data={"sub": user.id})
+    refresh_token = issue_refresh_token(db, user.id)
     
     return {
         "access_token": access_token,
@@ -171,7 +183,10 @@ async def verify_demo_otp(request: VerifyOTPRequest, db: Session = Depends(get_d
         "user": {
             "id": user.id,
             "email": user.email,
-            "demo_expires_at": user.demo_expires_at
+            "role": user.role.value,
+            "is_demo": user.is_demo,
+            "demo_expires_at": user.demo_expires_at,
+            "user_limit": user.user_limit
         }
     }
 
@@ -182,7 +197,7 @@ class ForgotPasswordRequest(BaseModel):
 
 @router.post("/forgot-password")
 @limiter.limit("5/minute")   # Enumeration shield: 5 reset requests/minute per IP
-async def forgot_password(request: Request, payload: ForgotPasswordRequest = Body(...), db: Session = Depends(get_db)):
+def forgot_password(request: Request, payload: ForgotPasswordRequest = Body(...), db: Session = Depends(get_db)):
     """
     Identity Recovery Initialization.
     Dispatches a secure 6-digit verification code to the registered email to authorize password restoration.
@@ -192,10 +207,17 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest = Bod
         # Prevent Identity Enumeration: Return success even if account doesn't exist
         return {"message": "If this identity is registered, a verification code has been mobilized to the associated email."}
 
+    # Activation Gate: Do not allow unactivated identities to use self-service recovery
+    if not user.hashed_password:
+        raise HTTPException(
+            status_code=400, 
+            detail="Identity sector pending activation. Please use the secure setup link provided in your welcome email or contact your administrator."
+        )
+
     # Generate 6-digit high-variance cryptographically secure OTP
     import secrets
     otp = str(secrets.randbelow(900000) + 100000)
-    user.otp_code = otp
+    user.otp_code = get_password_hash(otp)
     user.otp_expiry = datetime.datetime.now(UTC) + timedelta(minutes=10)
     db.commit()
 
@@ -207,19 +229,15 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest = Bod
 
     return {"message": "Identity verification code mobilized to your vaulted email."}
 
-class VerifyOTPRequest(BaseModel):
-    email: str
-    otp: str
-
 @router.post("/verify-otp")
 @limiter.limit("10/minute")
-async def verify_otp(request: Request, payload: VerifyOTPRequest, db: Session = Depends(get_db)):
+def verify_otp(request: Request, payload: VerifyOTPRequest, db: Session = Depends(get_db)):
     """
     Verification Coordinate Validation.
     Confirms the legitimacy of the verification code and issues a temporary reset authorization session.
     """
     user = db.query(models.User).filter(models.User.email == payload.email).first()
-    if not user or not user.otp_code or user.otp_code != payload.otp:
+    if not user or not user.otp_code or not verify_password(payload.otp, user.otp_code):
         raise HTTPException(status_code=400, detail="Invalid verification code.")
 
     # Time-based validation
@@ -239,7 +257,7 @@ class ResetPasswordRequest(BaseModel):
 
 @router.post("/reset-password")
 @limiter.limit("10/minute")
-async def reset_password(request: Request, payload: ResetPasswordRequest, db: Session = Depends(get_db)):
+def reset_password(request: Request, payload: ResetPasswordRequest, db: Session = Depends(get_db)):
     """
     Cryptographic Credential Restoration.
     Updates the user's hashed password and terminates all pre-existing sessions to ensure identity integrity.
@@ -248,18 +266,34 @@ async def reset_password(request: Request, payload: ResetPasswordRequest, db: Se
         raise HTTPException(status_code=400, detail="Passwords do not match.")
 
     try:
-        from app.core.security import SECRET_KEY, ALGORITHM
+        from app.core.security import SECRET_KEY, ALGORITHM, _get_revocation_time
         import jwt
         decoded_payload = jwt.decode(payload.reset_token, SECRET_KEY, algorithms=[ALGORITHM])
-        if decoded_payload.get("purpose") != "password_reset":
+        purpose = decoded_payload.get("purpose")
+        if purpose not in ["password_reset", "account_onboarding"]:
             raise HTTPException(status_code=401, detail="Unauthorized reset session.")
+        
         user_id = decoded_payload.get("sub")
+        iat = decoded_payload.get("iat")
+
+        # Security Layer: Distributed Revocation Check
+        if iat is not None:
+            revocation_time = _get_revocation_time(user_id)
+            if revocation_time and iat < revocation_time:
+                raise HTTPException(status_code=401, detail="Security link has expired or been used.")
+                
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=401, detail="Reset session expired or invalid.")
 
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Identity profile not found.")
+
+    # One-Time Use Guard for Onboarding
+    if purpose == "account_onboarding" and user.hashed_password:
+        raise HTTPException(status_code=400, detail="This activation link has already been used to initialize the sector.")
 
     # Prepare secure hashed credentials. We only commit after session revocation
     # succeeds so the endpoint cannot return failure after persisting the password.
@@ -275,7 +309,8 @@ async def reset_password(request: Request, payload: ResetPasswordRequest, db: Se
     return {"message": "Identity credentials updated. You may now initialize a secure session."}
 
 @router.post("/refresh")
-async def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
+@limiter.limit("15/minute")
+def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
     """
     Session Continuity Protocol.
     Exchanges a valid long-lived refresh token for a new fat JWT access token.
@@ -289,28 +324,58 @@ async def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
             raise HTTPException(status_code=401, detail="Invalid token type.")
             
         user_id = payload.get("sub")
+        iat = payload.get("iat")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload.")
             
+        # Security Layer: Distributed Revocation Check
+        # Prevents 'Ghost Sessions' by ensuring refresh tokens honor global logouts
+        if iat is not None:
+            from app.core.security import _get_revocation_time
+            revocation_time = _get_revocation_time(user_id)
+            if revocation_time and iat < revocation_time:
+                raise HTTPException(status_code=401, detail="Refresh session has been revoked.")
+
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=401, detail="Identity profile no longer exists.")
 
-        # Re-issue High-Fidelity Stateless Session
+        # Stateful Session Validation: Check DB for active token fingerprint
+        # This protects against JWT signature leaks and allows granular revocation.
+        t_hash = hash_token(request.refresh_token)
+        db_token = db.query(models.RefreshToken).filter(
+            models.RefreshToken.token_hash == t_hash,
+            models.RefreshToken.is_revoked == False
+        ).first()
+
+        if not db_token:
+            # High-Security Protocol: If a revoked token is presented, it might be a Replay Attack.
+            # In production, we could trigger a global revocation here for the user.
+            logger.warning(f"[SECURITY] REPLAY ATTACK SUSPECTED for user {user_id}. Revoked token presented.")
+            raise HTTPException(status_code=401, detail="Session expired or already rotated.")
+
+        # Temporal Boundary Check
+        if db_token.expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
+            db_token.is_revoked = True
+            db.commit()
+            raise HTTPException(status_code=401, detail="Refresh session has expired.")
+
+        # Rotation Protocol: Invalidate the old token and issue a fresh one
+        # This ensures that a stolen refresh token is only useful until the user's next refresh.
+        db_token.is_revoked = True
+        db.commit()
+        
+        new_refresh_token = issue_refresh_token(db, user.id)
+
+        # Re-issue High-Fidelity Stateless Session (Slim JWT)
         access_token = create_access_token(data={
             "sub": user.id, 
-            "email": user.email,
-            "role": user.role.value,
-            "created_by_id": user.created_by_id,
-            "user_limit": user.user_limit,
-            "is_demo": user.is_demo,
-            "demo_expires_at": user.demo_expires_at.isoformat() if user.demo_expires_at else None,
-            "has_used_trial_quota": user.has_used_trial_quota,
-            "provider": user.provider
+            "role": user.role.value
         })
         
         return {
             "access_token": access_token,
+            "refresh_token": new_refresh_token,
             "token_type": "bearer"
         }
     except jwt.ExpiredSignatureError:
@@ -318,8 +383,27 @@ async def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid refresh session.")
 
+@router.post("/logout")
+def logout(request: RefreshRequest, db: Session = Depends(get_db)):
+    """
+    Session Termination Protocol.
+    Permanently revokes the provided refresh token and invalidates the current session hierarchy.
+    """
+    t_hash = hash_token(request.refresh_token)
+    db_token = db.query(models.RefreshToken).filter(
+        models.RefreshToken.token_hash == t_hash
+    ).first()
+    
+    if db_token:
+        db_token.is_revoked = True
+        # Also kill access tokens for this user globally as a standard sign-out measure
+        revoke_sessions(db_token.user_id)
+        db.commit()
+        
+    return {"message": "Session terminated successfully."}
+
 @router.get("/me")
-async def get_me(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_me(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
     Identity Profile Audit.
     Retrieves the authenticated actor's profile, including role-based capabilities and trial boundary status.
@@ -334,9 +418,14 @@ async def get_me(current_user: models.User = Depends(get_current_user), db: Sess
         "id": current_user.id,
         "email": current_user.email,
         "role": current_user.role.value,
+        "is_demo": current_user.is_demo,
+        "demo_expires_at": current_user.demo_expires_at,
+        "is_expired": is_expired,
         "user_limit": current_user.user_limit,
-        "provider": current_user.provider,
+        "has_used_trial_quota": current_user.has_used_trial_quota,
         "has_mailbox": has_mailbox,
+        "provider": current_user.provider,
+        "created_at": current_user.created_at,
         "mailbox_health": {
             "status": oauth_account.mailbox_health_status if oauth_account else "NOT_CONNECTED",
             "last_checked_at": oauth_account.mailbox_last_checked_at if oauth_account else None,
@@ -354,11 +443,10 @@ async def get_me(current_user: models.User = Depends(get_current_user), db: Sess
 
 class AdminProvisionRequest(BaseModel):
     email: str
-    password: str
     user_limit: int = 5
 
 @router.post("/sovereign/admins")
-async def provision_admin(
+def provision_admin(
     request: AdminProvisionRequest, 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
@@ -376,7 +464,6 @@ async def provision_admin(
         
     new_admin = models.User(
         email=request.email,
-        hashed_password=get_password_hash(request.password),
         role=models.UserRole.ADMIN,
         user_limit=request.user_limit,
         created_by_id=current_user.id
@@ -396,12 +483,19 @@ async def provision_admin(
     # Autonomous Provisioning Dispatch
     email_sent = False
     try:
+        # Generate One-Time Onboarding Token (24h expiry)
+        setup_token = create_access_token(
+            data={"sub": new_admin.id, "purpose": "account_onboarding"}, 
+            expires_delta=timedelta(hours=24)
+        )
+        setup_url = f"{FRONTEND_URL}/setup-password?token={setup_token}"
+
         creds = TokenService.get_google_credentials(db, current_user.id)
         if creds:
             email_service.send_provisioning_email(
                 to_email=new_admin.email,
                 role="Admin",
-                password=request.password,
+                setup_url=setup_url,
                 creds=creds
             )
             email_sent = True
@@ -416,7 +510,7 @@ async def provision_admin(
     }
 
 @router.get("/sovereign/admins")
-async def list_admins(
+def list_admins(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
@@ -447,6 +541,7 @@ async def list_admins(
             "user_limit": adm.user_limit,
             "current_users": user_count,
             "is_over_quota": user_count > adm.user_limit,
+            "is_activated": adm.hashed_password is not None,
             "created_at": adm.created_at
         })
     return result
@@ -455,7 +550,7 @@ class AdminQuotaUpdateRequest(BaseModel):
     user_limit: int
 
 @router.patch("/sovereign/admins/{admin_id}/quota")
-async def update_admin_quota(
+def update_admin_quota(
     admin_id: str,
     request: AdminQuotaUpdateRequest,
     db: Session = Depends(get_db),
@@ -489,7 +584,7 @@ async def update_admin_quota(
     return {"message": "Admin quota successfully adjusted."}
 
 @router.delete("/sovereign/admins/{admin_id}")
-async def decommission_admin(
+def decommission_admin(
     admin_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
@@ -509,11 +604,18 @@ async def decommission_admin(
     if not admin:
         raise HTTPException(status_code=404, detail="Admin sector not found.")
         
+    # Sector-Wide Session Purge: Revoke sessions for the Admin and ALL their provisioned users
+    # This prevents 'Ghost Sessions' from lingering in Redis/Browsers after DB deletion
+    managed_users = db.query(models.User).filter(models.User.created_by_id == admin.id).all()
+    for u in managed_users:
+        revoke_sessions(u.id)
+    revoke_sessions(admin.id)
+
     log = models.AdministrativeLog(
         actor_id=current_user.id,
         target_id=admin.id,
         action="DECOMMISSION",
-        details=f"Permanently decommissioned Admin sector {admin.email}"
+        details=f"Permanently decommissioned Admin sector {admin.email} and recursively revoked {len(managed_users)} user sessions."
     )
     db.add(log)
     db.delete(admin)
@@ -524,11 +626,10 @@ async def decommission_admin(
 
 class UserProvisionRequest(BaseModel):
     email: str
-    password: str
 
 @router.post("/management/users")
 @limiter.limit("5/minute")
-async def provision_user(
+def provision_user(
     request: Request,
     payload: UserProvisionRequest, 
     db: Session = Depends(get_db),
@@ -563,7 +664,6 @@ async def provision_user(
 
         new_user = models.User(
             email=payload.email,
-            hashed_password=get_password_hash(payload.password),
             role=models.UserRole.USER,
             created_by_id=current_user.id,
             signup_source="manual"
@@ -583,12 +683,19 @@ async def provision_user(
     
     # Autonomous Provisioning Dispatch
     try:
+        # Generate One-Time Onboarding Token (24h expiry)
+        setup_token = create_access_token(
+            data={"sub": new_user.id, "purpose": "account_onboarding"}, 
+            expires_delta=timedelta(hours=24)
+        )
+        setup_url = f"{FRONTEND_URL}/setup-password?token={setup_token}"
+
         creds = TokenService.get_google_credentials(db, current_user.id)
         if creds:
             email_service.send_provisioning_email(
                 to_email=new_user.email,
                 role="User",
-                password=payload.password,
+                setup_url=setup_url,
                 creds=creds
             )
             email_sent = True
@@ -601,9 +708,64 @@ async def provision_user(
         "email_dispatched": email_sent
     }
 
+@router.post("/management/resend-activation/{user_id}")
+@limiter.limit("5/minute")
+def resend_activation(
+    request: Request,
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Activation Link Regeneration.
+    Permits authorized administrators to re-dispatch a secure setup link to unactivated sectors.
+    """
+    if current_user.role not in [models.UserRole.ADMIN, models.UserRole.SUPER_ADMIN]:
+        raise HTTPException(status_code=403, detail="Administrative authority required.")
+
+    target_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Identity sector not found.")
+
+    # Authority Boundary: Admins can only resend to users they created
+    if current_user.role == models.UserRole.ADMIN and target_user.created_by_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied to this identity sector.")
+    
+    # State Boundary: Only allow for unactivated users
+    if target_user.hashed_password:
+        raise HTTPException(status_code=400, detail="Identity sector is already activated.")
+
+    # Generate fresh One-Time Onboarding Token (24h expiry)
+    setup_token = create_access_token(
+        data={"sub": target_user.id, "purpose": "account_onboarding"}, 
+        expires_delta=timedelta(hours=24)
+    )
+    setup_url = f"{FRONTEND_URL}/setup-password?token={setup_token}"
+
+    email_sent = False
+    try:
+        creds = TokenService.get_google_credentials(db, current_user.id)
+        if creds:
+            email_service.send_provisioning_email(
+                to_email=target_user.email,
+                role=target_user.role.value.replace('_', ' ').title(),
+                setup_url=setup_url,
+                creds=creds
+            )
+            email_sent = True
+            logger.info(f"[RESEND] Activation link re-dispatched for {target_user.email}")
+    except Exception as e:
+        logger.error(f"[RESEND] Dispatch failure for {target_user.email}: {e}")
+        raise HTTPException(status_code=500, detail="Email dispatch system failure.")
+
+    return {
+        "message": "Activation link successfully re-dispatched.",
+        "email_dispatched": email_sent
+    }
+
 @router.get("/management/users")
 @limiter.limit("15/minute")
-async def list_managed_users(
+def list_managed_users(
     request: Request,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
@@ -643,6 +805,7 @@ async def list_managed_users(
             "email": u.email,
             "campaign_count": campaign_count,
             "is_demo": u.is_demo,
+            "is_activated": u.hashed_password is not None,
             "has_mailbox": has_mailbox,
             "created_at": u.created_at
         })
@@ -657,7 +820,7 @@ async def list_managed_users(
 
 @router.delete("/management/users/{user_id}")
 @limiter.limit("5/minute")
-async def decommission_user(
+def decommission_user(
     request: Request,
     user_id: str,
     db: Session = Depends(get_db),
@@ -679,11 +842,14 @@ async def decommission_user(
     if not target_user:
         raise HTTPException(status_code=404, detail="User sector not found in your jurisdiction.")
         
+    # Session Revocation: Kill all active Access/Refresh tokens instantly
+    revoke_sessions(target_user.id)
+
     log = models.AdministrativeLog(
         actor_id=current_user.id,
         target_id=target_user.id,
         action="DECOMMISSION",
-        details=f"Decommissioned User identity {target_user.email}"
+        details=f"Permanently decommissioned identity {target_user.email}"
     )
     db.add(log)
     db.delete(target_user)

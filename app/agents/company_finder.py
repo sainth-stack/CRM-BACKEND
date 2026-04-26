@@ -50,9 +50,8 @@ class DeduplicationResult(BaseModel):
 
 class CompanyFinderPipeline:
     """
-    Intelligence Discovery Cluster: Company Identification.
-    Orchestrates search reconnaissance, deduplication, deep research, and AI-driven validation
-    to identify high-fidelity leads within a specific industry vertical.
+    Handles company discovery, deduplication, and AI-driven validation
+    for identifying high-quality leads in specific industries.
     """
     def __init__(self):
         self.llm = ChatOpenAI(
@@ -61,7 +60,8 @@ class CompanyFinderPipeline:
             seed=42,
             top_p=1,
             frequency_penalty=0,
-            presence_penalty=0
+            presence_penalty=0,
+            request_timeout=25
         )
         try:
             from tavily import TavilyClient
@@ -101,10 +101,7 @@ class CompanyFinderPipeline:
             return []
 
     def stage_1_recon(self, industry: str, location: str, size: str, start_page: int = 0) -> list:
-        """
-        Phase 1: Search Reconnaissance.
-        Mobilizes multi-threaded search queries to gather raw LinkedIn company snapshots.
-        """
+        """Phase 1: Parallel LinkedIn search for target companies."""
         query = f'site:linkedin.com/company "{industry}" "{location}"'
         if size: query += f' "{size}"'
         
@@ -124,10 +121,7 @@ class CompanyFinderPipeline:
         return all_results
 
     def stage_2_dedup(self, raw_results: list) -> List[DeduplicatedCompany]:
-        """
-        Phase 2: Entity Deduplication.
-        Uses AI-driven auditing to filter out search aggregators and normalize unique company brand identities.
-        """
+        """Phase 2: Uses AI to deduplicate results and filter aggregators."""
         if not raw_results: return []
         logger.info(f"[PIPELINE] Stage 2: Deduplicating {len(raw_results)} snippets into unique identities...")
         structured_llm = self.llm.with_structured_output(DeduplicationResult)

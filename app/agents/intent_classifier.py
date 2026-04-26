@@ -1,3 +1,4 @@
+# Intent Classification Agent
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
@@ -13,6 +14,7 @@ llm = ChatOpenAI(
     frequency_penalty=0,
     presence_penalty=0,
     seed=42,
+    request_timeout=25
 )
 
 class IntentType(str, enum.Enum):

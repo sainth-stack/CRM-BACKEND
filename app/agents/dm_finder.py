@@ -15,6 +15,7 @@ load_dotenv()
 llm = ChatOpenAI(
     model="gpt-4o-mini", 
     temperature=0,
+    request_timeout=20
 )
 
 class DecisionMakerSchema(BaseModel):
@@ -38,13 +39,8 @@ def clean_linkedin_url(url: str) -> str:
 
 def find_decision_makers(company_name: str, location: str):
     """
-    Stakeholder Identification Protocol.
-    Executes a high-fidelity targeted search for executive leadership within a specific company and geography.
-    Process:
-    1. Targeted Query Strategy: Uses Boolean operators and site-specific fencing.
-    2. Parallel Search Execution: Mobilizes multiple search clusters concurrently.
-    3. 'Default Reject' Auditing: Uses AI to verify current role, seniority, and brand association.
-    4. Provides the Top 3 most senior and verified stakeholders.
+    Identifies the top 3 executives for a given company and location.
+    Uses targeted LinkedIn search followed by an AI-driven 'Default Reject' audit.
     """
     logger.info(f"[DM FINDER] Starting localized stakeholder research for: {company_name} in {location}")
     

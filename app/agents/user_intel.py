@@ -19,6 +19,7 @@ llm = ChatOpenAI(
     frequency_penalty=0,
     presence_penalty=0,
     seed=42,
+    request_timeout=30
 )
 
 USER_INTEL_PROMPT = """You are a Strategic Growth Analyst & Corporate Intelligence Architect.
@@ -93,7 +94,7 @@ def scrape_homepage_lite(url: str):
             # Navigational Mapping Vertical Extraction
             nav_paths = set(re.findall(r'href=["\'](/[a-zA-Z0-9\-_]+)["\']', html))
             important_paths = [p for p in nav_paths if any(k in p.lower() for k in ['course', 'project', 'hackathon', 'price', 'pricing', 'about'])]
-
+            
             body_text = sanitize_html(html)
             
             return {

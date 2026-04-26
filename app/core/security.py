@@ -1,3 +1,4 @@
+import hashlib
 import os
 import jwt
 import socket
@@ -5,6 +6,10 @@ import ipaddress
 import urllib.parse
 from datetime import datetime, timedelta, UTC
 from typing import Optional, Dict, Any
+import socket
+# Defensive Boundary: Force a system-wide socket timeout of 15 seconds.
+# This prevents unshielded external API calls from hanging worker threads indefinitely.
+socket.setdefaulttimeout(15)
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, status, Depends, Request
 from fastapi.security import OAuth2PasswordBearer
@@ -107,6 +112,10 @@ def decrypt_token(encrypted_token: str) -> str:
             detail="Failed to decrypt secure token"
         )
 
+def hash_token(token: str) -> str:
+    """Generates a non-reversible SHA-256 fingerprint for a session token."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
 # Distributed Session Revocation Cache (Redis-backed)
 # Stores revocation timestamps to invalidate JWTs globally across the cluster.
 logger.debug("[SECURITY] Session revocation infrastructure active.")
@@ -202,7 +211,7 @@ def create_refresh_token(data: dict) -> str:
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> models.User:
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> models.User:
     """
     Zero-Trust Identity Resolution.
     Validates JWT integrity, enforces distributed revocation policies, and assembles the localized user identity.

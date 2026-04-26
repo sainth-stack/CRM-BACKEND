@@ -9,8 +9,7 @@ from datetime import UTC
 from sqlalchemy import or_
 from sqlalchemy.orm import joinedload
 
-from app.agents.discovery_agent import extract_schedule_info
-from app.agents.intent_classifier import classify_reply_intent
+from app.services.inbox_service import inbox_service
 from app.core.email_service import email_service
 from app.core.logging_config import logger
 from app.core.security import acquire_lock, release_lock
@@ -21,10 +20,6 @@ from app.integrations.cal import cal_provider
 from app.integrations.gmail import GmailProvider
 from app.integrations.hubspot import hubspot_provider
 from app.workers.config.celery_app import celery_app
-from app.workers.discovery_scheduling import (
-    _process_booking,
-    _request_scheduling_clarification,
-)
 from app.workers.lifecycle import (
     hold_company_siblings,
     reactivate_due_prospects,
@@ -210,22 +205,21 @@ def _find_reply_candidate(db, user_id: str, reply: dict, *, include_terminated: 
 def _match_reply_to_prospect(db, user_id: str, reply: dict):
     return _find_reply_candidate(db, user_id, reply, include_terminated=False)
 
-
 def _match_reply_to_terminated_prospect(db, user_id: str, reply: dict):
     return _find_reply_candidate(db, user_id, reply, include_terminated=True)
 
-
 def poll_inbox_task(user_id: str):
+    """Polls the user's mailbox for new prospect replies and classifies intent."""
     lock_key = f"inbox_sweep:{user_id}"
     if not acquire_lock(lock_key, ttl=300):
-        logger.debug(f"[SENTINEL] Inbox lock active for user {user_id}. Skipping sweep.")
+        logger.debug(f"[SENTINEL] Lock active for user {user_id}. Skipping.")
         return
 
     db = SessionLocal()
     try:
         creds = TokenService.get_google_credentials(db, user_id)
         if not creds:
-            logger.warning(f"[SENTINEL] Aborting: No outreach capability established for user {user_id}.")
+            logger.warning(f"[SENTINEL] No credentials for user {user_id}.")
             return
 
         provider = GmailProvider(creds)
@@ -271,11 +265,7 @@ def poll_inbox_task(user_id: str):
                         token = campaign_id_var.set(dm.campaign_id)
                         try:
                             if dm.state == models.ProspectState.TERMINATED or dm.status == "TERMINATED":
-                                logger.info(
-                                    "[SENTINEL] Defensive skip: terminated prospect %s (%s) is not eligible for reply monitoring.",
-                                    dm.name,
-                                    dm.id,
-                                )
+                                logger.info(f"[SENTINEL] Defensive skip: {dm.name} is terminated.")
                                 should_mark_read = True
                             else:
                                 existing_log = db.query(models.CommunicationLog).filter(
@@ -285,67 +275,8 @@ def poll_inbox_task(user_id: str):
                                 if existing_log:
                                     should_mark_read = True
                                 else:
-                                    reply_received_at = reply.get("received_at") or utcnow_naive()
-                                    dm.last_reply_at = reply_received_at
-                                    dm.reminder_count = 0
-                                    dm.termination_reason = None
-                                    dm.retry_after = None
-
-                                    last_sent = (
-                                        db.query(models.CommunicationLog)
-                                        .filter(
-                                            models.CommunicationLog.dm_id == dm.id,
-                                            models.CommunicationLog.direction == "SENT",
-                                        )
-                                        .order_by(models.CommunicationLog.received_at.desc())
-                                        .first()
-                                    )
-
-                                    classification = classify_reply_intent(
-                                        last_sent.body if last_sent else "",
-                                        reply["body"],
-                                    )
-                                    intent = classification["intent"]
-                                    dm.reply_intent = intent
-                                    dm.intent_last = intent
-
-                                    db.add(
-                                        models.CommunicationLog(
-                                            campaign_id=dm.campaign_id,
-                                            dm_id=dm.id,
-                                            direction="RECEIVED",
-                                            subject=reply["subject"],
-                                            body=reply["body"],
-                                            message_id=reply["message_id"],
-                                            received_at=reply_received_at,
-                                        )
-                                    )
-                                    db.flush()
-
-                                    if dm.state in [
-                                        models.ProspectState.DISCOVERY_CALL,
-                                        models.ProspectState.WAITING_FOR_REPLY,
-                                        models.ProspectState.DISCOVERY_EXPIRED,
-                                    ]:
-                                        today_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d")
-                                        extract = extract_schedule_info(
-                                            reply["body"],
-                                            today_str,
-                                            dm.target_company.location if dm.target_company else "Global",
-                                        )
-                                        if intent == "NEGATIVE":
-                                            _process_intent_transition_v2(db, dm, intent)
-                                        elif extract and extract.get("date") and extract.get("time"):
-                                            _process_booking(db, dm, extract)
-                                        else:
-                                            _request_scheduling_clarification(
-                                                db,
-                                                dm,
-                                                source="missing_date_or_time",
-                                            )
-                                    else:
-                                        _process_intent_transition_v2(db, dm, intent)
-
+                                    # Delegate processing to Inbox Service
+                                    inbox_service.handle_prospect_reply(db, dm, reply)
                                     should_mark_read = True
                         finally:
                             campaign_id_var.reset(token)
@@ -366,105 +297,13 @@ def poll_inbox_task(user_id: str):
     finally:
         db.close()
         release_lock(lock_key)
-def _process_intent_transition_v2(db, dm, intent):
-    from app.workers.tasks.ghostwriter_worker import draft_discovery_worker, draft_followup_worker
-
-    if intent == "POSITIVE":
-        if dm.state == models.ProspectState.MEETING_BOOKED:
-            return
-
-        logger.info(
-            f"[DISCOVERY] Positive intent detected for {dm.name}. Routing into discovery coordination."
-        )
-        dm.termination_reason = None
-        dm.retry_after = None
-
-        if dm.target_company:
-            dm.target_company.status = "DISCOVERY_CALL"
-
-        if dm.state in [
-            models.ProspectState.DISCOVERY_CALL,
-            models.ProspectState.WAITING_FOR_REPLY,
-            models.ProspectState.DISCOVERY_EXPIRED,
-        ]:
-            if dm.target_company:
-                for sibling in hold_company_siblings(db, dm):
-                    logger.debug(f"[DISCOVERY] Re-holding concurrent stakeholder {sibling.name}")
-                    hubspot_provider.update_lead_status(sibling.hubspot_id, "On Hold (Peer Engaged)")
-            transition_prospect(
-                db,
-                dm,
-                state=models.ProspectState.DISCOVERY_CALL,
-                status="DISCOVERY_CALL",
-                reason="POSITIVE_REPLY",
-                actor="sentinel",
-                metadata={"intent": intent, "source_state": dm.state.value if dm.state else None},
-            )
-            dm.next_action_at = None
-            draft_followup_worker(dm.id, db=db, manual_scheduling=True)
-            return
-
-        transition_prospect(
-            db,
-            dm,
-            state=models.ProspectState.DISCOVERY_CALL,
-            status="DISCOVERY_CALL",
-            reason="POSITIVE_REPLY",
-            actor="sentinel",
-            metadata={"intent": intent},
-        )
-        dm.next_action_at = None
-        if dm.target_company:
-            for sibling in hold_company_siblings(db, dm):
-                logger.debug(f"[DISCOVERY] Holding concurrent stakeholder {sibling.name}")
-                hubspot_provider.update_lead_status(sibling.hubspot_id, "On Hold (Peer Engaged)")
-        draft_discovery_worker(dm.id, db=db)
-    elif intent == "NEGATIVE":
-        logger.info(f"[INTENT] Terminating outreach for {dm.name} due to explicit rejection.")
-        for sibling in restore_held_company_siblings(db, dm):
-            hubspot_provider.update_lead_status(sibling.hubspot_id, "Hold Released")
-        terminate_prospect(
-            db,
-            dm,
-            models.ProspectTerminationReason.NEGATIVE_REPLY,
-            retryable=True,
-            actor="sentinel",
-            metadata={"intent": intent},
-        )
-        hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (Negative Reply)")
-    elif intent == "NEUTRAL":
-        if dm.followup_count < 11:
-            logger.info(f"[INTENT] Neutral engagement from {dm.name}. Dispatching to Orchestrator for nudge drafting.")
-            transition_prospect(
-                db,
-                dm,
-                state=models.ProspectState.NEUTRAL,
-                status="NEUTRAL",
-                reason="NEUTRAL_REPLY",
-                actor="sentinel",
-                metadata={"intent": intent},
-            )
-            dm.next_action_at = utcnow_naive()
-            dm.termination_reason = None
-            dm.retry_after = None
-        else:
-            logger.info(f"[INTENT] Exhausted follow-up threshold for {dm.name}. Terminating mission.")
-            for sibling in restore_held_company_siblings(db, dm):
-                hubspot_provider.update_lead_status(sibling.hubspot_id, "Hold Released")
-            terminate_prospect(
-                db,
-                dm,
-                models.ProspectTerminationReason.FOLLOWUP_EXHAUSTED,
-                retryable=True,
-                actor="sentinel",
-                metadata={"intent": intent},
-            )
-            hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (Exhausted Threshold)")
+# --- End of Inbox Polling ---
 
 
 @celery_app.task
 def outreach_orchestrator_worker():
-    logger.info("[ORCHESTRATOR] Initiating lifecycle audit for all active outreach sectors...")
+    """Audits the lifecycle of all active outreach prospects and triggers reminders."""
+    logger.info("[ORCHESTRATOR] Auditing active outreach lifecycle...")
     db = SessionLocal()
     try:
         now = utcnow_naive()

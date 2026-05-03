@@ -9,14 +9,18 @@ def acquire_lease(db: Session, campaign_id: str, worker_id: str) -> bool:
     Acquires a distributed lease for a specific campaign.
     Prevents concurrent execution and sets the initial heartbeat.
     """
-    now = datetime.datetime.now(UTC)
+    now = datetime.datetime.now(UTC).replace(tzinfo=None)
     threshold = now - datetime.timedelta(minutes=10)
     
     campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
     if not campaign:
         return False
         
-    if campaign.locked_by and campaign.last_heartbeat and campaign.last_heartbeat > threshold:
+    last_hb = campaign.last_heartbeat
+    if last_hb and last_hb.tzinfo is not None:
+        last_hb = last_hb.replace(tzinfo=None)
+
+    if campaign.locked_by and last_hb and last_hb > threshold:
         if campaign.locked_by != worker_id:
             logger.warning(f"[LEASE BLOCKED] Campaign {campaign_id} currently locked by {campaign.locked_by}. Worker {worker_id} aborting.")
             return False
@@ -34,7 +38,7 @@ def heartbeat_lease(db: Session, campaign_id: str, worker_id: str):
         db.query(models.Campaign).filter(
             models.Campaign.id == campaign_id,
             models.Campaign.locked_by == worker_id
-        ).update({"last_heartbeat": datetime.datetime.now(UTC)}, synchronize_session=False)
+        ).update({"last_heartbeat": datetime.datetime.now(UTC).replace(tzinfo=None)}, synchronize_session=False)
         db.commit()
     except Exception as e:
         logger.error(f"[HEARTBEAT FAILURE] Failed to pulse for campaign {campaign_id}: {e}")
@@ -47,7 +51,7 @@ def release_lease(db: Session, campaign_id: str, worker_id: str):
         db.query(models.Campaign).filter(
             models.Campaign.id == campaign_id,
             models.Campaign.locked_by == worker_id
-        ).update({"locked_by": None, "last_heartbeat": datetime.datetime.now(UTC)}, synchronize_session=False)
+        ).update({"locked_by": None, "last_heartbeat": datetime.datetime.now(UTC).replace(tzinfo=None)}, synchronize_session=False)
         db.commit()
     except Exception as e:
         logger.error(f"[LEASE RELEASE FAILURE] Failed to release lock for campaign {campaign_id}: {e}")

@@ -14,7 +14,7 @@ llm = ChatOpenAI(
     frequency_penalty=0,
     presence_penalty=0,
     seed=42,
-    request_timeout=25
+    request_timeout=120
 )
 
 class IntentType(str, enum.Enum):

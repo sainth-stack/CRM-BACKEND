@@ -15,7 +15,7 @@ load_dotenv()
 llm = ChatOpenAI(
     model="gpt-4o-mini", 
     temperature=0,
-    request_timeout=20
+    request_timeout=120
 )
 
 class DecisionMakerSchema(BaseModel):

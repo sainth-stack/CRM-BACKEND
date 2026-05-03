@@ -92,4 +92,34 @@ class HubSpotProvider:
         except Exception as e:
             logger.error(f"[HUBSPOT] Status synchronization error: {e}")
 
+    def sync_decision_maker(self, dm_id: str):
+        """
+        Synchronizes a specific decision maker to HubSpot.
+        """
+        if not self.client:
+            return None
+        from app.db.database import SessionLocal
+        from app.db import models
+        db = SessionLocal()
+        try:
+            dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
+            if dm and not dm.hubspot_id:
+                co = db.query(models.TargetCompany).filter(models.TargetCompany.id == dm.target_company_id).first()
+                co_name = co.name if co else "Unknown"
+                hs_id = self.create_lead(
+                    dm={"name": dm.name, "position": dm.position},
+                    company_name=co_name,
+                    email=dm.email
+                )
+                if hs_id:
+                    dm.hubspot_id = hs_id
+                    db.commit()
+                    return hs_id
+        except Exception as e:
+            logger.error(f"[HUBSPOT] Error syncing decision maker {dm_id}: {e}")
+            db.rollback()
+        finally:
+            db.close()
+        return None
+
 hubspot_provider = HubSpotProvider()

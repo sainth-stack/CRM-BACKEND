@@ -100,17 +100,17 @@ if redis_url.startswith("rediss"):
     )
 
 celery_app.conf.beat_schedule = {
-    "poll-inboxes-every-2-minutes": {
+    "poll-inboxes-every-5-minutes": {
         "task": "app.workers.tasks.sentinels_worker.poll_all_users_task",
-        "schedule": 120.0,
+        "schedule": 300.0,
     },
     "check-meetings-every-10-minutes": {
         "task": "app.workers.tasks.sentinels_worker.check_upcoming_meetings_task",
         "schedule": 600.0,
     },
-    "check-inactivity-every-5-minutes": {
+    "check-inactivity-every-10-minutes": {
         "task": "app.workers.tasks.sentinels_worker.check_all_inactivity_task",
-        "schedule": 300.0,
+        "schedule": 600.0,
     },
     "reactivate-terminated-every-6-hours": {
         "task": "app.workers.tasks.sentinels_worker.reactivate_terminated_prospects_task",

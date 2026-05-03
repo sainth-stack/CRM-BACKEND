@@ -19,7 +19,7 @@ llm = ChatOpenAI(
     frequency_penalty=0,
     presence_penalty=0,
     seed=42,
-    request_timeout=30
+    request_timeout=120
 )
 
 USER_INTEL_PROMPT = """You are a Strategic Growth Analyst & Corporate Intelligence Architect.
@@ -80,8 +80,7 @@ def scrape_homepage_lite(url: str):
         response = requests.get(
             safe_url, 
             impersonate="chrome", 
-            timeout=10,
-            resolve={f"{hostname}:{port}": validated_ip}
+            timeout=10
         )
         if response.status_code == 200:
             html = response.text

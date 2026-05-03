@@ -23,7 +23,7 @@ class User(Base):
     otp_expiry = Column(DateTime, nullable=True)
     provider = Column(String, nullable=True) # google, microsoft
     provider_user_id = Column(String, nullable=True)
-    role = Column(SQLEnum(UserRole), default=UserRole.USER, index=True)
+    role = Column(SQLEnum(UserRole, values_callable=lambda obj: [e.value for e in obj]), default=UserRole.USER, index=True)
     user_limit = Column(Integer, default=0) # Total users an admin can create
     created_by_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     

@@ -61,7 +61,7 @@ class CompanyFinderPipeline:
             top_p=1,
             frequency_penalty=0,
             presence_penalty=0,
-            request_timeout=25
+            request_timeout=120
         )
         try:
             from tavily import TavilyClient

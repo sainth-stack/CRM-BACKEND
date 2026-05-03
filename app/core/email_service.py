@@ -38,8 +38,7 @@ class EmailService:
             return self._service_cache[cache_key]
         
         # Build new service with explicit 10s boundary
-        http = httplib2.Http(timeout=10)
-        service = build('gmail', 'v1', credentials=creds, http=http)
+        service = build('gmail', 'v1', credentials=creds)
         self._service_cache[cache_key] = service
         return service
 

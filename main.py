@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 from app.db.database import get_db
 from app.db import models
-from app.api import auth
+from app.api import auth, export
 from app.core.security import get_current_user
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -71,6 +71,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.include_router(auth.router)
 app.include_router(auth.capability_router)
+app.include_router(export.router)
 
 class CampaignCreate(BaseModel):
     name: str
@@ -392,11 +393,11 @@ def get_campaign(
     Retrieves comprehensive metadata, discovered stakeholders, and communication history for a specific campaign.
     """    # N+1 Fix: Single query with all relationships eager-loaded
     db_campaign = db.query(models.Campaign).options(
-        joinedload(models.Campaign.user_intel),
-        joinedload(models.Campaign.target_companies),
-        joinedload(models.Campaign.dms).joinedload(models.DecisionMaker.logs),
-        joinedload(models.Campaign.dms).joinedload(models.DecisionMaker.drafts),
-        joinedload(models.Campaign.dms).joinedload(models.DecisionMaker.transitions),
+        selectinload(models.Campaign.user_intel),
+        selectinload(models.Campaign.target_companies),
+        selectinload(models.Campaign.dms).selectinload(models.DecisionMaker.logs),
+        selectinload(models.Campaign.dms).selectinload(models.DecisionMaker.drafts),
+        selectinload(models.Campaign.dms).selectinload(models.DecisionMaker.transitions),
     ).filter(
         models.Campaign.id == campaign_id,
         get_visibility_filter(db, current_user)

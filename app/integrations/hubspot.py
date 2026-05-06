@@ -3,6 +3,7 @@ from hubspot import HubSpot
 from hubspot.crm.contacts import SimplePublicObjectInputForCreate, SimplePublicObjectInput
 from dotenv import load_dotenv
 from app.core.logging_config import logger
+from app.core.retry_utils import with_retries
 
 load_dotenv()
 
@@ -43,6 +44,7 @@ class HubSpotProvider:
             "NEW": "NEW"
         }
 
+    @with_retries(max_attempts=3, base_delay=2.0)
     def create_lead(self, dm: dict, company_name: str, email: str = None):
         """
         CRM Lead Provisioning.
@@ -73,6 +75,7 @@ class HubSpotProvider:
             logger.error(f"[HUBSPOT] Contact creation critical failure: {e}")
             return None
 
+    @with_retries(max_attempts=3, base_delay=2.0)
     def update_lead_status(self, hubspot_id: str, status: str):
         """
         CRM Lifecycle Management.

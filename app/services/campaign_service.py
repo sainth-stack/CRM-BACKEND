@@ -66,8 +66,8 @@ class CampaignService:
 
         # Idempotency: Identity Anchor Recovery
         existing_fingerprints = {
-            c.identity_key for c in db.query(models.TargetCompany)
-            .filter(models.TargetCompany.campaign_id == campaign_id).all() if c.identity_key
+            key for (key,) in db.query(models.TargetCompany.identity_key)
+            .filter(models.TargetCompany.campaign_id == campaign_id).all() if key
         }
 
         # Resume logic: Start from appropriate search page
@@ -89,6 +89,7 @@ class CampaignService:
         companies_generator = find_target_companies(criteria, offerings, start_page=start_page)
         
         count = 0
+        BATCH_SIZE = 50
         for co in companies_generator:
             count += 1
             fingerprint = self.build_company_identity_key(co)
@@ -113,62 +114,78 @@ class CampaignService:
             ).on_conflict_do_nothing(index_elements=['campaign_id', 'identity_key'])
             
             db.execute(stmt)
-            db.commit()
+            if count % BATCH_SIZE == 0:
+                db.commit()
             if fingerprint: existing_fingerprints.add(fingerprint)
 
+        db.commit()
         return count
 
     def identify_stakeholders(self, db: Session, campaign_id: str, worker_id: str):
         """Orchestrates stakeholder identification and CRM synchronization."""
-        target_cos = db.query(models.TargetCompany).filter(
-            models.TargetCompany.campaign_id == campaign_id,
-            models.TargetCompany.status == "NEW"
-        ).all()
+        target_co_ids = [
+            row[0] for row in db.query(models.TargetCompany.id).filter(
+                models.TargetCompany.campaign_id == campaign_id,
+                models.TargetCompany.status == "NEW"
+            ).all()
+        ]
 
         existing_dm_keys = {
-            (dm.target_company_id, dm.name.lower())
-            for dm in db.query(models.DecisionMaker).filter(models.DecisionMaker.campaign_id == campaign_id).all()
+            (company_id, name.lower())
+            for company_id, name in db.query(
+                models.DecisionMaker.target_company_id,
+                models.DecisionMaker.name
+            ).filter(models.DecisionMaker.campaign_id == campaign_id).all()
+            if name
         }
 
         total_dms = 0
-        for i, co in enumerate(target_cos):
+        BATCH_SIZE = 20
+        for i, co_id in enumerate(target_co_ids):
             if i % 3 == 0: heartbeat_lease(db, campaign_id, worker_id)
             
+            co = db.query(models.TargetCompany).filter(models.TargetCompany.id == co_id).first()
+            if not co: continue
+
             co.status = "RESEARCHING_STAKEHOLDERS"
-            db.commit()
+            db.flush()
 
             try:
-                dms = find_decision_makers(co.name, co.location)
-                for dm_data in dms:
-                    name = dm_data.get("name", "Unknown")
-                    if (co.id, name.lower()) in existing_dm_keys: continue
-                    
-                    score = dm_data.get("similarity_score", 0)
-                    if score < 70: continue
+                with db.begin_nested():
+                    dms = find_decision_makers(co.name, co.location)
+                    for dm_data in dms:
+                        name = dm_data.get("name", "Unknown")
+                        if (co.id, name.lower()) in existing_dm_keys: continue
+                        
+                        score = dm_data.get("similarity_score", 0)
+                        if score < 70: continue
 
-                    email = self.predict_prospect_email(name, co.domain)
-                    new_dm = models.DecisionMaker(
-                        campaign_id=campaign_id,
-                        target_company_id=co.id,
-                        name=name,
-                        position=dm_data.get("position"),
-                        linkedin=dm_data.get("linkedin_url") or dm_data.get("linkedin"),
-                        relevance_score=score,
-                        email=email,
-                        status="NEW",
-                        state=models.ProspectState.NEW
-                    )
-                    db.add(new_dm)
-                    db.flush()
-                    hubspot_provider.sync_decision_maker(new_dm.id)
-                    total_dms += 1
-                
-                co.status = "STAKEHOLDERS_IDENTIFIED"
-                db.commit()
+                        email = self.predict_prospect_email(name, co.domain)
+                        new_dm = models.DecisionMaker(
+                            campaign_id=campaign_id,
+                            target_company_id=co.id,
+                            name=name,
+                            position=dm_data.get("position"),
+                            linkedin=dm_data.get("linkedin_url") or dm_data.get("linkedin"),
+                            relevance_score=score,
+                            email=email,
+                            status="NEW",
+                            state=models.ProspectState.NEW
+                        )
+                        db.add(new_dm)
+                        db.flush()
+                        hubspot_provider.sync_decision_maker(new_dm.id)
+                        total_dms += 1
+                    
+                    co.status = "STAKEHOLDERS_IDENTIFIED"
             except Exception as e:
                 logger.error(f"[CAMPAIGN] DM identification failed for {co.name}: {e}")
-                db.rollback()
+                # Savepoint automatically rolled back, so only this company's DMs are skipped
+            
+            if (i + 1) % BATCH_SIZE == 0:
+                db.commit()
 
+        db.commit()
         return total_dms
 
 campaign_service = CampaignService()

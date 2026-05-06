@@ -73,7 +73,9 @@ celery_app = Celery(
         "app.workers.tasks.discovery_worker",
         "app.workers.tasks.ghostwriter_worker",
         "app.workers.tasks.outbound_worker",
-        "app.workers.tasks.sentinels_worker",
+        "app.workers.tasks.inbox_worker",
+        "app.workers.tasks.orchestrator_worker",
+        "app.workers.tasks.reminders_worker",
         "app.workers.tasks.sweeper_worker",
     ],
     task_cls=CampaignBaseTask
@@ -101,19 +103,19 @@ if redis_url.startswith("rediss"):
 
 celery_app.conf.beat_schedule = {
     "poll-inboxes-every-5-minutes": {
-        "task": "app.workers.tasks.sentinels_worker.poll_all_users_task",
+        "task": "app.workers.tasks.inbox_worker.poll_all_users_task",
         "schedule": 300.0,
     },
     "check-meetings-every-10-minutes": {
-        "task": "app.workers.tasks.sentinels_worker.check_upcoming_meetings_task",
+        "task": "app.workers.tasks.reminders_worker.check_upcoming_meetings_task",
         "schedule": 600.0,
     },
     "check-inactivity-every-10-minutes": {
-        "task": "app.workers.tasks.sentinels_worker.check_all_inactivity_task",
+        "task": "app.workers.tasks.orchestrator_worker.check_all_inactivity_task",
         "schedule": 600.0,
     },
     "reactivate-terminated-every-6-hours": {
-        "task": "app.workers.tasks.sentinels_worker.reactivate_terminated_prospects_task",
+        "task": "app.workers.tasks.orchestrator_worker.reactivate_terminated_prospects_task",
         "schedule": 21600.0,
     },
     "sweep-stuck-campaigns-every-10-minutes": {

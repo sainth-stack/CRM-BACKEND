@@ -7,6 +7,8 @@ from googleapiclient.discovery import build
 import httplib2
 from typing import Any
 from app.core.logging_config import logger
+from app.core.retry_utils import with_retries
+from googleapiclient.errors import HttpError
 
 class EmailService:
     """
@@ -42,6 +44,7 @@ class EmailService:
         self._service_cache[cache_key] = service
         return service
 
+    @with_retries(max_attempts=3, base_delay=3.0, exceptions=(HttpError, httplib2.ServerNotFoundError, ConnectionError))
     def _send_via_gmail(self, to_email: str, subject: str, body: str, creds: Credentials, thread_id: str = None) -> dict:
         """Official Google API Bridge for high-fidelity outreach and threading with a 10s timeout guard."""
         service = self._get_service(creds)

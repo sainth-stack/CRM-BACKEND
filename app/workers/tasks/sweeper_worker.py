@@ -4,6 +4,7 @@ from app.core.logging_config import logger
 from app.workers.config.celery_app import celery_app
 import datetime
 from datetime import UTC
+from app.core.config import settings
 
 
 @celery_app.task
@@ -17,7 +18,7 @@ def sweep_stuck_campaigns_task():
     try:
         # Recovery Gate: Only resurrect operations that have lost their heartbeat lease.
         # Threshold: 10 minutes of silence indicates a crashed worker.
-        threshold = datetime.datetime.now(UTC) - datetime.timedelta(minutes=10)
+        threshold = datetime.datetime.now(UTC) - datetime.timedelta(minutes=settings.SWEEP_STUCK_MINUTES)
         
         stuck_campaigns = db.query(models.Campaign).filter(
             models.Campaign.status.in_([

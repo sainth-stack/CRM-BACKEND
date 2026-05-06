@@ -70,15 +70,19 @@ def draft_emails_worker(self, campaign_id: str):
             "deep_research": user_intel_raw.deep_research
         }
 
-        dms = db.query(models.DecisionMaker).filter(models.DecisionMaker.campaign_id == campaign_id).all()
-        logger.info(f"[GHOSTWRITER] Generating personalized content for {len(dms)} validated stakeholders.")
+        dm_ids = [row[0] for row in db.query(models.DecisionMaker.id).filter(models.DecisionMaker.campaign_id == campaign_id).all()]
+        logger.info(f"[GHOSTWRITER] Generating personalized content for {len(dm_ids)} validated stakeholders.")
 
         processed_count = 0
-        for dm in dms:
+        BATCH_SIZE = 10
+        for dm_id in dm_ids:
             processed_count += 1
             # Heartbeat Pulse
             if processed_count % 5 == 0:
                 heartbeat_lease(db, campaign_id, worker_id)
+
+            dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
+            if not dm: continue
 
             # Skip if already drafted
             if db.query(models.EmailDraft).filter(models.EmailDraft.decision_maker_id == dm.id).first():
@@ -97,40 +101,42 @@ def draft_emails_worker(self, campaign_id: str):
                 if draft_data:
                     from sqlalchemy.exc import IntegrityError
                     try:
-                        new_draft = models.EmailDraft(
-                            campaign_id=campaign_id,
-                            decision_maker_id=dm.id,
-                            subject=draft_data.get("subject"),
-                            body=draft_data.get("body"),
-                            status="DRAFTED",
-                            followup_index=0,
-                            draft_type="INITIAL"
-                        )
-                        db.add(new_draft)
-                        transition_prospect(
-                            db,
-                            dm,
-                            state=models.ProspectState.DRAFTED,
-                            status="DRAFTED",
-                            reason="INITIAL_DRAFTED",
-                            actor="ghostwriter",
-                            metadata={"draft_type": "INITIAL"},
-                        )
-                        db.commit()
+                        with db.begin_nested():
+                            new_draft = models.EmailDraft(
+                                campaign_id=campaign_id,
+                                decision_maker_id=dm.id,
+                                subject=draft_data.get("subject"),
+                                body=draft_data.get("body"),
+                                status="DRAFTED",
+                                followup_index=0,
+                                draft_type="INITIAL"
+                            )
+                            db.add(new_draft)
+                            transition_prospect(
+                                db,
+                                dm,
+                                state=models.ProspectState.DRAFTED,
+                                status="DRAFTED",
+                                reason="INITIAL_DRAFTED",
+                                actor="ghostwriter",
+                                metadata={"draft_type": "INITIAL"},
+                            )
+                            db.flush()
                     except IntegrityError:
-                        db.rollback()
                         logger.info(f"[IDEMPOTENCY] Benign Collision: Initial draft for DM {dm.id} already exists.")
                         continue
                 else:
                     logger.warning(f"[GHOSTWRITER] Null Draft for {dm.name}")
             except Exception as draft_e:
                 logger.error(f"Drafting Failure for {dm.name}: {draft_e}")
-                db.rollback()
+                continue
+                
+            if processed_count % BATCH_SIZE == 0:
+                db.commit()
 
         # Honest Outcome Audit: High-Fidelity Classification
-        final_dms = db.query(models.DecisionMaker).filter(models.DecisionMaker.campaign_id == campaign_id).all()
-        drafted_count = db.query(models.EmailDraft).filter(models.EmailDraft.campaign_id == campaign_id).count()
-        expected_count = len(final_dms)
+        expected_count = db.query(models.DecisionMaker.id).filter(models.DecisionMaker.campaign_id == campaign_id).count()
+        drafted_count = db.query(models.EmailDraft.id).filter(models.EmailDraft.campaign_id == campaign_id).count()
 
         if expected_count == 0:
             campaign.status = models.CampaignStatus.PARTIAL_SUCCESS

@@ -26,14 +26,13 @@ from app.workers.tasks.ghostwriter_worker import (
 from app.workers.tasks.outbound_worker import send_draft_worker
 
 # --- Sentinels (APScheduler cron hooks) ---
-from app.workers.tasks.sentinels_worker import (
-    poll_inbox_task,
-    poll_all_users_task,
-    check_upcoming_meetings_task,
+from app.workers.tasks.inbox_worker import poll_inbox_task, poll_all_users_task
+from app.workers.tasks.orchestrator_worker import (
+    outreach_orchestrator_worker,
     check_all_inactivity_task,
     reactivate_terminated_prospects_task,
-    outreach_orchestrator_worker,
 )
+from app.workers.tasks.reminders_worker import check_upcoming_meetings_task
 
 # --- Sweeper (Startup resurrection) ---
 from app.workers.tasks.sweeper_worker import sweep_stuck_campaigns_task

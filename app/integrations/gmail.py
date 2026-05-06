@@ -11,6 +11,7 @@ from app.core.circuit_breaker import (
     record_circuit_success,
 )
 from app.core.logging_config import logger
+from app.core.retry_utils import with_retries
 
 GMAIL_SCAN_CIRCUIT = CircuitBreakerConfig(
     name="gmail:scan",
@@ -139,6 +140,7 @@ class GmailProvider:
     def get_latest_replies(self, unread_only: bool = True):
         return self.scan_latest_replies(unread_only=unread_only).get("replies", [])
 
+    @with_retries(max_attempts=3, base_delay=2.0)
     def mark_as_read(self, message_id):
         """
         Communication Protocol: Inbox Housekeeping.

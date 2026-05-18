@@ -29,3 +29,5 @@ bcrypt
 celery
 redis
 slowapi
+pandas
+openpyxl

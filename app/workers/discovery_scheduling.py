@@ -135,7 +135,10 @@ def _process_booking(db, dm, extract):
         _request_scheduling_clarification(db, dm, source="date_time_parse_recheck")
         return
 
+    user = dm.campaign.owner
     booking = cal_provider.book_meeting(
+        db=db,
+        user=user,
         email=dm.email,
         name=dm.name,
         start_time=ist_iso,

@@ -41,3 +41,11 @@ Thumbs.db
 
 # Local tests
 tests/
+test_*.py
+test_stage1_input_validation_contract.py
+
+# Project-specific ignores
+uploads/
+scripts/
+celerybeat-schedule*
+upgrade_user_intel_schema.py

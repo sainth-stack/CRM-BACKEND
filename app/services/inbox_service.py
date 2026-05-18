@@ -1,8 +1,7 @@
 from sqlalchemy.orm import Session
 from app.db import models
 from app.core.logging_config import logger
-from app.agents.intent_classifier import classify_reply_intent
-from app.agents.discovery_agent import extract_schedule_info
+from app.agents.intent_classifier import classify_reply_intent, extract_schedule_info
 from app.workers.lifecycle import utcnow_naive
 from app.workers.discovery_scheduling import _process_booking, _request_scheduling_clarification
 from app.services.outreach_service import outreach_service

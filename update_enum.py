@@ -1,43 +1,51 @@
 from app.db.database import SessionLocal
 from sqlalchemy import text
+import logging
 
-db = SessionLocal()
-try:
-    # Let's add all the missing values to the campaignstatus enum in the DB
-    db.execute(text("ALTER TYPE campaignstatus ADD VALUE IF NOT EXISTS 'PARTIAL_SUCCESS'"))
-    print("Added PARTIAL_SUCCESS to campaignstatus")
-except Exception as e:
-    print(f"Error adding PARTIAL_SUCCESS: {e}")
-    db.rollback()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("DB-Enum-Update")
 
-try:
-    db.execute(text("ALTER TYPE campaignstatus ADD VALUE IF NOT EXISTS 'INTERVENTION_NEEDED'"))
-    print("Added INTERVENTION_NEEDED to campaignstatus")
-except Exception as e:
-    print(f"Error adding INTERVENTION_NEEDED: {e}")
-    db.rollback()
+def update_enums():
+    db = SessionLocal()
+    new_statuses = [
+        'STAGE_1_CSV_TRIMMED',
+        'STAGE_2_USER_INTEL_COMPLETE',
+        'STAGE_3_ICP_FILTERED',
+        'STAGE_4_RESEARCH_COMPLETE',
+        'STAGE_5_STAKEHOLDERS_RANKED',
+        'STAGE_6_DRAFTING_COMPLETE',
+        'PARTIAL_SUCCESS',
+        'INTERVENTION_NEEDED',
+        'FAILED',
+        'INACTIVE'
+    ]
+    
+    logger.info("🚀 Mobilizing Database Enum Synchronization...")
+    
+    for status in new_statuses:
+        try:
+            # Postgres specific: ADD VALUE IF NOT EXISTS
+            db.execute(text(f"ALTER TYPE campaignstatus ADD VALUE IF NOT EXISTS '{status}'"))
+            db.commit()
+            logger.info(f"✅ Synced status: {status}")
+        except Exception as e:
+            db.rollback()
+            if "already exists" in str(e).lower():
+                logger.info(f"ℹ️ Status already exists: {status}")
+            else:
+                logger.warning(f"⚠️ Could not sync {status}: {e}")
 
-try:
-    db.execute(text("ALTER TYPE campaignstatus ADD VALUE IF NOT EXISTS 'FAILED'"))
-    print("Added FAILED to campaignstatus")
-except Exception as e:
-    print(f"Error adding FAILED: {e}")
-    db.rollback()
+    # Also update ProspectState for safety
+    prospect_states = ['POSITIVE', 'NEGATIVE', 'NEUTRAL', 'DISCOVERY_CALL', 'MEETING_BOOKED']
+    for state in prospect_states:
+        try:
+            db.execute(text(f"ALTER TYPE prospectstate ADD VALUE IF NOT EXISTS '{state}'"))
+            db.commit()
+        except Exception:
+            db.rollback()
 
-try:
-    db.execute(text("ALTER TYPE campaignstatus ADD VALUE IF NOT EXISTS 'INACTIVE'"))
-    print("Added INACTIVE to campaignstatus")
-except Exception as e:
-    print(f"Error adding INACTIVE: {e}")
-    db.rollback()
+    db.close()
+    logger.info("🏁 Database Enums are now synchronized with V2 State-Machine.")
 
-try:
-    # Also check if any other enums need new values
-    db.execute(text("ALTER TYPE prospectstate ADD VALUE IF NOT EXISTS 'POSITIVE'"))
-    print("Added POSITIVE to prospectstate")
-except Exception as e:
-    print(f"Error adding POSITIVE: {e}")
-    db.rollback()
-
-db.commit()
-db.close()
+if __name__ == "__main__":
+    update_enums()

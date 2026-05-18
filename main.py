@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, Query, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, joinedload, selectinload
 from app.db.database import get_db
@@ -23,8 +23,13 @@ from app.services.draft_dispatch import (
     queue_draft_dispatch,
 )
 from app.workers.tasks.outbound_worker import send_draft_worker
+from app.workers.tasks.intel_worker import process_csv_worker, research_user_company_worker, validate_input_worker
+from app.core.sanitizer import sanitize_text
+from app.services.input_validation_service import input_validation_service
+from app.services.csv_service import CSVProcessingService
 import gc
 import os
+import shutil
 
 # Initialize Enterprise Logging
 logger = setup_logging()
@@ -79,7 +84,6 @@ class CampaignCreate(BaseModel):
     target_industry: str
     target_location: str
     target_employee_count: str | None = None
-    query: str = "" # Keeping as optional for legacy if needed, but industry/location are primary now
     class Config:
         from_attributes = True
 
@@ -93,6 +97,12 @@ class CampaignResponse(BaseModel):
 
 class BatchDeleteRequest(BaseModel):
     campaign_ids: list[str]
+
+class CampaignUpdate(BaseModel):
+    prompt: str | None = None
+    target_industry: str | None = None
+    target_location: str | None = None
+    name: str | None = None
 
 def get_visibility_filter(db: Session, current_user: models.User):
     """Enforces the Zero-Trust multi-tenant data isolation boundary."""
@@ -177,50 +187,134 @@ def dependency_health_check(
 
 from app.core.sanitizer import sanitize_text
 
-@app.post("/campaigns", response_model=CampaignResponse)
+@app.post("/campaigns")
 @limiter.limit("5/minute")
 def create_campaign(
     request: Request,
-    campaign: CampaignCreate, 
-    background_tasks: BackgroundTasks, 
+    name: str = Form(...),
+    user_url: str = Form(...),
+    target_industry: str = Form(...),
+    target_location: str = Form(...),
+    target_employee_count: str = Form(None),
+    prompt: str = Form(None),
+    file: UploadFile = File(None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+
     """
-    Campaign Mobilization Protocol.
-    Initializes a new outreach campaign, validates target parameters, and triggers the autonomous research cluster.
+    Stage 1 Input Validation Protocol.
+    Initializes a campaign shell only after validating and reviewing user-provided setup inputs.
     Input parameters are normalized via the Sanitization Engine to mitigate injection risks.
     """
-    # Hierarchy boundary: Only localized operators can initialize executions
-    if str(current_user.role).lower().split('.')[-1] != "user":
-        raise HTTPException(status_code=403, detail="Only Localized Users can mobilize new campaigns.")
+    # Hierarchy boundary: Only localized user identities can initialize campaign setup.
+    user_role_str = str(current_user.role).lower().split('.')[-1]
+    if user_role_str != "user":
+        raise HTTPException(status_code=403, detail="Access Denied: Campaign setup is restricted to user identities.")
 
     # 0. High-Fidelity Input Sanitization
-    sanitized_name = sanitize_text(campaign.name, max_length=100)
-    sanitized_industry = sanitize_text(campaign.target_industry, max_length=200)
-    sanitized_location = sanitize_text(campaign.target_location, max_length=200)
-    sanitized_emp_count = sanitize_text(campaign.target_employee_count, max_length=50) if campaign.target_employee_count else None
+    sanitized_name = sanitize_text(name, max_length=100)
+    sanitized_industry = sanitize_text(target_industry, max_length=200)
+    sanitized_location = sanitize_text(target_location, max_length=200)
+    sanitized_emp_count = sanitize_text(target_employee_count, max_length=50) if target_employee_count else None
+    sanitized_prompt = sanitize_text(prompt, max_length=2000) if prompt else None
     
-    # Tactical Limit Enforcement for Demo Identities (Permanent Lock)
-    if current_user.is_demo:
-        # We use a persistent sentinel to ensure deletion doesn't reset the quota
-        if current_user.has_used_trial_quota:
-            raise HTTPException(
-                status_code=403, 
-                detail="Trial identity quota exceeded. You have already utilized your 1-campaign entitlement. Please upgrade to professional access for unlimited mobilization."
-            )
+    # 0.1 Mandatory SSoT Verification
+    if not sanitized_name:
+        raise HTTPException(status_code=400, detail="Campaign name is required.")
+    if not file:
+        raise HTTPException(status_code=400, detail="SSoT Violation: A Lead CSV file is strictly mandatory for campaign mobilization.")
+    if not user_url:
+        raise HTTPException(status_code=400, detail="Context Violation: A User Company URL is strictly mandatory for Brand Intelligence.")
+    if not sanitized_industry:
+        raise HTTPException(status_code=400, detail="Target industry is required.")
+    if not sanitized_location:
+        raise HTTPException(status_code=400, detail="Target location is required.")
+    if len(sanitized_industry) < 2:
+        raise HTTPException(status_code=400, detail="Target industry must be at least 2 characters.")
+    if len(sanitized_location) < 2:
+        raise HTTPException(status_code=400, detail="Target location must be at least 2 characters.")
+
+    if not file.filename.lower().endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Tactical Restriction: Only CSV files are authorized for lead injection.")
+
+    # 0.2 URL Normalization + SSRF Protection
+    raw_url = user_url.strip()
+    if not raw_url.startswith(("http://", "https://")):
+        raw_url = f"https://{raw_url}"
+    safe_url, _validated_ip = validate_url_for_ssrf(raw_url)
+
+    # 0.3 Strict LLM Input Review
+    input_review = input_validation_service.review_inputs(
+        target_industry=sanitized_industry,
+        target_location=sanitized_location,
+        prompt=sanitized_prompt,
+    )
+    if input_review.overall.status == "needs_clarification" or input_review.overall.requires_user_clarification:
+        return {
+            "stage": "input_validation",
+            "status": "needs_clarification",
+            "clarification_questions": input_review.overall.clarification_questions,
+            "fields_requiring_clarification": [
+                field_name
+                for field_name, field_review in [
+                    ("target_industry", input_review.target_industry),
+                    ("target_location", input_review.target_location),
+                    ("prompt", input_review.prompt),
+                ]
+                if field_review.clarification_needed
+            ],
+            "ready_for_next_stage": False,
+        }
+
+    reviewed_industry = sanitize_text(input_review.target_industry.corrected, max_length=200) or sanitized_industry
+    reviewed_location = sanitize_text(input_review.target_location.corrected, max_length=200) or sanitized_location
+    reviewed_prompt = sanitize_text(input_review.prompt.enhanced, max_length=2000) if input_review.prompt.enhanced else None
 
     # 1. Create campaign in DB tied to user
     campaign_id = str(uuid.uuid4())
+    
+    # 2. In-Memory Artifact Ingestion: Trimming to 100-row SSoT Batch
+    MAX_FILE_SIZE = 200 * 1024 * 1024 # 200MB Limit
+    
+    try:
+        # Check size before reading
+        file.file.seek(0, 2)
+        file_size = file.file.tell()
+        file.file.seek(0)
+        
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(status_code=413, detail="Artifact Oversized: Lead CSV must be under 200MB.")
+
+        content = file.file.read()
+        
+        # 2. Surgical Protocol: Enforce 100-row high-fidelity limit and filter columns
+        csv_svc = CSVProcessingService()
+        trimmed_content = csv_svc.trim_csv_from_bytes(content, max_rows=100)
+        
+        # 2.1 Persist Trimmed File to Disk (Replace Raw Concept)
+        os.makedirs("uploads", exist_ok=True)
+        trimmed_file_path = f"uploads/trimmed_{campaign_id}.csv"
+        with open(trimmed_file_path, "w", encoding="utf-8") as f:
+            f.write(trimmed_content)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ingestion Failure: Could not process CSV for campaign {campaign_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal Ingestion Failure: Mission artifact could not be secured.")
+
     new_campaign = models.Campaign(
         id=campaign_id,
         user_id=current_user.id,
         name=sanitized_name,
-        user_query=sanitize_text(campaign.query, max_length=500),
-        target_industry=sanitized_industry,
-        target_location=sanitized_location,
+        prompt=reviewed_prompt,
+        input_validation_review=input_review.model_dump(),
+        target_industry=reviewed_industry,
+        target_location=reviewed_location,
         target_employee_count=sanitized_emp_count,
-        status=models.CampaignStatus.RESEARCHING_USER_COMPANY
+        trimmed_csv_data=trimmed_content, # DB SSoT
+        csv_file_url=trimmed_file_path,   # Physical SSoT
+        status=models.CampaignStatus.INPUT_VALIDATED
     )
     db.add(new_campaign)
     
@@ -239,30 +333,34 @@ def create_campaign(
                 detail="Deployment Lock: Your 1-campaign entitlement has been strictly enforced. Simultaneous operation intercepted."
             )
     
-    # Apply SSRF protection on user-submitted URL
-    raw_url = campaign.user_url.strip()
-    if not raw_url.startswith(("http://", "https://")):
-        raw_url = f"https://{raw_url}"
-    validated_url, _ = validate_url_for_ssrf(raw_url)
-
-    # 2. Instantly persist Mission Origin
-    intel = models.UserCompanyIntel(
+    intel_id = str(uuid.uuid4())
+    new_intel = models.UserCompanyIntel(
+        id=intel_id,
         campaign_id=campaign_id,
-        website=validated_url,
-        company_name="Synchronizing Identity..."
+        company_name=sanitized_name,
+        website=safe_url,
+        motto="",
+        offerings="",
+        deep_research=""
     )
-    db.add(intel)
+    db.add(new_intel)
     db.commit()
-    db.refresh(new_campaign)
-    
-    # 3. Trigger Stage 1 via Distributed Celery Message Queue
-    from app.workers import research_user_company_worker
-    research_user_company_worker.delay(campaign_id)
-    
-    return new_campaign
+
+    # 3. Mobilize Gated Background Pipeline (Track A & B)
+    # Track C (User Intel) will be triggered by the State Machine once Track A (Validation) succeeds.
+    process_csv_worker.delay(campaign_id)
+    validate_input_worker.delay(campaign_id)
+
+    return {
+        "id": campaign_id,
+        "name": new_campaign.name,
+        "status": new_campaign.status,
+        "created_at": new_campaign.created_at,
+        "message": "Campaign inputs validated and saved successfully."
+    }
 
 @app.get("/campaigns")
-def list_campaigns(
+def get_campaigns(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
     page: int = Query(1, ge=1, description="Page number"),
@@ -287,7 +385,6 @@ def list_campaigns(
             "name": campaign.name,
             "status": campaign.status,
             "created_at": campaign.created_at,
-            "query": campaign.user_query,
             "target_industry": campaign.target_industry,
             "target_location": campaign.target_location,
         })
@@ -522,8 +619,8 @@ def get_campaign(
         "id": db_campaign.id,
         "name": db_campaign.name,
         "status": db_campaign.status,
+        "prompt": db_campaign.prompt,
         "created_at": db_campaign.created_at,
-        "query": db_campaign.user_query,
         "target_industry": db_campaign.target_industry,
         "target_location": db_campaign.target_location,
         "user_intel": {k: v for k, v in db_campaign.user_intel.__dict__.items() if k != "_sa_instance_state"} if db_campaign.user_intel else None,
@@ -578,6 +675,46 @@ def update_draft(
         
     db.commit()
     return {"message": "Email Draft updated successfully"}
+
+@app.patch("/campaigns/{campaign_id}")
+def update_campaign(
+    campaign_id: str,
+    update: CampaignUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Sovereign Asset Refinement.
+    Allows for human-in-the-loop updates to mission briefing and tactical parameters.
+    """
+    db_campaign = db.query(models.Campaign).filter(
+        models.Campaign.id == campaign_id,
+        get_visibility_filter(db, current_user)
+    ).first()
+    if not db_campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found or access denied")
+    
+    if update.name:
+        db_campaign.name = sanitize_text(update.name, max_length=100)
+    if update.prompt:
+        db_campaign.prompt = sanitize_text(update.prompt, max_length=2000)
+        # Reset validation state if prompt changed
+        db_campaign.input_validation_review = None
+        if db_campaign.status == "INTERVENTION_NEEDED":
+             db_campaign.status = models.CampaignStatus.INPUT_VALIDATED
+        
+    if update.target_industry:
+        db_campaign.target_industry = sanitize_text(update.target_industry, max_length=200)
+    if update.target_location:
+        db_campaign.target_location = sanitize_text(update.target_location, max_length=200)
+
+    db.commit()
+    
+    # Re-trigger validation if prompt was updated
+    if update.prompt:
+        validate_input_worker.delay(campaign_id)
+        
+    return {"message": "Campaign updated successfully"}
 
 @app.post("/drafts/{draft_id}/approve")
 def approve_draft(

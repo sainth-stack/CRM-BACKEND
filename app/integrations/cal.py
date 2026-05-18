@@ -15,34 +15,92 @@ CAL_TIMEZONE = os.getenv("CAL_TIMEZONE", "UTC")
 
 class CalProvider:
     """
-    Scheduling integration with Cal.com.
-    Keeps the existing workflow intact while making availability resolution deterministic.
+    Scheduling integration with Cal.com API v2.
+    Supports multi-user OAuth token resolution and dynamic calendar booking.
     """
 
     def __init__(self):
-        self.base_url = "https://api.cal.com/v1"
-        self.api_key = CAL_API_KEY
-        self.event_type_id = CAL_EVENT_TYPE_ID
-        self.timezone = CAL_TIMEZONE
+        self.base_url = "https://api.cal.com/v2"
 
-    def get_first_available_slot(self, days_ahead: int = 3):
-        if not self.api_key:
+    def get_valid_access_token(self, db, user) -> str | None:
+        """
+        Retrieves a valid, decrypted Cal.com access token for the user,
+        automatically refreshing it synchronously if it has expired.
+        """
+        if not user or not user.cal_refresh_token:
+            logger.warning(f"[CAL] User has no connected Cal.com account.")
             return None
+
+        from app.core.security import decrypt_token, encrypt_token
+        from app.core.auth import CalAuthService
+
+        # Check if token is expired or expires in the next 120 seconds
+        now = datetime.now()
+        is_expired = (
+            user.cal_token_expires_at is None or 
+            user.cal_token_expires_at <= now + timedelta(seconds=120)
+        )
+
+        if is_expired:
+            logger.info(f"[CAL] Access token for user {user.email} is expired. Refreshing...")
+            try:
+                decrypted_refresh = decrypt_token(user.cal_refresh_token)
+                tokens = CalAuthService.refresh_access_token(decrypted_refresh)
+                
+                user.cal_access_token = encrypt_token(tokens["access_token"])
+                user.cal_refresh_token = encrypt_token(tokens["refresh_token"])
+                
+                if tokens.get("expires_at"):
+                    import dateutil.parser
+                    user.cal_token_expires_at = dateutil.parser.parse(tokens["expires_at"]).replace(tzinfo=None)
+                else:
+                    user.cal_token_expires_at = datetime.now() + timedelta(seconds=1800)
+                    
+                db.commit()
+                logger.info(f"[CAL] Access token successfully refreshed for user {user.email}")
+            except Exception as e:
+                logger.error(f"[CAL] Failed to refresh access token for user {user.email}: {e}")
+                return None
+
+        try:
+            return decrypt_token(user.cal_access_token)
+        except Exception as e:
+            logger.error(f"[CAL] Failed to decrypt access token for user {user.email}: {e}")
+            return None
+
+    def get_first_available_slot(self, db, user, days_ahead: int = 3):
+        token = self.get_valid_access_token(db, user)
+        if not token:
+            logger.warning("[CAL] Cannot fetch availability slots: missing or invalid user token.")
+            return None
+
+        event_type_id = user.cal_event_type_id
+        if not event_type_id:
+            logger.warning(f"[CAL] User {user.email} has no configured cal_event_type_id.")
+            return None
+
+        timezone_str = user.cal_timezone or "UTC"
 
         start_time = (
             datetime.now(timezone.utc) + timedelta(days=1)
         ).replace(hour=9, minute=0, second=0, microsecond=0)
         end_time = start_time + timedelta(days=days_ahead)
 
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "cal-api-version": "2024-09-04",
+            "Content-Type": "application/json"
+        }
+
         try:
             response = requests.get(
                 f"{self.base_url}/slots",
+                headers=headers,
                 params={
-                    "apiKey": self.api_key,
-                    "eventTypeId": self.event_type_id,
-                    "startTime": start_time.isoformat(),
-                    "endTime": end_time.isoformat(),
-                    "timeZone": self.timezone,
+                    "eventTypeId": event_type_id,
+                    "start": start_time.strftime("%Y-%m-%d"),
+                    "end": end_time.strftime("%Y-%m-%d"),
+                    "timeZone": timezone_str,
                 },
                 timeout=10,
             )
@@ -54,47 +112,63 @@ class CalProvider:
 
     def book_meeting(
         self,
+        db,
+        user,
         email: str,
         name: str,
         start_time: str | None = None,
         booking_timezone: str | None = None,
     ):
-        if not self.api_key:
-            logger.error("[CAL] Missing CAL_API_KEY.")
+        token = self.get_valid_access_token(db, user)
+        if not token:
+            logger.error("[CAL] Cannot book meeting: missing or invalid user token.")
             return None
 
-        slot_start = start_time or self.get_first_available_slot()
+        event_type_id = user.cal_event_type_id
+        if not event_type_id:
+            logger.warning(f"[CAL] User {user.email} has no configured cal_event_type_id.")
+            return None
+
+        timezone_str = user.cal_timezone or "UTC"
+
+        slot_start = start_time or self.get_first_available_slot(db, user)
         if not slot_start:
             logger.warning("[CAL] No valid slot available for booking.")
             return None
 
-        target_timezone = booking_timezone or self.timezone
+        target_timezone = booking_timezone or timezone_str
         try:
             start_dt = self._coerce_datetime(slot_start, target_timezone)
-            end_dt = start_dt + timedelta(minutes=30)
         except ValueError as exc:
             logger.error(f"[CAL] Invalid booking start time '{slot_start}': {exc}")
             return None
 
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "cal-api-version": "2024-08-13",
+            "Content-Type": "application/json"
+        }
+
         payload = {
-            "eventTypeId": self.event_type_id,
+            "eventTypeId": event_type_id,
             "start": start_dt.isoformat(timespec="milliseconds"),
-            "end": end_dt.isoformat(timespec="milliseconds"),
-            "responses": {
+            "attendee": {
                 "name": name,
                 "email": email,
-                "location": "integrations:daily",
+                "timeZone": target_timezone,
+                "language": "en"
             },
-            "timeZone": target_timezone,
-            "language": "en",
+            "location": {
+                "type": "integration",
+                "integration": "cal-video"
+            },
             "metadata": {},
         }
 
         try:
             response = requests.post(
                 f"{self.base_url}/bookings",
-                params={"apiKey": self.api_key},
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 json=payload,
                 timeout=15,
             )
@@ -102,7 +176,7 @@ class CalProvider:
             body = response.json()
             data = body.get("data", body) if isinstance(body, dict) else {}
             uid = data.get("uid")
-            meeting_url = data.get("videoCallUrl") or data.get("bookingUrl") or data.get("location") or (
+            meeting_url = data.get("meetingUrl") or data.get("videoCallUrl") or data.get("bookingUrl") or data.get("location") or (
                 f"https://cal.com/booking/{uid}" if uid else None
             )
             logger.info(f"[CAL] Booking success for {email} at {payload['start']}")
@@ -140,12 +214,18 @@ class CalProvider:
         if isinstance(data, dict):
             if isinstance(data.get("slots"), dict):
                 slot_maps.append(data["slots"])
-            elif any(isinstance(value, list) for value in data.values()):
+            else:
+                # API v2 shape: data is the dict with date keys
                 slot_maps.append(data)
 
         for slot_map in slot_maps:
             for day in sorted(slot_map.keys()):
+                # Filter out metadata keys like 'status' or 'success' if present at top level in API v2
+                if day in ("status", "success"):
+                    continue
                 entries = slot_map.get(day) or []
+                if not isinstance(entries, list):
+                    continue
                 for entry in entries:
                     slot = self._extract_slot_value(entry)
                     if slot:

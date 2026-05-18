@@ -43,7 +43,7 @@ def export_mission_briefing(
 ## Campaign Parameters
 - **Target Location:** {db_campaign.target_location or 'N/A'}
 - **Target Industry:** {db_campaign.target_industry or 'N/A'}
-- **Mission Objective/Query:** {db_campaign.user_query or 'N/A'}
+- **Mission Context:** {db_campaign.prompt or 'N/A'}
 
 ## Discovered User Intel
 - **Intel Company Name:** {intel.company_name if intel else 'N/A'}
@@ -239,11 +239,10 @@ def export_analysis(
     sent_dms = len([dm for dm in dms if dm.status and ("SENT" in dm.status or "BOOKED" in dm.status)])
     positive_replies = len([dm for dm in dms if dm.reply_intent == "POSITIVE"])
 
-    has_intents = drafted_dms + sent_dms + positive_replies > 0
-    final_pos = positive_replies if has_intents else max(1, int(len(dms) * 0.15))
-    final_neu = drafted_dms if has_intents else max(1, int(len(dms) * 0.55))
-    final_neg = max(0, len(dms) - final_pos - final_neu)
-    sum_for_intent = (final_pos + final_neu + final_neg) or 1
+    final_pos = positive_replies
+    final_neu = drafted_dms + (len(dms) - drafted_dms - sent_dms - positive_replies)
+    final_neg = sent_dms - positive_replies # Simplified logic for report
+    sum_for_intent = len(dms) or 1
     
     content = f"""# CAMPAIGN INTELLIGENCE & ANALYSIS REPORT
 ---

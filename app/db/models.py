@@ -32,6 +32,13 @@ class User(Base):
     signup_source = Column(String, nullable=True) # demo, manual, organic
     has_used_trial_quota = Column(Boolean, default=False)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
+
+    # Cal.com OAuth & Scheduling Settings
+    cal_access_token = Column(String, nullable=True)
+    cal_refresh_token = Column(String, nullable=True)
+    cal_token_expires_at = Column(DateTime, nullable=True)
+    cal_event_type_id = Column(Integer, nullable=True)
+    cal_timezone = Column(String, default="UTC")
     
     campaigns = relationship("Campaign", back_populates="owner", cascade="all, delete-orphan")
     oauth_accounts = relationship("OAuthAccount", back_populates="user", cascade="all, delete-orphan")
@@ -83,14 +90,25 @@ class RefreshToken(Base):
     user = relationship("User", backref="refresh_tokens")
 
 class CampaignStatus(str, enum.Enum):
+    INPUT_VALIDATED = "INPUT_VALIDATED"
     PENDING = "PENDING"
+    
+    # NEW Granular Intelligence Stages (SSoT-First)
+    STAGE_1_CSV_TRIMMED = "STAGE_1_CSV_TRIMMED"
+    STAGE_2_USER_INTEL_COMPLETE = "STAGE_2_USER_INTEL_COMPLETE"
+    STAGE_3_ICP_FILTERED = "STAGE_3_ICP_FILTERED"
+    STAGE_4_RESEARCH_COMPLETE = "STAGE_4_RESEARCH_COMPLETE"
+    STAGE_5_STAKEHOLDERS_RANKED = "STAGE_5_STAKEHOLDERS_RANKED"
+    STAGE_6_DRAFTING_COMPLETE = "STAGE_6_DRAFTING_COMPLETE"
+
+    # Legacy / High-Level Statuses
     RESEARCHING_USER_COMPANY = "RESEARCHING_USER_COMPANY"
     FINDING_TARGET_COMPANIES = "FINDING_TARGET_COMPANIES"
     FINDING_DECISION_MAKERS = "FINDING_DECISION_MAKERS"
     DRAFTING_EMAILS = "DRAFTING_EMAILS"
     COMPLETED = "COMPLETED"
-    PARTIAL_SUCCESS = "PARTIAL_SUCCESS" # Some targets missed but others drafted
-    INTERVENTION_NEEDED = "INTERVENTION_NEEDED" # Mission stalled due to data/retry limits
+    PARTIAL_SUCCESS = "PARTIAL_SUCCESS" 
+    INTERVENTION_NEEDED = "INTERVENTION_NEEDED" 
     FAILED = "FAILED"
     INACTIVE = "INACTIVE"
 
@@ -127,15 +145,19 @@ class Campaign(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String, nullable=False)
-    user_query = Column(Text, nullable=False)
-    status = Column(SQLEnum(CampaignStatus), default=CampaignStatus.PENDING, index=True)
+    prompt = Column(Text, nullable=True)
+    input_validation_review = Column(JSON, nullable=True)
+
+    status = Column(SQLEnum(CampaignStatus), default=CampaignStatus.INPUT_VALIDATED, index=True)
     status_reason = Column(Text, nullable=True) # Operational metadata for terminal states
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
     
     # Target company parameters
     target_industry = Column(String, nullable=True)
     target_location = Column(String, nullable=True)
+    trimmed_csv_data = Column(Text, nullable=True) # SSoT: Trimmed 100-row batch stored as string
     target_employee_count = Column(String, nullable=True)
+    csv_file_url = Column(String, nullable=True) # Persistent SSoT artifact path
     
     # Operational Telemetry (Lease & Heartbeat System)
     # Used to prevent duplicate work during worker clusters or server restarts.
@@ -163,6 +185,14 @@ class UserCompanyIntel(Base):
     offerings = Column(Text)
     deep_research = Column(Text)
     
+    # Enriched Dossier Cluster (The Brand DNA)
+    target_customers = Column(JSON, nullable=True)
+    competitive_advantages = Column(JSON, nullable=True)
+    proof_points = Column(JSON, nullable=True)
+    capability_to_pain_map = Column(JSON, nullable=True)
+    
+    v2_intel = Column(JSON, nullable=True)
+    
     campaign = relationship("Campaign", back_populates="user_intel")
 
 class TargetCompany(Base):
@@ -175,15 +205,31 @@ class TargetCompany(Base):
     domain = Column(String, nullable=True)
     identity_key = Column(String, nullable=True, index=True)
     linkedin = Column(String)
+    linkedin_id = Column(String, nullable=True)
     location = Column(String)
+    website = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
     company_type = Column(String, nullable=True) # Specific sub-vertical (e.g., 'Precision Machining')
     employee_count = Column(String, nullable=True) # Headcount data from research
+    revenue_range = Column(String, nullable=True)
     contact_email = Column(String)
     contact_number = Column(String)
     deep_research = Column(Text)
+    v2_intel = Column(JSON, nullable=True)
     relevance_score = Column(Integer, default=0, index=True) # Anchored numeric quality index
     relevance_explanation = Column(Text, nullable=True) # Strategic reasoning for the score
     rejection_reason = Column(Text, nullable=True)
+    matched_pains = Column(JSON, nullable=True)
+    matched_services = Column(JSON, nullable=True)
+    opportunity_reason = Column(Text, nullable=True)
+    growth_hooks = Column(JSON, nullable=True)
+    pain_hooks = Column(JSON, nullable=True)
+    news_hooks = Column(JSON, nullable=True)
+    research_summary = Column(Text, nullable=True)
+    icp_research_context = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), onupdate=lambda: datetime.datetime.now(datetime.timezone.utc))
+
     status = Column(String, default="ACTIVE", index=True) # NEW, ACTIVE, DISCOVERY_CALL, TERMINATED, REJECTED
     
     __table_args__ = (
@@ -202,10 +248,16 @@ class DecisionMaker(Base):
     target_company_id = Column(String, ForeignKey("target_companies.id", ondelete="CASCADE"), index=True)
     name = Column(String, nullable=False)
     position = Column(String)
+    seniority = Column(String, nullable=True)
+    location = Column(String, nullable=True)
     email = Column(String)
+    phone = Column(String, nullable=True)
+    company_phone = Column(String, nullable=True)
     is_email_verified = Column(Boolean, default=False) # Distinguish predicted vs verified coordinates
     reply_intent = Column(String, nullable=True) # POSITIVE, NEUTRAL, NEGATIVE
     linkedin = Column(String)
+    time_in_role = Column(String, nullable=True)
+    time_at_company = Column(String, nullable=True)
     relevance_score = Column(Integer, default=0, index=True) # Operational lead quality score
     relevance_explanation = Column(Text, nullable=True) # Agentic reasoning for coordinate selection
     hubspot_id = Column(String, nullable=True)
@@ -276,6 +328,12 @@ class EmailDraft(Base):
     dispatch_started_at = Column(DateTime, nullable=True)
     dispatch_completed_at = Column(DateTime, nullable=True)
     dispatch_error = Column(Text, nullable=True)
+    
+    # V2 Intelligence Upgrades
+    variants = Column(JSON, nullable=True) # Stores the 3 high-impact variants
+    strategic_observation = Column(Text, nullable=True)
+    pain_hypothesis = Column(Text, nullable=True)
+    personalization_hook = Column(Text, nullable=True)
     
     __table_args__ = (
         UniqueConstraint('decision_maker_id', 'followup_index', name='_dm_followup_uc'),

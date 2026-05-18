@@ -1,7 +1,7 @@
 from app.db.database import SessionLocal
 from app.db import models
-from app.agents.email_drafter import draft_personalized_email, draft_followup_email, draft_nudge_email
-from app.agents.discovery_agent import draft_discovery_request
+from app.agents.email_drafter import draft_personalized_email, draft_followup_email, draft_nudge_email, draft_discovery_request
+from app.services.drafting_service import DraftingService
 from app.workers.config.celery_app import celery_app
 from app.core.logging_config import logger
 import json
@@ -9,6 +9,7 @@ import datetime
 import gc
 from datetime import UTC
 from app.workers.lifecycle import transition_prospect
+from app.workers.utils import heartbeat_lease
 
 
 DISCOVERY_DRAFT_START_INDEX = 100
@@ -36,11 +37,12 @@ def draft_emails_worker(self, campaign_id: str):
     Uses deep research data to ensure relevance and high conversion rates.
     """
     db = SessionLocal()
+    worker_id = self.request.id
     try:
-        from app.workers.utils import acquire_lease, release_lease, heartbeat_lease
-        worker_id = f"worker:{self.request.id}"
-        if not acquire_lease(db, campaign_id, worker_id):
-            return
+        from app.core.security import acquire_lock, release_lock
+        
+        lock_key = f"campaign_stage6:{campaign_id}"
+        if not acquire_lock(lock_key, ttl=3600): return
 
         logger.info(f"[MISSION CONTROL] Transition: Initiating Ghostwriting Cluster for {campaign_id}")
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
@@ -70,6 +72,9 @@ def draft_emails_worker(self, campaign_id: str):
             "deep_research": user_intel_raw.deep_research
         }
 
+        # V2 Drafting Initializer
+        drafter = DraftingService()
+
         dm_ids = [row[0] for row in db.query(models.DecisionMaker.id).filter(models.DecisionMaker.campaign_id == campaign_id).all()]
         logger.info(f"[GHOSTWRITER] Generating personalized content for {len(dm_ids)} validated stakeholders.")
 
@@ -92,24 +97,30 @@ def draft_emails_worker(self, campaign_id: str):
             if not target_co: continue
 
             try:
-                draft_data = draft_personalized_email(
-                    user_intel,
-                    {"name": dm.name, "position": dm.position},
-                    target_co.name,
-                    target_co.deep_research
-                )
-                if draft_data:
+                # V2 Strategic Drafting Cluster
+                # Injects 3 variants and strategic reasoning directly into the draft record
+                draft_set = drafter.generate_draft_set(db, dm.id)
+                
+                if draft_set:
                     from sqlalchemy.exc import IntegrityError
                     try:
                         with db.begin_nested():
+                            # V3 "Apex" Drafting: Use the single high-fidelity primary synthesis
+                            primary_variant = draft_set.variants.get("primary", list(draft_set.variants.values())[0])
+                            
                             new_draft = models.EmailDraft(
                                 campaign_id=campaign_id,
                                 decision_maker_id=dm.id,
-                                subject=draft_data.get("subject"),
-                                body=draft_data.get("body"),
+                                subject=primary_variant.get("subject"),
+                                body=primary_variant.get("body"),
                                 status="DRAFTED",
                                 followup_index=0,
-                                draft_type="INITIAL"
+                                draft_type="INITIAL",
+                                # V2 Metadata Storage
+                                variants=draft_set.variants,
+                                strategic_observation=draft_set.strategic_observation,
+                                pain_hypothesis=draft_set.pain_hypothesis,
+                                personalization_hook=draft_set.personalization_hook
                             )
                             db.add(new_draft)
                             transition_prospect(
@@ -119,14 +130,14 @@ def draft_emails_worker(self, campaign_id: str):
                                 status="DRAFTED",
                                 reason="INITIAL_DRAFTED",
                                 actor="ghostwriter",
-                                metadata={"draft_type": "INITIAL"},
+                                metadata={"draft_type": "INITIAL", "v2_enhanced": True},
                             )
                             db.flush()
                     except IntegrityError:
                         logger.info(f"[IDEMPOTENCY] Benign Collision: Initial draft for DM {dm.id} already exists.")
                         continue
                 else:
-                    logger.warning(f"[GHOSTWRITER] Null Draft for {dm.name}")
+                    logger.warning(f"[GHOSTWRITER] Null Draft Set for {dm.name}")
             except Exception as draft_e:
                 logger.error(f"Drafting Failure for {dm.name}: {draft_e}")
                 continue
@@ -156,11 +167,10 @@ def draft_emails_worker(self, campaign_id: str):
             logger.error(f"[MISSION CONTROL] MISSION FAILURE: 0/{expected_count} drafts secured for {campaign_id}.")
             
         db.commit()
-        release_lease(db, campaign_id, worker_id)
+        release_lock(lock_key)
     except Exception as e:
         logger.error(f"Critical error in Email Ghostwriter Cluster: {e}", exc_info=True)
-        try: release_lease(db, campaign_id, f"worker:{self.request.id}")
-        except: pass
+        release_lock(f"campaign_stage6:{campaign_id}")
         self.retry(exc=e)
     finally:
         db.close()

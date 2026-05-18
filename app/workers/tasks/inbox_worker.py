@@ -120,7 +120,8 @@ def _match_reply_to_prospect(db, user_id: str, reply: dict):
 def _match_reply_to_terminated_prospect(db, user_id: str, reply: dict):
     return _find_reply_candidate(db, user_id, reply, include_terminated=True)
 
-def poll_inbox_task(user_id: str):
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=300)
+def poll_inbox_task(self, user_id: str):
     """Polls the user's mailbox for new prospect replies and classifies intent."""
     lock_key = f"inbox_sweep:{user_id}"
     if not acquire_lock(lock_key, ttl=300):
@@ -224,6 +225,6 @@ def poll_all_users_task():
             if is_demo and demo_expires_at:
                 if demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
                     continue
-            poll_inbox_task(user_id)
+            poll_inbox_task.delay(user_id)
     finally:
         db.close()

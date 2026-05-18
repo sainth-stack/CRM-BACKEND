@@ -33,8 +33,8 @@ def _has_unique(inspector, table_name: str, constraint_name: str) -> bool:
 def upgrade() -> None:
     bind = op.get_bind()
 
-    # Fresh deployments: create the canonical schema.
-    models.Base.metadata.create_all(bind=bind)
+    # Fresh deployments: migrations should handle table creation.
+    # models.Base.metadata.create_all(bind=bind)
 
     inspector = sa.inspect(bind)
 

@@ -151,13 +151,13 @@ def demo_signup(request: Request, credentials: LoginRequest = Body(...), db: Ses
     return {"message": "Identity verification mobilized. Please check your email for the code."}
 
 @router.post("/demo/verify")
-def verify_demo_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
+def verify_demo_otp(request: Request, payload: VerifyOTPRequest, db: Session = Depends(get_db)):
     """
     Trial Boundary Activation.
     Validates the provided OTP and activates the 5-day temporal boundary for the trial identity.
     """
-    user = db.query(models.User).filter(models.User.email == request.email).first()
-    if not user or not user.otp_code or not verify_password(request.otp, user.otp_code):
+    user = db.query(models.User).filter(models.User.email == payload.email).first()
+    if not user or not user.otp_code or not verify_password(payload.otp, user.otp_code):
         raise HTTPException(status_code=400, detail="Invalid verification code.")
     
     if not user.otp_expiry or user.otp_expiry.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
@@ -310,7 +310,7 @@ def reset_password(request: Request, payload: ResetPasswordRequest, db: Session 
 
 @router.post("/refresh")
 @limiter.limit("15/minute")
-def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
+def refresh_token(request: Request, payload: RefreshRequest, db: Session = Depends(get_db)):
     """
     Session Continuity Protocol.
     Exchanges a valid long-lived refresh token for a new fat JWT access token.
@@ -318,13 +318,13 @@ def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
     try:
         from app.core.security import SECRET_KEY, ALGORITHM
         import jwt
-        payload = jwt.decode(request.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        decoded_payload = jwt.decode(payload.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
         
-        if payload.get("type") != "refresh":
+        if decoded_payload.get("type") != "refresh":
             raise HTTPException(status_code=401, detail="Invalid token type.")
             
-        user_id = payload.get("sub")
-        iat = payload.get("iat")
+        user_id = decoded_payload.get("sub")
+        iat = decoded_payload.get("iat")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload.")
             
@@ -342,7 +342,7 @@ def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
 
         # Stateful Session Validation: Check DB for active token fingerprint
         # This protects against JWT signature leaks and allows granular revocation.
-        t_hash = hash_token(request.refresh_token)
+        t_hash = hash_token(payload.refresh_token)
         db_token = db.query(models.RefreshToken).filter(
             models.RefreshToken.token_hash == t_hash,
             models.RefreshToken.is_revoked == False
@@ -384,12 +384,12 @@ def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid refresh session.")
 
 @router.post("/logout")
-def logout(request: RefreshRequest, db: Session = Depends(get_db)):
+def logout(request: Request, payload: RefreshRequest, db: Session = Depends(get_db)):
     """
     Session Termination Protocol.
     Permanently revokes the provided refresh token and invalidates the current session hierarchy.
     """
-    t_hash = hash_token(request.refresh_token)
+    t_hash = hash_token(payload.refresh_token)
     db_token = db.query(models.RefreshToken).filter(
         models.RefreshToken.token_hash == t_hash
     ).first()
@@ -410,6 +410,7 @@ def get_me(current_user: models.User = Depends(get_current_user), db: Session = 
     """
     oauth_account = db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == current_user.id).first()
     has_mailbox = oauth_account is not None
+    has_calendar = current_user.cal_refresh_token is not None
     is_expired = False
     if current_user.is_demo and current_user.demo_expires_at:
         is_expired = current_user.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC)
@@ -424,6 +425,7 @@ def get_me(current_user: models.User = Depends(get_current_user), db: Session = 
         "user_limit": current_user.user_limit,
         "has_used_trial_quota": current_user.has_used_trial_quota,
         "has_mailbox": has_mailbox,
+        "has_calendar": has_calendar,
         "provider": current_user.provider,
         "created_at": current_user.created_at,
         "mailbox_health": {
@@ -984,3 +986,119 @@ async def disconnect_mailbox(
         db.delete(oauth_acc)
         db.commit()
     return {"message": "Mailbox decommissioned successfully and authorization revoked upstream."}
+
+
+class SaveCalSettingsRequest(BaseModel):
+    event_type_id: int | None = None
+    timezone: str | None = None
+
+
+@capability_router.get("/cal/url")
+async def get_cal_auth_url(current_user: models.User = Depends(get_current_user)):
+    """
+    Returns the secure Cal.com authorization URL for redirecting the client.
+    """
+    from app.core.auth import CalAuthService
+    return {"url": CalAuthService.get_authorization_url(user_id=current_user.id)}
+
+
+@capability_router.post("/cal/callback")
+async def connect_cal_calendar(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Exchanges authorization code for access and refresh tokens, encrypting them in the User table.
+    """
+    code = payload.get("code")
+    state = payload.get("state")
+    
+    if not code:
+        raise HTTPException(status_code=400, detail="Authorization code missing.")
+        
+    from app.core.auth import CalAuthService
+    if not state or not CalAuthService.validate_state(current_user.id, state):
+        logger.warning(f"[SECURITY] Cal OAuth State Mismatch for user_id={current_user.id}.")
+        raise HTTPException(
+            status_code=403, 
+            detail="Authorization session expired or integrity check failed."
+        )
+
+    # Exchange code for tokens
+    token_data = CalAuthService.exchange_code_for_tokens(code)
+    
+    # Phase 2: Cal.com OAuth Identity Alignment Verification
+    cal_email = CalAuthService.get_user_email(token_data["access_token"])
+    if not cal_email or cal_email.lower() != current_user.email.lower():
+        logger.warning(f"[IDENTITY MISMATCH] User {current_user.email} tried to connect Cal.com account associated with {cal_email}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Identity mismatch. You must connect the Cal.com calendar associated with your account: {current_user.email}. (Detected: {cal_email or 'unknown'})"
+        )
+    
+    # Store encrypted tokens in user record
+    current_user.cal_access_token = encrypt_token(token_data["access_token"])
+    current_user.cal_refresh_token = encrypt_token(token_data["refresh_token"])
+    
+    if token_data.get("expires_at"):
+        try:
+            import dateutil.parser
+            current_user.cal_token_expires_at = dateutil.parser.parse(token_data["expires_at"]).replace(tzinfo=None)
+        except Exception:
+            current_user.cal_token_expires_at = datetime.datetime.now() + datetime.timedelta(seconds=1800)
+    else:
+        current_user.cal_token_expires_at = datetime.datetime.now() + datetime.timedelta(seconds=1800)
+        
+    db.commit()
+    logger.info(f"[AUTH] Cal.com calendar successfully connected for {current_user.email}")
+    return {"message": "Cal.com calendar successfully connected!"}
+
+
+@capability_router.get("/cal/status")
+async def get_cal_status(
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Returns the current Cal.com integration status.
+    """
+    is_connected = current_user.cal_refresh_token is not None
+    return {
+        "connected": is_connected,
+        "cal_event_type_id": current_user.cal_event_type_id,
+        "cal_timezone": current_user.cal_timezone
+    }
+
+
+@capability_router.post("/cal/settings")
+async def save_cal_settings(
+    payload: SaveCalSettingsRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Saves user-specific event type ID and timezone preferences.
+    """
+    if payload.event_type_id is not None:
+        current_user.cal_event_type_id = payload.event_type_id
+    if payload.timezone is not None:
+        current_user.cal_timezone = payload.timezone
+    db.commit()
+    return {"message": "Cal.com settings saved successfully."}
+
+
+@capability_router.delete("/cal")
+async def disconnect_cal_calendar(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Decomissions the Cal.com connection, revoking the tokens from the user record.
+    """
+    current_user.cal_access_token = None
+    current_user.cal_refresh_token = None
+    current_user.cal_token_expires_at = None
+    current_user.cal_event_type_id = None
+    current_user.cal_timezone = "UTC"
+    db.commit()
+    return {"message": "Cal.com calendar disconnected successfully."}

@@ -12,6 +12,11 @@ from google_auth_oauthlib.flow import Flow
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URL", "http://localhost:5173/auth/google/callback")
+
+CAL_CLIENT_ID = os.getenv("CAL_CLIENT_ID")
+CAL_CLIENT_SECRET = os.getenv("CAL_CLIENT_SECRET")
+CAL_REDIRECT_URI = os.getenv("CAL_REDIRECT_URI", "http://localhost:5173/connect-calendar")
+
 # Extra scopes for mailbox connection
 MAILBOX_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -180,3 +185,156 @@ class MicrosoftAuthService:
     """Design placeholder for future provider-agnostic expansion."""
     async def verify_id_token(self, token: str):
         raise NotImplementedError("Microsoft Auth engagement protocol pending mobilization.")
+
+
+class CalAuthService:
+    @staticmethod
+    def get_authorization_url(user_id: str) -> str:
+        """
+        Generates a secure Cal.com OAuth2 portal URL for calendar synchronization.
+        Implements CSRF protection via a secure state token.
+        """
+        from urllib.parse import urlencode
+        import secrets
+        from app.core.security import _get_redis
+        
+        state = secrets.token_urlsafe(32)
+        r = _get_redis()
+        if r:
+            r.setex(f"cal_oauth_state:{user_id}", 900, state)
+        else:
+            logger.critical("[AUTH] Redis unreachable. Cal state verification suspended.")
+            raise HTTPException(status_code=503, detail="Security infrastructure unreachable.")
+
+        config_params = {
+            "client_id": CAL_CLIENT_ID,
+            "redirect_uri": CAL_REDIRECT_URI,
+            "response_type": "code",
+            "scope": "booking:read booking:write",
+            "state": state
+        }
+        
+        base_endpoint = "https://app.cal.com/auth/oauth2/authorize"
+        return f"{base_endpoint}?{urlencode(config_params)}"
+
+    @staticmethod
+    def validate_state(user_id: str, incoming_state: str) -> bool:
+        """
+        Validates the Cal.com OAuth2 state token to prevent CSRF.
+        """
+        from app.core.security import _get_redis
+        r = _get_redis()
+        if not r:
+            return False
+            
+        stored_state = r.get(f"cal_oauth_state:{user_id}")
+        if not stored_state:
+            return False
+            
+        import secrets
+        is_valid = secrets.compare_digest(stored_state.decode() if isinstance(stored_state, bytes) else stored_state, incoming_state)
+        r.delete(f"cal_oauth_state:{user_id}")
+        return is_valid
+
+    @staticmethod
+    def exchange_code_for_tokens(code: str) -> Dict[str, Any]:
+        """
+        Exchanges a Cal.com OAuth code for permanent access/refresh tokens.
+        """
+        try:
+            logger.info("[AUTH-CAL] Exchanging auth code for tokens...")
+            response = requests.post(
+                "https://api.cal.com/v2/auth/oauth2/token",
+                headers={
+                    "Content-Type": "application/json",
+                    "cal-api-version": "2024-08-13"
+                },
+                json={
+                    "client_id": CAL_CLIENT_ID,
+                    "client_secret": CAL_CLIENT_SECRET,
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": CAL_REDIRECT_URI
+                },
+                timeout=15
+            )
+            response.raise_for_status()
+            body = response.json()
+            # Cal.com v2 token response structure: {"status": "success", "data": {"accessToken": "...", "refreshToken": "...", "expiresAt": "..."}}
+            data = body.get("data", body) if isinstance(body, dict) else {}
+            access_token = data.get("accessToken") or data.get("access_token")
+            refresh_token = data.get("refreshToken") or data.get("refresh_token")
+            expires_at = data.get("expiresAt") or data.get("expires_at")
+            
+            return {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "expires_at": expires_at
+            }
+        except Exception as e:
+            logger.error(f"[AUTH-CAL] Token exchange failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cal.com OAuth exchange failed: {str(e)}"
+            )
+
+    @staticmethod
+    def refresh_access_token(refresh_token: str) -> Dict[str, Any]:
+        """
+        Refreshes an expired Cal.com access token using a refresh token.
+        """
+        try:
+            response = requests.post(
+                "https://api.cal.com/v2/auth/oauth2/token",
+                headers={
+                    "Content-Type": "application/json",
+                    "cal-api-version": "2024-08-13"
+                },
+                json={
+                    "client_id": CAL_CLIENT_ID,
+                    "client_secret": CAL_CLIENT_SECRET,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token
+                },
+                timeout=15
+            )
+            response.raise_for_status()
+            body = response.json()
+            data = body.get("data", body) if isinstance(body, dict) else {}
+            access_token = data.get("accessToken") or data.get("access_token")
+            new_refresh_token = data.get("refreshToken") or data.get("refresh_token") or refresh_token
+            expires_at = data.get("expiresAt") or data.get("expires_at")
+            
+            return {
+                "access_token": access_token,
+                "refresh_token": new_refresh_token,
+                "expires_at": expires_at
+            }
+        except Exception as e:
+            logger.error(f"[AUTH-CAL] Token refresh failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Failed to refresh Cal.com access: {str(e)}"
+            )
+
+    @staticmethod
+    def get_user_email(access_token: str) -> str:
+        """
+        Fetches the authenticated user's email from Cal.com API v2 to prevent identity mismatch.
+        """
+        try:
+            response = requests.get(
+                "https://api.cal.com/v2/me",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "cal-api-version": "2024-08-13"
+                },
+                timeout=15
+            )
+            response.raise_for_status()
+            body = response.json()
+            data = body.get("data", {})
+            return data.get("email")
+        except Exception as e:
+            logger.error(f"[AUTH-CAL] Failed to fetch Cal.com user email: {e}")
+            return None

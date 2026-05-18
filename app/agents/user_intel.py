@@ -37,26 +37,36 @@ INPUT DATA:
 {search_results}
 
 REQUIRED OUTPUT ARCHITECTURE:
-- exact_company_name: The formal legal or trade name identified in Ground Truth.
+- exact_company_name: The formal legal or trade name.
 - website: Cleaned and verified official URL.
-- moto: The primary brand tagline or mission statement snippet (N/A if absent).
-- core_offerings: A list of 4-6 high-impact products, services, or core competencies. Be specific (e.g., "AS9100 Certified CNC Machining" instead of "Manufacturing").
-- deep_research: A high-fidelity, professional analytical narrative. Use clear, flowing paragraphs to cover:
-    1. Market Position & Core Vertical.
-    2. Technical Value Proposition (The core differentiator).
-    3. Strategic Synergy Signals for outreach.
-    CRITICAL: DO NOT use numbered side headings like "SECTION 1", "SECTION 2", or "SECTION 3" in the output.
+- moto: Primary tagline or mission snippet.
+- core_offerings: List of 4-6 high-impact products/services.
+- target_customers: Primary types of companies or industries they serve.
+- competitive_advantages: Why they win (experience, unique tech, market position).
+- proof_points: Case studies, years in business, growth metrics, or specific achievements.
+- capability_to_pain_map: A strategic mapping of: [Pain Point they solve] -> [Their specific Solution] -> [Evidence/Proof].
+- deep_research: A professional analytical narrative covering Market Position, Technical Value, and Strategic Synergy.
+    CRITICAL: DO NOT use numbered side headings like "SECTION 1" or "SECTION 2".
 """
 
 from pydantic import BaseModel, Field
 from typing import List
 from urllib.parse import urlparse
 
+class CapabilityPainMap(BaseModel):
+    pain: str = Field(description="The customer pain point")
+    solution: str = Field(description="How the company solves it")
+    evidence: str = Field(description="Proof or evidence of the solution")
+
 class UserIntelResponse(BaseModel):
     exact_company_name: str = Field(description="The formal and verified name of the company")
     website: str = Field(description="The verified official website URL")
     moto: str = Field(description="The formal motto or tagline, or N/A")
-    core_offerings: List[str] = Field(description="List of core products or services")
+    core_offerings: List[str] = Field(description="List of 4-6 high-impact products or services")
+    target_customers: List[str] = Field(description="Primary types of companies or roles they serve")
+    competitive_advantages: List[str] = Field(description="Specific reasons why they win against competitors")
+    proof_points: List[str] = Field(description="Verifiable achievements, case studies, or growth metrics")
+    capability_to_pain_map: List[CapabilityPainMap] = Field(description="Mapping of company capabilities to specific customer pains")
     deep_research: str = Field(description="A high-fidelity business focus summary")
 
 def scrape_homepage_lite(url: str):
@@ -106,7 +116,7 @@ def scrape_homepage_lite(url: str):
         logger.warning(f"[SCRAPER] Lite-scrape mission compromised for {url}: {e}")
     return None
 
-def research_user_company(company_url: str):
+def research_user_company(company_url: str, campaign_prompt: str = ""):
     """
     User Identity & Intent Research Orchestrator.
     Maps out a company's corporate architecture and extracts their primary value-drivers through sitemap traversal and targeted search.
@@ -153,7 +163,7 @@ def research_user_company(company_url: str):
 
     # Phase 2: Intelligence Extraction with Sovereign Policy Enforcement
     structured_llm = llm.with_structured_output(UserIntelResponse)
-    STRICT_PROMPT = USER_INTEL_PROMPT + f"\n\nSTRICT SOVEREIGNTY: Focus ONLY on {domain}. Discard similar entities. If {domain} has sub-pages for Courses or Projects, list EVERY item found in those paths."
+    STRICT_PROMPT = USER_INTEL_PROMPT + f"\n\nUSER CAMPAIGN CONTEXT: {campaign_prompt}\n\nSTRICT SOVEREIGNTY: Focus ONLY on {domain}. Discard similar entities. If {domain} has sub-pages for Courses or Projects, list EVERY item found in those paths."
     
     prompt = ChatPromptTemplate.from_template(STRICT_PROMPT)
     chain = prompt | structured_llm

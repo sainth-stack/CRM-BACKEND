@@ -124,7 +124,7 @@ def _get_redis():
     """Retrieves an active Redis client connection for distributed operations."""
     try:
         import redis
-        r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), socket_connect_timeout=1)
+        r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), socket_connect_timeout=5)
         r.ping()
         return r
     except Exception:

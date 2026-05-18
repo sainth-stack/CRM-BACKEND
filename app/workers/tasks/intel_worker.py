@@ -1,97 +1,168 @@
 """
-Phase 1: User Company Deep Research Worker
-Celery task that researches the user's own company and triggers Phase 2.
+Phase 1: Parallel Background Pipeline
+Triggers Track A (CSV) and Track B (User Intel) concurrently.
 """
 from app.db.database import SessionLocal
 from app.db import models
-from app.agents.user_intel import research_user_company
 from app.workers.config.celery_app import celery_app
 from app.core.logging_config import logger
 import json
 import datetime
 from datetime import UTC
+import asyncio
+from app.core.security import acquire_lock, release_lock
+from app.agents.campaign_validator import CampaignValidator
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-def research_user_company_worker(self, campaign_id: str):
+def process_csv_worker(self, campaign_id: str):
     """
-    Phase 1: Deep user-company capability extraction.
-    Researches the user's base domain to build a capability model for AI-driven emails.
+    Track A: Heavy Data Lifting (CSV Ingestion & Trimming)
+    Pulls from the persistent SSoT artifact in local/cloud storage.
     """
     db = SessionLocal()
     try:
+        from app.services.campaign_service import campaign_service
+        from app.core.security import acquire_lock, release_lock
+        import os
+        
+        lock_key = f"campaign_csv:{campaign_id}"
+        if not acquire_lock(lock_key, ttl=600):
+             logger.warning(f"⚠️  [Track A] Could not acquire lock for {campaign_id}. Already locked?")
+             return
+        
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         if not campaign:
-            logger.warning(f"Campaign {campaign_id} not found in intel worker.")
+            logger.error(f"❌ [Track A] Campaign {campaign_id} not found in DB.")
+            release_lock(lock_key)
             return
 
-        # Temporal Boundary Check: Pause worker for expired trials
-        owner = campaign.owner
-        if owner and owner.is_demo and owner.demo_expires_at:
-            if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
-                logger.info(f"[MISSION CONTROL] Suspension: Campaign {campaign_id} owner trial expired.")
-                return
-
-        intel = campaign.user_intel
-        if not intel:
-            logger.warning(f"No user intel profile for campaign {campaign_id}.")
-            return
-
-        from app.workers.utils import acquire_lease, release_lease
-        worker_id = f"worker:{self.request.id}"
-        if not acquire_lease(db, campaign_id, worker_id):
-            return
-
-        logger.info(f"Starting deep research for campaign {campaign_id} on {intel.website}")
-        research_data = research_user_company(intel.website)
-        if research_data:
-            intel.company_name = research_data.get("exact_company_name")
-            intel.website = research_data.get("website")
-            intel.motto = research_data.get("moto")
-            intel.offerings = json.dumps(research_data.get("core_offerings"))
-            intel.deep_research = research_data.get("deep_research")
-            db.commit()
-            
-            # Explicit Lease Release: Handoff to next cluster
-            release_lease(db, campaign_id, worker_id)
-            check_phase_1_completion(campaign_id)
+        logger.info(f"🚀 [Track A] Mobilizing SSoT Ingestion from DB for {campaign_id} (Status: {campaign.status})")
+        
+        csv_content = campaign.trimmed_csv_data
+        
+        # Execute the Indestructible State-Machine Orchestrator
+        asyncio.run(campaign_service.process_state_machine(db, campaign_id, csv_content if csv_content else None))
+        
+        release_lock(lock_key)
     except Exception as e:
-        logger.error(f"User Research Critical Error for campaign {campaign_id}: {e}", exc_info=True)
-        # Clear lease on failure to allow retry/recovery
-        try: release_lease(db, campaign_id, f"worker:{self.request.id}")
-        except: pass
+        logger.error(f"Track A Failure: {e}")
+        release_lock(f"campaign_csv:{campaign_id}")
         self.retry(exc=e)
     finally:
         db.close()
 
-
-def check_phase_1_completion(campaign_id: str):
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=120)
+def research_user_company_worker(self, campaign_id: str):
     """
-    Synchronization Gate: Triggers Phase 2 only when deep research is validated.
-    Ensures that target company discovery only begins after high-fidelity intel is secured.
+    Track B: Brand Intelligence Agent (User Intel)
     """
-    from app.workers.tasks.discovery_worker import find_companies_worker
     db = SessionLocal()
     try:
-        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-        intel = campaign.user_intel
+        from app.services.user_intel_service import UserIntelService
+        from app.core.security import acquire_lock, release_lock
+        from app.services.campaign_service import campaign_service
+        
+        lock_key = f"campaign_intel:{campaign_id}"
+        if not acquire_lock(lock_key, ttl=900):
+            logger.warning(f"⚠️  [Track B] Research already in progress for {campaign_id}. Skipping.")
+            return
 
-        # Criteria: Deep Research Validation Gate & Status Guard
-        if (
-            campaign.status == models.CampaignStatus.RESEARCHING_USER_COMPANY and
-            intel and intel.deep_research and intel.deep_research not in [
-                "Analysis pending deep synchronization.",
-                "Identity verified through site architecture."
-            ]
-        ):
-            logger.info(f"[MISSION CONTROL] User Intel Phase Complete for {campaign_id}. Dispatching Discovery Cluster.")
-            campaign.status = models.CampaignStatus.FINDING_TARGET_COMPANIES
+        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        if not campaign:
+            release_lock(lock_key)
+            return
+
+        intel = campaign.user_intel
+        if not intel:
+            logger.error(f"❌ [Track B] No UserIntel record for {campaign_id}")
+            release_lock(lock_key)
+            return
+
+        logger.info(f"🧠 [Track B] Building Brand Brain for: {intel.website}")
+        user_intel_svc = UserIntelService()
+        
+        # Parallel-optimized research fetch
+        research_data = asyncio.run(user_intel_svc.research_user_company(intel.website, campaign.prompt))
+        
+        if research_data:
+            intel.company_name = research_data.get("exact_company_name")
+            intel.website = research_data.get("website")
+            intel.motto = research_data.get("motto")
+            intel.offerings = json.dumps(research_data.get("core_offerings"))
+            intel.deep_research = research_data.get("deep_research")
+            
+            # High-Fidelity Dossier Persistence
+            intel.target_customers = research_data.get("target_customers")
+            intel.competitive_advantages = research_data.get("competitive_advantages")
+            intel.proof_points = research_data.get("proof_points")
+            intel.capability_to_pain_map = research_data.get("capability_to_pain_map")
+            
+            intel.v2_intel = research_data
+            
+            # Transition to Stage 2 Complete (ONLY if not already further along)
+            if campaign.status in [models.CampaignStatus.PENDING, models.CampaignStatus.STAGE_1_CSV_TRIMMED]:
+                campaign.status = models.CampaignStatus.STAGE_2_USER_INTEL_COMPLETE
+            
             db.commit()
-            find_companies_worker.delay(campaign_id)
-        else:
-            logger.info(f"[MISSION CONTROL] Intel validation failed for {campaign_id}. Halting progression.")
+            
+            logger.info(f"✅ [Track B] Brand Intelligence Secured for {campaign_id}. Advancing State Machine.")
+            
+            # Re-trigger State Machine to move to Stage 3
+            from app.services.campaign_service import campaign_service
+            asyncio.run(campaign_service.process_state_machine(db, campaign_id))
+            
+            release_lock(lock_key)
     except Exception as e:
-        db.rollback()
-        logger.error(f"Synchronization Gate Error for campaign {campaign_id}: {e}")
+        logger.error(f"Track B Failure: {e}")
+        release_lock(f"campaign_intel:{campaign_id}")
+        self.retry(exc=e)
+    finally:
+        db.close()
+    
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def validate_input_worker(self, campaign_id: str):
+    """
+    Track C: Input Validation Agent (Agent B)
+    Validates the campaign prompt for clarity and actionability.
+    """
+    db = SessionLocal()
+    try:
+        from app.services.campaign_service import campaign_service
+        from app.core.security import acquire_lock, release_lock
+        
+        lock_key = f"campaign_val:{campaign_id}"
+        if not acquire_lock(lock_key, ttl=600):
+            logger.warning(f"⚠️  [Track C] Validation already in progress for {campaign_id}. Skipping.")
+            return
+
+        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        if not campaign:
+            release_lock(lock_key)
+            return
+
+        logger.info(f"🔍 [Track C] Validating Input for Campaign: {campaign_id}")
+        
+        # Execute Validation
+        validation_data = asyncio.run(CampaignValidator.validate_prompt(campaign.prompt))
+        
+        if validation_data:
+            campaign.input_validation_review = validation_data
+            # We don't change status to STAGE_2 yet because that's for User Intel.
+            # We check for all tracks completion in the state machine.
+            db.commit()
+            
+            logger.info(f"✅ [Track C] Input Validation Complete for {campaign_id}. Advancing State Machine.")
+            
+            # Re-trigger State Machine
+            asyncio.run(campaign_service.process_state_machine(db, campaign_id))
+            
+            release_lock(lock_key)
+    except Exception as e:
+        logger.error(f"Track C Failure: {e}")
+        release_lock(f"campaign_val:{campaign_id}")
+        self.retry(exc=e)
     finally:
         db.close()

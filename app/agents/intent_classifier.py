@@ -76,3 +76,52 @@ def classify_reply_intent(original_email: str, prospect_reply: str) -> dict:
     except Exception as e:
         logger.error(f"[INTENT] Critical classification error: {e}")
         return {"intent": "NEUTRAL", "reasoning": "Fallback due to operational error"}
+
+class ScheduleExtraction(BaseModel):
+    date: str | None = Field(description="The date requested (YYYY-MM-DD)")
+    time: str | None = Field(description="The specific time requested (e.g. '14:00')")
+    timezone: str | None = Field(description="The timezone if mentioned")
+    reasoning: str = Field(description="Brief logic for the extraction")
+
+def extract_schedule_info(text: str, current_date: str, target_location: str) -> dict:
+    """
+    Coordination Agent: Temporal Extraction.
+    Surgically extracts requested meeting times from prospect communications.
+    """
+    structured_llm = llm.with_structured_output(ScheduleExtraction)
+    prompt = ChatPromptTemplate.from_template("""
+    You are a Scheduling Precision Agent. 
+    Analyze the prospect's reply below and extract the requested date and time for a meeting.
+    
+    Context:
+    - Current Date: {current_date}
+    - Prospect Location: {target_location}
+    
+    Prospect's Reply:
+    {text}
+    
+    RULES:
+    1. Extract the date in YYYY-MM-DD format. If they say "next Tuesday", calculate it based on the current date.
+    2. Extract the time in 24h format (e.g., 2:00 PM -> 14:00).
+    3. If no specific date or time is mentioned, return null for those fields.
+    4. Focus only on the 'next meeting' request.
+    """)
+    
+    chain = prompt | structured_llm
+    try:
+        logger.info("[INTENT] Extracting temporal coordinates for scheduling...")
+        result = run_openai_guarded(
+            "schedule_extraction",
+            lambda: chain.invoke({
+                "text": text,
+                "current_date": current_date,
+                "target_location": target_location
+            }),
+            fallback={"date": None, "time": None, "timezone": None, "reasoning": "Fallback due to service unavailability"},
+        )
+        if isinstance(result, dict):
+            return result
+        return result.model_dump()
+    except Exception as e:
+        logger.error(f"[INTENT] Temporal extraction failed: {e}")
+        return {"date": None, "time": None, "timezone": None, "reasoning": "Critical failure"}

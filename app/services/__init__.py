@@ -1,1 +1,1 @@
-"""Service-layer helpers for production-critical workflows."""
+# Services package initialization

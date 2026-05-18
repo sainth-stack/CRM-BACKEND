@@ -1,6 +1,10 @@
 from celery import Celery, Task
 import os
+import logging
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
@@ -24,13 +28,19 @@ class CampaignBaseTask(Task):
         """
         from app.core.logging_config import campaign_id_var
         
-        # Heuristic: campaign_id is almost always the first positional argument
-        # or an explicit keyword argument in this architecture.
-        campaign_id = args[0] if args else kwargs.get("campaign_id")
+        # Heuristic: campaign_id extraction
+        # If bound task, first arg in *args is usually 'self'
+        cid = kwargs.get("campaign_id")
+        if not cid and args:
+            # If the first arg is the task instance itself, skip it
+            potential_cid = args[1] if (len(args) > 1 and args[0] == self) else args[0]
+            if isinstance(potential_cid, str): cid = potential_cid
         
-        token = campaign_id_var.set(campaign_id)
+        token = campaign_id_var.set(cid)
         try:
-            return super().__call__(*args, **kwargs)
+            # We call run() directly to avoid super().__call__ duplication issues 
+            # with bound methods in complex inheritance chains.
+            return self.run(*args, **kwargs)
         finally:
             campaign_id_var.reset(token)
     def on_failure(self, exc, task_id, args, kwargs, einfo):
@@ -56,10 +66,10 @@ class CampaignBaseTask(Task):
             ]:
                 campaign.status = models.CampaignStatus.FAILED
                 db.commit()
-                print(f"[TERMINAL FAILURE] Campaign {campaign_id} marked FAILED "
-                      f"after exhausting all retries. Root cause: {exc}")
+                logger.error(f"[TERMINAL FAILURE] Campaign {campaign_id} marked FAILED "
+                             f"after exhausting all retries. Root cause: {exc}")
         except Exception as db_err:
-            print(f"[TERMINAL FAILURE] Could not update campaign status: {db_err}")
+            logger.critical(f"[TERMINAL FAILURE] Could not update campaign status: {db_err}")
         finally:
             db.close()
 
@@ -101,25 +111,31 @@ if redis_url.startswith("rediss"):
         redis_backend_use_ssl={"ssl_cert_reqs": "none"}
     )
 
+# --- Task Routing Architecture ---
+# Separates heavy/slow polling from mission-critical campaign logic
+celery_app.conf.task_routes = {
+    "app.workers.tasks.inbox_worker.*": {"queue": "inbox"},
+}
+
 celery_app.conf.beat_schedule = {
-    "poll-inboxes-every-5-minutes": {
+    "poll-inboxes-every-20-minutes": {
         "task": "app.workers.tasks.inbox_worker.poll_all_users_task",
-        "schedule": 300.0,
+        "schedule": 1200.0,
     },
-    "check-meetings-every-10-minutes": {
+    "check-meetings-every-30-minutes": {
         "task": "app.workers.tasks.reminders_worker.check_upcoming_meetings_task",
-        "schedule": 600.0,
+        "schedule": 1800.0,
     },
-    "check-inactivity-every-10-minutes": {
+    "check-inactivity-every-30-minutes": {
         "task": "app.workers.tasks.orchestrator_worker.check_all_inactivity_task",
-        "schedule": 600.0,
+        "schedule": 1800.0,
     },
     "reactivate-terminated-every-6-hours": {
         "task": "app.workers.tasks.orchestrator_worker.reactivate_terminated_prospects_task",
         "schedule": 21600.0,
     },
-    "sweep-stuck-campaigns-every-10-minutes": {
+    "sweep-stuck-campaigns-every-15-minutes": {
         "task": "app.workers.tasks.sweeper_worker.sweep_stuck_campaigns_task",
-        "schedule": 600.0,
+        "schedule": 900.0,
     },
 }

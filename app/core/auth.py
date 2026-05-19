@@ -87,7 +87,7 @@ class GoogleAuthService:
         return is_valid
 
     @staticmethod
-    async def verify_id_token(token: str) -> Dict[str, Any]:
+    def verify_id_token(token: str) -> Dict[str, Any]:
         """
         Verifies a Google ID token from the frontend and returns user info.
         For use during initial Sign-up/Login.
@@ -105,7 +105,7 @@ class GoogleAuthService:
             )
 
     @staticmethod
-    async def verify_auth_code_for_mailbox(code: str, redirect_uri: str = None) -> Dict[str, Any]:
+    def verify_auth_code_for_mailbox(code: str, redirect_uri: str = None) -> Dict[str, Any]:
         """
         Exchanges an OAuth code for a REFRESH TOKEN. 
         For use during the "Connect Mailbox" flow.
@@ -158,7 +158,7 @@ class GoogleAuthService:
             )
 
     @staticmethod
-    async def get_fresh_access_token(refresh_token: str) -> str:
+    def get_fresh_access_token(refresh_token: str) -> str:
         """
         Uses a refresh token to fetch a new short-lived access token.
         Critical for the TokenService during outbound campaign execution.
@@ -172,6 +172,7 @@ class GoogleAuthService:
                     "refresh_token": refresh_token,
                     "grant_type": "refresh_token",
                 },
+                timeout=10
             )
              tokens = response.json()
              return tokens.get("access_token")

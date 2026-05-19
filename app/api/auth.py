@@ -859,7 +859,7 @@ def decommission_user(
     return {"message": "User sector decommissioned successfully."}
 
 @router.get("/google/url")
-async def get_google_auth_url(current_user: models.User = Depends(get_current_user)):
+def get_google_auth_url(current_user: models.User = Depends(get_current_user)):
     """
     Authorization Gateway Initialization.
     Generates the high-fidelity Google OAuth2 URL required to grant the system mailbox capabilities.
@@ -870,7 +870,7 @@ async def get_google_auth_url(current_user: models.User = Depends(get_current_us
 capability_router = APIRouter(prefix="/connect", tags=["Capability & Mailbox"])
 
 @capability_router.post("/google/mailbox")
-async def connect_google_mailbox(
+def connect_google_mailbox(
     payload: Dict[str, Any] = Body(...), 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
@@ -899,7 +899,7 @@ async def connect_google_mailbox(
     from app.core.auth import GoogleAuthService
     logger.info(f"[AUTH] MOBILIZING CODE EXCHANGE. user_id={current_user.id}")
     try:
-        mailbox_data = await GoogleAuthService.verify_auth_code_for_mailbox(code, redirect_uri=redirect_uri)
+        mailbox_data = GoogleAuthService.verify_auth_code_for_mailbox(code, redirect_uri=redirect_uri)
     except Exception as e:
         logger.error(f"[REJECTED] Handshake Collision for user_id={current_user.id}: {e}")
         raise
@@ -955,8 +955,9 @@ async def connect_google_mailbox(
     logger.info(f"[SUCCESS] CAPABILITY VAULTED AND SYNCHRONIZED FOR {email}")
     return {"message": "Mailbox synchronization active. Capability vaulted successfully.", "email": email}
 
+
 @capability_router.delete("/mailbox")
-async def disconnect_mailbox(
+def disconnect_mailbox(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
@@ -974,7 +975,8 @@ async def disconnect_mailbox(
             revoke_resp = requests.post(
                 "https://oauth2.googleapis.com/revoke",
                 params={"token": refresh_token},
-                headers={"Content-Type": "application/x-www-form-urlencoded"}
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=10
             )
             if revoke_resp.status_code == 200:
                 logger.info(f"[AUTH] Upstream revocation successful for {oauth_acc.email_address}")
@@ -994,7 +996,7 @@ class SaveCalSettingsRequest(BaseModel):
 
 
 @capability_router.get("/cal/url")
-async def get_cal_auth_url(current_user: models.User = Depends(get_current_user)):
+def get_cal_auth_url(current_user: models.User = Depends(get_current_user)):
     """
     Returns the secure Cal.com authorization URL for redirecting the client.
     """
@@ -1003,7 +1005,7 @@ async def get_cal_auth_url(current_user: models.User = Depends(get_current_user)
 
 
 @capability_router.post("/cal/callback")
-async def connect_cal_calendar(
+def connect_cal_calendar(
     payload: Dict[str, Any] = Body(...),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
@@ -1056,7 +1058,7 @@ async def connect_cal_calendar(
 
 
 @capability_router.get("/cal/status")
-async def get_cal_status(
+def get_cal_status(
     current_user: models.User = Depends(get_current_user)
 ):
     """
@@ -1071,7 +1073,7 @@ async def get_cal_status(
 
 
 @capability_router.post("/cal/settings")
-async def save_cal_settings(
+def save_cal_settings(
     payload: SaveCalSettingsRequest,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
@@ -1088,7 +1090,7 @@ async def save_cal_settings(
 
 
 @capability_router.delete("/cal")
-async def disconnect_cal_calendar(
+def disconnect_cal_calendar(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):

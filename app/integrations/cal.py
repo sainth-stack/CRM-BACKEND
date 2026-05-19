@@ -13,6 +13,8 @@ CAL_EVENT_TYPE_ID = int(os.getenv("CAL_EVENT_TYPE_ID", "5137238"))
 CAL_TIMEZONE = os.getenv("CAL_TIMEZONE", "UTC")
 
 
+from app.core.retry_utils import with_retries
+
 class CalProvider:
     """
     Scheduling integration with Cal.com API v2.
@@ -24,8 +26,7 @@ class CalProvider:
 
     def get_valid_access_token(self, db, user) -> str | None:
         """
-        Retrieves a valid, decrypted Cal.com access token for the user,
-        automatically refreshing it synchronously if it has expired.
+        Decrypted Cal.com access token for the user, refreshing it synchronously if expired.
         """
         if not user or not user.cal_refresh_token:
             logger.warning(f"[CAL] User has no connected Cal.com account.")
@@ -68,6 +69,7 @@ class CalProvider:
             logger.error(f"[CAL] Failed to decrypt access token for user {user.email}: {e}")
             return None
 
+    @with_retries(max_attempts=3, base_delay=2.0)
     def get_first_available_slot(self, db, user, days_ahead: int = 3):
         token = self.get_valid_access_token(db, user)
         if not token:
@@ -108,8 +110,9 @@ class CalProvider:
             return self._extract_first_slot(response.json())
         except Exception as exc:
             logger.error(f"[CAL] Availability probe failure: {exc}", exc_info=True)
-            return None
+            raise exc
 
+    @with_retries(max_attempts=3, base_delay=2.0)
     def book_meeting(
         self,
         db,
@@ -188,7 +191,7 @@ class CalProvider:
             }
         except Exception as exc:
             logger.error(f"[CAL] Booking failed: {exc}", exc_info=True)
-            return None
+            raise exc
 
     @staticmethod
     def _coerce_datetime(value: str, target_timezone: str = "UTC") -> datetime:

@@ -22,6 +22,8 @@ class EmailDraftSet(BaseModel):
     pain_hypothesis: str = Field(description="The specific business pain being addressed")
     personalization_hook: str = Field(description="The specific news or growth hook used")
 
+from app.core.resilience import retry_with_backoff
+
 class DraftingService:
     def __init__(self):
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=4000) 
@@ -34,6 +36,7 @@ class DraftingService:
         """
         return asyncio.run(self.agenerate_draft_set(db, dm_id))
 
+    @retry_with_backoff(max_attempts=3, base_delay_sec=2.0, max_delay_sec=15.0)
     async def agenerate_draft_set(self, db, dm_id: str):
         from app.db.database import SessionLocal
         # 1. Gather Context Cluster in a short-lived read transaction

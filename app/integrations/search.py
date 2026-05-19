@@ -14,6 +14,8 @@ load_dotenv()
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
+from app.core.retry_utils import with_retries
+
 class SearchProvider:
     """
     Unified Search Intelligence Bridge.
@@ -22,6 +24,7 @@ class SearchProvider:
     def __init__(self):
         self.tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
+    @with_retries(max_attempts=3, base_delay=2.0)
     def search_tavily(self, query: str, include_domains: list = None):
         """
         Executes a high-fidelity deep research query via Tavily.
@@ -38,7 +41,7 @@ class SearchProvider:
             return [{"title": r.get('title', ''), "url": r.get('url', ''), "content": r.get('content', ''), "raw_content": r.get('raw_content', ''), "score": r.get('score', 0.8)} for r in results]
         except Exception as e:
             logger.error(f"Tavily deep research failure: {e}")
-            return []
+            raise e
 
     def search_ddgs(self, query: str):
         """
@@ -72,8 +75,17 @@ class SearchProvider:
             future_tavily = executor.submit(self.search_tavily, query, include_domains)
             future_ddgs = executor.submit(self.search_ddgs, query)
             
-            tavily_results = future_tavily.result()
-            ddgs_results = future_ddgs.result()
+            try:
+                tavily_results = future_tavily.result() or []
+            except Exception as e:
+                logger.error(f"[SEARCH] Tavily failed completely after retries: {e}")
+                tavily_results = []
+                
+            try:
+                ddgs_results = future_ddgs.result() or []
+            except Exception as e:
+                logger.error(f"[SEARCH] DuckDuckGo failed completely: {e}")
+                ddgs_results = []
             
             return tavily_results + ddgs_results
 

@@ -31,15 +31,57 @@ def _next_discovery_draft_index(db, dm_id: str) -> int:
 
 
 from app.services.observability_service import ObservabilityService
+from sqlalchemy.orm import joinedload
+
+def _save_drafts_batch(campaign_id: str, drafts_batch: list):
+    """
+    Issue 1: Batch-commits a collection of drafts to the database at once.
+    This significantly reduces transaction overhead, locks, and connection counts.
+    """
+    db = SessionLocal()
+    try:
+        for dm_id, draft_set in drafts_batch:
+            dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
+            if dm:
+                primary_variant = draft_set.variants.get("primary", list(draft_set.variants.values())[0])
+                new_draft = models.EmailDraft(
+                    campaign_id=campaign_id,
+                    decision_maker_id=dm.id,
+                    subject=primary_variant.get("subject"),
+                    body=primary_variant.get("body"),
+                    status="DRAFTED",
+                    followup_index=0,
+                    draft_type="INITIAL",
+                    variants=draft_set.variants,
+                    strategic_observation=draft_set.strategic_observation,
+                    pain_hypothesis=draft_set.pain_hypothesis,
+                    personalization_hook=draft_set.personalization_hook
+                )
+                db.add(new_draft)
+                transition_prospect(
+                    db,
+                    dm,
+                    state=models.ProspectState.DRAFTED,
+                    status="DRAFTED",
+                    reason="INITIAL_DRAFTED",
+                    actor="ghostwriter",
+                    metadata={"draft_type": "INITIAL", "v2_enhanced": True},
+                )
+        db.commit()
+        logger.info(f"[BATCH] Committed batch of {len(drafts_batch)} drafts.")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[BATCH] Failed to commit drafts batch: {e}")
+    finally:
+        db.close()
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 @ObservabilityService.track_celery_task("draft_emails_worker")
 def draft_emails_worker(self, campaign_id: str):
     """
-    Phase 3: AI-powered ghostwriting cluster.
-    Generates hyper-personalized outreach content for all stakeholders identified in previous phases.
-    Uses deep research data to ensure relevance and high conversion rates.
+    Phase 3: Personalization and drafting worker.
+    Generates personalized outreach content for all stakeholders identified in previous phases.
     """
     worker_id = self.request.id
     from app.core.security import acquire_lock, release_lock
@@ -47,10 +89,11 @@ def draft_emails_worker(self, campaign_id: str):
     lock_key = f"campaign_stage6:{campaign_id}"
     if not acquire_lock(lock_key, ttl=3600): return
 
-    logger.info(f"[MISSION CONTROL] Transition: Initiating Ghostwriting Cluster for {campaign_id}")
+    logger.info(f"[CAMPAIGN] Initiating draft generation for campaign {campaign_id}")
     
-    # 1. Fetch active target list in a short read session
+    # 1. Fetch active target list in a paginated, short read session
     db = SessionLocal()
+    dm_data_list = []
     try:
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         if not campaign or not campaign.user_intel:
@@ -61,99 +104,85 @@ def draft_emails_worker(self, campaign_id: str):
         owner = campaign.owner
         if owner and owner.is_demo and owner.demo_expires_at:
             if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
-                logger.info(f"[MISSION CONTROL] Suspension: Campaign {campaign_id} owner trial expired.")
+                logger.info(f"[CAMPAIGN] Campaign {campaign_id} trial expired.")
                 release_lock(lock_key)
                 return
 
-        dm_ids = [row[0] for row in db.query(models.DecisionMaker.id).filter(models.DecisionMaker.campaign_id == campaign_id).all()]
+        # Issue 5: Paginate dataset queries to keep memory utilization flat
+        PAGE_SIZE = 500
+        offset = 0
+        while True:
+            dms_page = (db.query(models.DecisionMaker)
+                        .options(joinedload(models.DecisionMaker.target_company))
+                        .filter(models.DecisionMaker.campaign_id == campaign_id)
+                        .order_by(models.DecisionMaker.id)
+                        .limit(PAGE_SIZE)
+                        .offset(offset)
+                        .all())
+            if not dms_page:
+                break
+            
+            for dm in dms_page:
+                # Issue 5: Filter out pre-drafted items early to avoid massive object overhead
+                exists = db.query(models.EmailDraft.id).filter(models.EmailDraft.decision_maker_id == dm.id).first() is not None
+                if not exists:
+                    dm_data_list.append({
+                        "id": dm.id,
+                        "name": dm.name,
+                        "target_company_id": dm.target_company_id,
+                        "target_company_name": dm.target_company.name if dm.target_company else None
+                    })
+            offset += PAGE_SIZE
     finally:
         db.close()
 
-    logger.info(f"[GHOSTWRITER] Generating personalized content for {len(dm_ids)} validated stakeholders.")
+    logger.info(f"[GHOSTWRITER] Generating content for {len(dm_data_list)} prospects.")
     drafter = DraftingService()
     processed_count = 0
     BATCH_SIZE = 10
+    pending_drafts = []
 
-    for dm_id in dm_ids:
+    for item in dm_data_list:
         processed_count += 1
+        dm_id = item["id"]
+        dm_name = item["name"]
+        company_id = item["target_company_id"]
+        company_name = item["target_company_name"]
 
-        # Check if already drafted, load dm & company in a short read transaction
-        db = SessionLocal()
-        try:
-            # Heartbeat Pulse
-            if processed_count % 5 == 0:
-                heartbeat_lease(db, campaign_id, worker_id)
-
-            if db.query(models.EmailDraft).filter(models.EmailDraft.decision_maker_id == dm_id).first():
-                continue
-
-            dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
-            if not dm: continue
-            
-            dm_name = dm.name
-            target_co_id = dm.target_company_id
-        finally:
-            db.close()
-
-        # Check target company
-        db = SessionLocal()
-        try:
-            target_co = db.query(models.TargetCompany).filter(models.TargetCompany.id == target_co_id).first()
-            if not target_co: continue
-        finally:
-            db.close()
+        # Heartbeat Pulse inside the loop (session-safe)
+        if processed_count % 5 == 0:
+            db_heartbeat = SessionLocal()
+            try:
+                heartbeat_lease(db_heartbeat, campaign_id, worker_id)
+            except Exception:
+                pass
+            finally:
+                db_heartbeat.close()
 
         # V2 Strategic Drafting Cluster runs with ZERO database sessions held
         try:
-            draft_set = drafter.generate_draft_set(None, dm_id)
+            draft_set = drafter.create_outreach_dossier(
+                campaign_id=campaign_id,
+                dm_id=dm_id,
+                company_id=company_id
+            )
             
-            if draft_set:
-                from sqlalchemy.exc import IntegrityError
-                # Save draft in a short write session
-                db = SessionLocal()
-                try:
-                    dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
-                    if dm:
-                        primary_variant = draft_set.variants.get("primary", list(draft_set.variants.values())[0])
-                        new_draft = models.EmailDraft(
-                            campaign_id=campaign_id,
-                            decision_maker_id=dm.id,
-                            subject=primary_variant.get("subject"),
-                            body=primary_variant.get("body"),
-                            status="DRAFTED",
-                            followup_index=0,
-                            draft_type="INITIAL",
-                            # V2 Metadata Storage
-                            variants=draft_set.variants,
-                            strategic_observation=draft_set.strategic_observation,
-                            pain_hypothesis=draft_set.pain_hypothesis,
-                            personalization_hook=draft_set.personalization_hook
-                        )
-                        db.add(new_draft)
-                        transition_prospect(
-                            db,
-                            dm,
-                            state=models.ProspectState.DRAFTED,
-                            status="DRAFTED",
-                            reason="INITIAL_DRAFTED",
-                            actor="ghostwriter",
-                            metadata={"draft_type": "INITIAL", "v2_enhanced": True},
-                        )
-                        db.commit()
-                except IntegrityError:
-                    db.rollback()
-                    logger.info(f"[IDEMPOTENCY] Benign Collision: Initial draft for DM {dm_id} already exists.")
-                    continue
-                except Exception as save_e:
-                    db.rollback()
-                    logger.error(f"Failed to save draft for {dm_name}: {save_e}")
-                finally:
-                    db.close()
+            if draft_set and draft_set.variants:
+                pending_drafts.append((dm_id, draft_set))
+                
+                # Check if we should commit the accumulated batch
+                if len(pending_drafts) >= BATCH_SIZE:
+                    _save_drafts_batch(campaign_id, pending_drafts)
+                    pending_drafts.clear()
             else:
                 logger.warning(f"[GHOSTWRITER] Null Draft Set for {dm_name}")
         except Exception as draft_e:
             logger.error(f"Drafting Failure for {dm_name}: {draft_e}")
             continue
+
+    # Commit any remaining drafts in the final batch
+    if pending_drafts:
+        _save_drafts_batch(campaign_id, pending_drafts)
 
     # Final Campaign Status Update in a short write session
     db = SessionLocal()
@@ -166,15 +195,15 @@ def draft_emails_worker(self, campaign_id: str):
             if expected_count == 0:
                 campaign.status = models.CampaignStatus.PARTIAL_SUCCESS
                 campaign.status_reason = "Mission stalled: Zero stakeholders identified during previous phases."
-                logger.warning(f"[MISSION CONTROL] Campaign {campaign_id} stalled: Zero stakeholders identified.")
+                logger.warning(f"[CAMPAIGN] Campaign {campaign_id} stalled: No stakeholders identified.")
             elif drafted_count >= expected_count:
                 campaign.status = models.CampaignStatus.COMPLETED
                 campaign.status_reason = f"Mission successful: {drafted_count}/{expected_count} drafts secured."
-                logger.info(f"[MISSION CONTROL] SUCCESS: {drafted_count}/{expected_count} drafts secured for {campaign_id}.")
+                logger.info(f"[CAMPAIGN] Success: Generated {drafted_count}/{expected_count} drafts for {campaign_id}.")
             elif drafted_count > 0:
                 campaign.status = models.CampaignStatus.PARTIAL_SUCCESS
                 campaign.status_reason = f"Partial Success: Only {drafted_count}/{expected_count} drafts could be generated."
-                logger.warning(f"[MISSION CONTROL] PARTIAL SUCCESS: {drafted_count}/{expected_count} drafts secured for {campaign_id}.")
+                logger.warning(f"[CAMPAIGN] Partial Success: Generated {drafted_count}/{expected_count} drafts for {campaign_id}.")
             else:
                 campaign.status = models.CampaignStatus.FAILED
                 campaign.status_reason = "Mission Failure: Zero drafts could be generated despite identified stakeholders."

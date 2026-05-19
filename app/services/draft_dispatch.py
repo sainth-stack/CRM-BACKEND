@@ -11,7 +11,9 @@ from app.db import models
 from app.db.database import SessionLocal
 
 
-DRAFT_DISPATCH_STALE_MINUTES = 15
+from app.core.config import settings
+
+DRAFT_DISPATCH_STALE_MINUTES = settings.NUDGE_DISPATCH_STALE_MINUTES
 
 
 def lock_query(query):
@@ -87,7 +89,7 @@ def _apply_sent_draft_effects(
                 actor="user",
                 metadata={"draft_type": draft_type, "draft_id": db_draft.id, "message_id": message_id},
             )
-            dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=2)
+            dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
             arm_company_hold_window(db, dm, sent_at=sent_at)
         elif draft_type == "INITIAL":
             hs_status = "Initial Email Sent"
@@ -100,7 +102,7 @@ def _apply_sent_draft_effects(
                 actor="user",
                 metadata={"draft_type": draft_type, "draft_id": db_draft.id, "message_id": message_id},
             )
-            dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=2)
+            dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
         else:
             idx = db_draft.followup_index
             dm.followup_count = idx
@@ -114,7 +116,7 @@ def _apply_sent_draft_effects(
                 actor="user",
                 metadata={"draft_type": draft_type, "draft_id": db_draft.id, "message_id": message_id, "followup_index": idx},
             )
-            dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=2)
+            dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
 
     db_draft.status = "SENT"
     db_draft.message_id = message_id

@@ -1,9 +1,11 @@
 from app.core.logging_config import logger
 from app.services.draft_dispatch import execute_draft_send
 from app.workers.config.celery_app import celery_app
+from app.services.observability_service import ObservabilityService
 
 
 @celery_app.task(bind=True, name="app.workers.tasks.outbound_worker.send_draft_worker")
+@ObservabilityService.track_celery_task("send_draft_worker")
 def send_draft_worker(self, draft_id: str):
     """
     Background draft dispatcher.

@@ -13,6 +13,7 @@ from app.workers.utils import heartbeat_lease
 from app.services.company_validation_service import CompanyValidationService
 from app.services.stakeholder_service import StakeholderRankingService
 from app.services.user_intel_service import UserIntelService
+from app.db.database import SessionLocal
 
 # Bounded DNS Executor for Vitality Audits
 dns_executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
@@ -96,22 +97,25 @@ class CampaignService:
         STAGE 3: ICP Filtering (AI Gatekeeper)
         Runs soft-signal checks and saves TargetCompany records.
         """
-        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        # 1. Fetch Brand DNA (Short Read Session)
+        temp_db = SessionLocal()
+        try:
+            campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+            ui_record = campaign.user_intel
+            user_intel_dict = {
+                "services": json.loads(ui_record.offerings) if ui_record.offerings else [],
+                "target_customers": ui_record.target_customers or [],
+                "competitive_advantages": ui_record.competitive_advantages or []
+            }
+            campaign_metadata = {
+                "target_location": campaign.target_location,
+                "target_employee_count": campaign.target_employee_count
+            }
+        finally:
+            temp_db.close()
+
+        # 2. Run long LLM validation holding ZERO DB connections
         validator = CompanyValidationService()
-        
-        # Get Brand DNA for filtering
-        ui_record = campaign.user_intel
-        user_intel_dict = {
-            "services": json.loads(ui_record.offerings) if ui_record.offerings else [],
-            "target_customers": ui_record.target_customers or [],
-            "competitive_advantages": ui_record.competitive_advantages or []
-        }
-
-        campaign_metadata = {
-            "target_location": campaign.target_location,
-            "target_employee_count": campaign.target_employee_count
-        }
-
         import asyncio
         semaphore = asyncio.Semaphore(10)
 
@@ -127,180 +131,217 @@ class CampaignService:
         tasks = [validate_one(domain, data) for domain, data in unique_cos.items()]
         results = await asyncio.gather(*tasks)
 
-        for domain, res in results:
-            status = res.get('status', 'REJECTED')
-            
-            # Idempotency Check: Upsert logic to prevent UniqueViolation on (campaign_id, domain)
-            existing_co = db.query(models.TargetCompany).filter(
-                models.TargetCompany.campaign_id == campaign_id,
-                models.TargetCompany.domain == domain
-            ).first()
-            
-            if existing_co:
-                existing_co.status = status
-                existing_co.relevance_score = res.get('relevance_score', 0)
-                existing_co.relevance_explanation = res.get('reasoning', 'Updated via AI Gatekeeper.')
-                existing_co.icp_research_context = res.get('icp_context')
+        # 3. Create a fresh Short Write Session to persist companies
+        temp_db = SessionLocal()
+        try:
+            campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+            for domain, res in results:
+                status = res.get('status', 'REJECTED')
                 
-                # Update Extended Data if available
-                existing_co.location = unique_cos[domain].get('location')
-                existing_co.company_type = unique_cos[domain].get('industry')
-                existing_co.employee_count = unique_cos[domain].get('size')
-                existing_co.revenue_range = unique_cos[domain].get('revenue')
-                existing_co.linkedin = unique_cos[domain].get('linkedin')
-                existing_co.linkedin_id = unique_cos[domain].get('linkedin_id')
-                existing_co.description = unique_cos[domain].get('description')
-                existing_co.website = unique_cos[domain].get('website')
-
-                if status == "RESEARCH_COMPLETE":
-                    existing_co.v2_intel = res.get('hooks', {})
-                logger.info(f"[IDEMPOTENCY] Updated existing company: {domain}")
-            else:
-                new_co = models.TargetCompany(
-                    campaign_id=campaign_id,
-                    name=unique_cos[domain].get('company_name_cleaned') or unique_cos[domain].get('name', domain),
-                    domain=domain,
-                    status=status,
-                    relevance_score=res.get('relevance_score', 0),
-                    relevance_explanation=res.get('reasoning', 'Filtered via AI Gatekeeper.'),
-                    icp_research_context=res.get('icp_context'),
+                # Idempotency Check: Upsert logic to prevent UniqueViolation on (campaign_id, domain)
+                existing_co = temp_db.query(models.TargetCompany).filter(
+                    models.TargetCompany.campaign_id == campaign_id,
+                    models.TargetCompany.domain == domain
+                ).first()
+                
+                if existing_co:
+                    existing_co.status = status
+                    existing_co.relevance_score = res.get('relevance_score', 0)
+                    existing_co.relevance_explanation = res.get('reasoning', 'Updated via AI Gatekeeper.')
+                    existing_co.icp_research_context = res.get('icp_context')
                     
-                    # Extended Data Persistence
-                    location=unique_cos[domain].get('location'),
-                    company_type=unique_cos[domain].get('industry'),
-                    employee_count=unique_cos[domain].get('size'),
-                    revenue_range=unique_cos[domain].get('revenue'),
-                    linkedin=unique_cos[domain].get('linkedin'),
-                    linkedin_id=unique_cos[domain].get('linkedin_id'),
-                    description=unique_cos[domain].get('description'),
-                    website=unique_cos[domain].get('website'),
+                    # Update Extended Data if available
+                    existing_co.location = unique_cos[domain].get('location')
+                    existing_co.company_type = unique_cos[domain].get('industry')
+                    existing_co.employee_count = unique_cos[domain].get('size')
+                    existing_co.revenue_range = unique_cos[domain].get('revenue')
+                    existing_co.linkedin = unique_cos[domain].get('linkedin')
+                    existing_co.linkedin_id = unique_cos[domain].get('linkedin_id')
+                    existing_co.description = unique_cos[domain].get('description')
+                    existing_co.website = unique_cos[domain].get('website')
 
-                    v2_intel=res.get('hooks', {}) if status == "RESEARCH_COMPLETE" else {}
-                )
-                db.add(new_co)
+                    if status == "RESEARCH_COMPLETE":
+                        existing_co.v2_intel = res.get('hooks', {})
+                    logger.info(f"[IDEMPOTENCY] Updated existing company: {domain}")
+                else:
+                    new_co = models.TargetCompany(
+                        campaign_id=campaign_id,
+                        name=unique_cos[domain].get('company_name_cleaned') or unique_cos[domain].get('name', domain),
+                        domain=domain,
+                        status=status,
+                        relevance_score=res.get('relevance_score', 0),
+                        relevance_explanation=res.get('reasoning', 'Filtered via AI Gatekeeper.'),
+                        icp_research_context=res.get('icp_context'),
+                        
+                        # Extended Data Persistence
+                        location=unique_cos[domain].get('location'),
+                        company_type=unique_cos[domain].get('industry'),
+                        employee_count=unique_cos[domain].get('size'),
+                        revenue_range=unique_cos[domain].get('revenue'),
+                        linkedin=unique_cos[domain].get('linkedin'),
+                        linkedin_id=unique_cos[domain].get('linkedin_id'),
+                        description=unique_cos[domain].get('description'),
+                        website=unique_cos[domain].get('website'),
 
-        campaign.status = models.CampaignStatus.STAGE_3_ICP_FILTERED
-        db.commit()
-        logger.info(f"✅ [STAGE 3] ICP Filtering Complete for {campaign_id}")
+                        v2_intel=res.get('hooks', {}) if status == "RESEARCH_COMPLETE" else {}
+                    )
+                    temp_db.add(new_co)
+
+            campaign.status = models.CampaignStatus.STAGE_3_ICP_FILTERED
+            temp_db.commit()
+            logger.info(f"✅ [STAGE 3] ICP Filtering Complete for {campaign_id}")
+        except Exception as e:
+            temp_db.rollback()
+            logger.error(f"❌ [STAGE 3] Error saving companies: {e}")
+            raise e
+        finally:
+            temp_db.close()
 
     async def stage_4_deep_research(self, db: Session, campaign_id: str, target_domains: list = None):
         """
         STAGE 4: Deep Research Swarm
         Mobilizes research agents for ACCEPTED companies.
         """
-        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-        validator = CompanyValidationService()
-        
-        # Get Brand DNA
-        ui_record = campaign.user_intel
-        user_intel_dict = {
-            "capability_to_pain_map": ui_record.capability_to_pain_map or [],
-            "proof_points": ui_record.proof_points or [],
-            "competitive_advantages": ui_record.competitive_advantages or []
-        }
+        # 1. Fetch Brand DNA & Target Companies (Short Read Session)
+        temp_db = SessionLocal()
+        try:
+            campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+            ui_record = campaign.user_intel
+            user_intel_dict = {
+                "capability_to_pain_map": ui_record.capability_to_pain_map or [],
+                "proof_points": ui_record.proof_points or [],
+                "competitive_advantages": ui_record.competitive_advantages or []
+            }
 
-        query = db.query(models.TargetCompany).filter(
-            models.TargetCompany.campaign_id == campaign_id,
-            models.TargetCompany.status == "ACCEPTED"
-        )
-        
-        if target_domains:
-            query = query.filter(models.TargetCompany.domain.in_(target_domains))
-            
-        accepted_cos = query.all()
+            query = temp_db.query(models.TargetCompany).filter(
+                models.TargetCompany.campaign_id == campaign_id,
+                models.TargetCompany.status == "ACCEPTED"
+            )
+            if target_domains:
+                query = query.filter(models.TargetCompany.domain.in_(target_domains))
+                
+            accepted_cos_data = [
+                {
+                    "id": co.id,
+                    "name": co.name,
+                    "domain": co.domain,
+                    "description": co.description
+                }
+                for co in query.all()
+            ]
+        finally:
+            temp_db.close()
 
-        if not accepted_cos:
+        if not accepted_cos_data:
             logger.warning(f"No ACCEPTED companies for {campaign_id}. Skipping Stage 4.")
-            campaign.status = models.CampaignStatus.STAGE_4_RESEARCH_COMPLETE
-            db.commit()
+            temp_db = SessionLocal()
+            try:
+                campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+                campaign.status = models.CampaignStatus.STAGE_4_RESEARCH_COMPLETE
+                temp_db.commit()
+            finally:
+                temp_db.close()
             return
 
+        # 2. Run long LLM validation holding ZERO DB connections
+        validator = CompanyValidationService()
         import asyncio
         semaphore = asyncio.Semaphore(5) # High-intensity research limit
 
         async def research_one(co):
             async with semaphore:
                 try:
-                    # Synthesize with existing description from DB
                     swarm_data, raw_results = await validator.deep_research_swarm(
-                        co.domain, 
-                        co.name, 
+                        co["domain"], 
+                        co["name"], 
                         user_intel_dict, 
-                        existing_description=co.description
+                        existing_description=co["description"]
                     )
-                    return co.id, swarm_data, raw_results
+                    return co["id"], swarm_data, raw_results
                 except Exception as e:
-                    logger.error(f"Research failed for {co.domain}: {e}")
-                    return co.id, None, None
+                    logger.error(f"Research failed for {co['domain']}: {e}")
+                    return co["id"], None, None
 
-        tasks = [research_one(co) for co in accepted_cos]
+        tasks = [research_one(co) for co in accepted_cos_data]
         results = await asyncio.gather(*tasks)
 
-        for co_id, swarm_data, raw_results in results:
-            if swarm_data:
-                co = db.query(models.TargetCompany).filter(models.TargetCompany.id == co_id).first()
-                
-                # High-Fidelity Separate Field Persistence
-                co.relevance_score = swarm_data.get('relevance_score', co.relevance_score)
-                co.relevance_explanation = swarm_data.get('reasoning', co.relevance_explanation)
-                co.opportunity_reason = swarm_data.get('business_opportunity_reason', '')
-                co.matched_pains = swarm_data.get('matched_pains', [])
-                co.matched_services = swarm_data.get('matched_services', [])
-                co.growth_hooks = swarm_data.get('growth_hooks', [])
-                co.pain_hooks = swarm_data.get('pain_hooks', [])
-                co.news_hooks = swarm_data.get('news_hooks', [])
-                co.research_summary = swarm_data.get('executive_summary', '')
-                
-                # Blob for UI/Futureproofing
-                co.v2_intel = {
-                    "raw_swarm_results": raw_results,
-                    "full_dossier": swarm_data
-                }
-                co.status = "RESEARCH_COMPLETE" 
+        # 3. Create a fresh Short Write Session to save results
+        temp_db = SessionLocal()
+        try:
+            campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+            for co_id, swarm_data, raw_results in results:
+                if swarm_data:
+                    co = temp_db.query(models.TargetCompany).filter(models.TargetCompany.id == co_id).first()
+                    if co:
+                        # High-Fidelity Separate Field Persistence
+                        co.relevance_score = swarm_data.get('relevance_score', co.relevance_score)
+                        co.relevance_explanation = swarm_data.get('reasoning', co.relevance_explanation)
+                        co.opportunity_reason = swarm_data.get('business_opportunity_reason', '')
+                        co.matched_pains = swarm_data.get('matched_pains', [])
+                        co.matched_services = swarm_data.get('matched_services', [])
+                        co.growth_hooks = swarm_data.get('growth_hooks', [])
+                        co.pain_hooks = swarm_data.get('pain_hooks', [])
+                        co.news_hooks = swarm_data.get('news_hooks', [])
+                        co.research_summary = swarm_data.get('executive_summary', '')
+                        
+                        # Blob for UI/Futureproofing
+                        co.v2_intel = {
+                            "raw_swarm_results": raw_results,
+                            "full_dossier": swarm_data
+                        }
+                        co.status = "RESEARCH_COMPLETE" 
 
-        campaign.status = models.CampaignStatus.STAGE_4_RESEARCH_COMPLETE
-        db.commit()
-        logger.info(f"✅ [STAGE 4] Deep Research Complete for {campaign_id}")
+            campaign.status = models.CampaignStatus.STAGE_4_RESEARCH_COMPLETE
+            temp_db.commit()
+            logger.info(f"✅ [STAGE 4] Deep Research Complete for {campaign_id}")
+        except Exception as e:
+            temp_db.rollback()
+            logger.error(f"❌ [STAGE 4] Error saving deep research: {e}")
+            raise e
+        finally:
+            temp_db.close()
 
     async def stage_5_stakeholder_ranking(self, db: Session, campaign_id: str, contacts_map: dict):
         """
         STAGE 5: Strategic Stakeholder Ranking
         Selects Top 4 and applies Primary-First email logic using AI.
         """
-        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        # 1. Fetch Researched Companies & Brand DNA (Short Read Session)
+        temp_db = SessionLocal()
+        try:
+            campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+            ui_record = campaign.user_intel
+            user_intel_dict = {
+                "target_customers": ui_record.target_customers or [],
+                "capability_to_pain_map": ui_record.capability_to_pain_map or [],
+                "competitive_advantages": ui_record.competitive_advantages or []
+            }
+
+            researched_cos_data = [
+                {
+                    "id": co.id,
+                    "domain": co.domain,
+                    "name": co.name,
+                    "research_summary": co.research_summary
+                }
+                for co in temp_db.query(models.TargetCompany).filter(
+                    models.TargetCompany.campaign_id == campaign_id,
+                    models.TargetCompany.status == "RESEARCH_COMPLETE"
+                ).all()
+            ]
+        finally:
+            temp_db.close()
+
+        logger.info(f"🔍 [STAGE 5] Ranking stakeholders for {len(researched_cos_data)} researched companies.")
+        
+        # 2. Loop over companies and run AI Stakeholder Ranking holding ZERO DB connections
         ranking_svc = StakeholderRankingService()
         
-        # Build the user_intel dict for the ranking agent
-        from app.services.user_intel_service import UserIntelService
-        user_intel_svc = UserIntelService()
-        user_intel_context = user_intel_svc.get_context_from_db(db, campaign_id)
+        dms_to_create = []
+        company_status_updates = []
         
-        # Get structured user_intel
-        ui_record = campaign.user_intel
-        user_intel_dict = {
-            "target_customers": ui_record.target_customers or [],
-            "capability_to_pain_map": ui_record.capability_to_pain_map or [],
-            "competitive_advantages": ui_record.competitive_advantages or []
-        }
-
-        # Diagnostic check for company counts
-        total_in_db = db.query(models.TargetCompany).filter(models.TargetCompany.campaign_id == campaign_id).count()
-        logger.debug(f"[STAGE 5] Total Companies for Campaign {campaign_id}: {total_in_db}")
-
-        researched_cos = db.query(models.TargetCompany).filter(
-            models.TargetCompany.campaign_id == campaign_id,
-            models.TargetCompany.status == "RESEARCH_COMPLETE"
-        ).all()
-        
-        logger.info(f"🔍 [STAGE 5] Ranking stakeholders for {len(researched_cos)} researched companies.")
-        logger.debug(f"[STAGE 5] contacts_map domains: {list(contacts_map.keys())[:5]}...")
-
-        total_dms = 0
-        for co in researched_cos:
-            domain = co.domain.lower().strip().replace('www.', '')
-            # Try exact match, then try without www.
-            csv_prospects = contacts_map.get(co.domain) or contacts_map.get(domain) or []
-            domain_key = (co.domain or "").strip().lower()
+        for co in researched_cos_data:
+            domain_key = (co["domain"] or "").strip().lower()
             csv_prospects = contacts_map.get(domain_key, [])
             if not csv_prospects:
                 for k in contacts_map.keys():
@@ -312,30 +353,29 @@ class CampaignService:
                 logger.debug(f"⏭️ [STAGE 5] No prospects found in CSV for {domain_key}. Skipping.")
                 continue
 
-            # NEW: Stakeholder Screening Strategy
+            prospects_to_process = []
             if len(csv_prospects) <= 4:
-                # Rule 1: Auto-Pass with Management Gate
                 logger.info(f"⏭️ [STAGE 5] Low prospect count ({len(csv_prospects)}). Applying Management-Level Auto-Pass.")
-                prospects_to_process = []
                 mgmt_keywords = r'director|manager|vp|vice president|chief|head|lead|senior|principal|partner|owner'
                 for p in csv_prospects:
-                    # Case-insensitive lookup for title/position
                     title = ""
                     for key in p.keys():
                         if key.lower() in ['title', 'position']:
                             title = str(p.get(key) or "").lower()
                             break
                     if re.search(mgmt_keywords, title):
-                        p['strategic_score'] = 100 # Default high score for auto-pass
+                        p['strategic_score'] = 100
                         p['strategic_reasoning'] = "Auto-passed via Management Gate."
                         prospects_to_process.append(p)
             else:
-                # Rule 2: Strategic AI Ranking
-                research_context = co.research_summary or ""
-                ranked_prospects = await ranking_svc.rank_stakeholders_with_ai(csv_prospects, user_intel_dict, research_context)
-                prospects_to_process = ranked_prospects[:4]
+                research_context = co["research_summary"] or ""
+                try:
+                    ranked_prospects = await ranking_svc.rank_stakeholders_with_ai(csv_prospects, user_intel_dict, research_context)
+                    prospects_to_process = ranked_prospects[:4]
+                except Exception as e:
+                    logger.error(f"Failed to rank stakeholders with AI for {domain_key}: {e}")
+                    prospects_to_process = csv_prospects[:4]
             
-            # Helper for fuzzy key matching (case-insensitive, ignores spaces/underscores)
             def get_fuzzy(data, targets, default=None):
                 for k in data.keys():
                     norm_k = k.lower().replace(" ", "").replace("_", "").replace("-", "")
@@ -345,16 +385,11 @@ class CampaignService:
                             return data.get(k)
                 return default
 
-            logger.info(f"   - Processing {len(csv_prospects)} candidates for {co.domain}...")
+            logger.info(f"   - Processing {len(csv_prospects)} candidates for {co['domain']}...")
             for p in prospects_to_process:
-                # Rule 3: Email Hunt Protocol
-                # Priority 1: Primary Email
                 target_email = get_fuzzy(p, ["primary email", "email"])
                 is_verified = True if target_email else False
                 
-                logger.debug(f"     - Candidate: {get_fuzzy(p, ['contact full name', 'name'])} | Email Found: {target_email}")
-                
-                # Priority 2: Hunt for Valid Email in 1-10
                 if not target_email:
                     for i in range(1, 11):
                         val_status = str(get_fuzzy(p, [f"email {i} validation", f"email_{i}_validation"]) or "").lower()
@@ -367,38 +402,68 @@ class CampaignService:
                     logger.debug(f"   - Skipping {get_fuzzy(p, ['contact full name', 'name'])}: No valid email found.")
                     continue
 
-                # Rule 4: 11-Field Strategic Persistence
+                dms_to_create.append({
+                    "target_company_id": co["id"],
+                    "name": get_fuzzy(p, ["contact full name", "name"], "Unknown"),
+                    "position": get_fuzzy(p, ["title", "position"], "Stakeholder"),
+                    "seniority": get_fuzzy(p, ["seniority"]),
+                    "location": get_fuzzy(p, ["contact location", "location"]),
+                    "email": target_email,
+                    "phone": get_fuzzy(p, ["contact phone 1", "phone"]),
+                    "company_phone": get_fuzzy(p, ["company phone 1", "company phone"]),
+                    "linkedin": get_fuzzy(p, ["contact li profile url", "linkedin"]),
+                    "time_in_role": get_fuzzy(p, ["time in role"]),
+                    "time_at_company": get_fuzzy(p, ["time at company"]),
+                    "is_email_verified": is_verified,
+                    "relevance_score": p.get("strategic_score", 0),
+                    "relevance_explanation": p.get("strategic_reasoning") or "Identified via SToT matching."
+                })
+            
+            company_status_updates.append(co["id"])
+
+        # 3. Create a fresh Short Write Session to persist DMs and status
+        temp_db = SessionLocal()
+        try:
+            total_dms = 0
+            for dm_data in dms_to_create:
                 new_dm = models.DecisionMaker(
                     campaign_id=campaign_id,
-                    target_company_id=co.id,
-                    name=get_fuzzy(p, ["contact full name", "name"], "Unknown"),
-                    position=get_fuzzy(p, ["title", "position"], "Stakeholder"),
-                    seniority=get_fuzzy(p, ["seniority"]),
-                    location=get_fuzzy(p, ["contact location", "location"]),
-                    email=target_email,
-                    phone=get_fuzzy(p, ["contact phone 1", "phone"]),
-                    company_phone=get_fuzzy(p, ["company phone 1", "company phone"]),
-                    linkedin=get_fuzzy(p, ["contact li profile url", "linkedin"]),
-                    time_in_role=get_fuzzy(p, ["time in role"]),
-                    time_at_company=get_fuzzy(p, ["time at company"]),
-                    is_email_verified=is_verified,
-                    relevance_score=p.get("strategic_score", 0),
-                    relevance_explanation=p.get("strategic_reasoning") or "Identified via SToT matching.",
+                    target_company_id=dm_data["target_company_id"],
+                    name=dm_data["name"],
+                    position=dm_data["position"],
+                    seniority=dm_data["seniority"],
+                    location=dm_data["location"],
+                    email=dm_data["email"],
+                    phone=dm_data["phone"],
+                    company_phone=dm_data["company_phone"],
+                    linkedin=dm_data["linkedin"],
+                    time_in_role=dm_data["time_in_role"],
+                    time_at_company=dm_data["time_at_company"],
+                    is_email_verified=dm_data["is_email_verified"],
+                    relevance_score=dm_data["relevance_score"],
+                    relevance_explanation=dm_data["relevance_explanation"],
                     status="NEW",
                     state=models.ProspectState.NEW
                 )
-                db.add(new_dm)
+                temp_db.add(new_dm)
                 total_dms += 1
-            
-            # CRITICAL: Mark company as processed and commit immediately to prevent loss
-            co.status = "STAKEHOLDERS_IDENTIFIED"
-            db.commit()
 
-        # Final Status Update
-        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-        campaign.status = models.CampaignStatus.STAGE_5_STAKEHOLDERS_RANKED
-        db.commit()
-        logger.info(f"✅ [STAGE 5] Stakeholder Ranking Complete for {campaign_id}. DMs Created: {total_dms}")
+            for co_id in company_status_updates:
+                co = temp_db.query(models.TargetCompany).filter(models.TargetCompany.id == co_id).first()
+                if co:
+                    co.status = "STAKEHOLDERS_IDENTIFIED"
+            
+            campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+            if campaign:
+                campaign.status = models.CampaignStatus.STAGE_5_STAKEHOLDERS_RANKED
+            temp_db.commit()
+            logger.info(f"✅ [STAGE 5] Stakeholder Ranking Complete for {campaign_id}. DMs Created: {total_dms}")
+        except Exception as e:
+            temp_db.rollback()
+            logger.error(f"❌ [STAGE 5] Error saving DMs: {e}")
+            raise e
+        finally:
+            temp_db.close()
 
     async def process_state_machine(self, db: Session, campaign_id: str, csv_content: str = None):
         """

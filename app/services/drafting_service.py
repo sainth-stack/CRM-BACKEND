@@ -35,15 +35,34 @@ class DraftingService:
         return asyncio.run(self.agenerate_draft_set(db, dm_id))
 
     async def agenerate_draft_set(self, db, dm_id: str):
-        # 1. Gather Context Cluster
-        dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
-        if not dm: return None
-        
-        target_co = dm.target_company
-        campaign = dm.campaign
-        user_intel = campaign.user_intel
-        
-        if not user_intel: return None
+        from app.db.database import SessionLocal
+        # 1. Gather Context Cluster in a short-lived read transaction
+        temp_db = SessionLocal()
+        try:
+            dm = temp_db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
+            if not dm: return None
+            
+            target_co = dm.target_company
+            campaign = dm.campaign
+            user_intel = campaign.user_intel
+            
+            if not user_intel: return None
+
+            sender_name = user_intel.company_name
+            sender_services = user_intel.offerings
+            sender_map = json.dumps(user_intel.v2_intel.get("capability_to_pain_map", [])) if user_intel.v2_intel else "[]"
+            prospect_name = dm.name
+            target_company_name = target_co.name
+            prospect_role = dm.position or "Executive"
+            prospect_seniority = dm.seniority or "Management"
+            research_summary = target_co.research_summary or "N/A"
+            growth_hooks = ", ".join(target_co.growth_hooks or [])
+            pain_hooks = ", ".join(target_co.pain_hooks or [])
+            news_hooks = ", ".join(target_co.news_hooks or [])
+            opportunity_reason = target_co.opportunity_reason or ""
+            
+        finally:
+            temp_db.close()
 
         # 2. Extract structured intelligence (Direct Column Access)
         prompt = ChatPromptTemplate.from_template("""
@@ -91,24 +110,27 @@ class DraftingService:
         structured_llm = self.llm.with_structured_output(EmailDraftSet)
         chain = prompt | structured_llm
         
-        first_name = dm.name.split(' ')[0] if dm.name and ' ' in dm.name else (dm.name or "there")
+        from app.services.observability_service import ObservabilityService
+        
+        first_name = prospect_name.split(' ')[0] if prospect_name and ' ' in prospect_name else (prospect_name or "there")
 
         try:
-            drafts = await chain.ainvoke({
-                "sender_name": user_intel.company_name,
-                "sender_services": user_intel.offerings,
-                "sender_map": json.dumps(user_intel.v2_intel.get("capability_to_pain_map", [])) if user_intel.v2_intel else "[]",
-                "prospect_name": dm.name,
-                "prospect_first_name": first_name,
-                "target_company": target_co.name,
-                "prospect_role": dm.position or "Executive",
-                "prospect_seniority": dm.seniority or "Management",
-                "research_summary": target_co.research_summary or "N/A",
-                "growth_hooks": ", ".join(target_co.growth_hooks or []),
-                "pain_hooks": ", ".join(target_co.pain_hooks or []),
-                "news_hooks": ", ".join(target_co.news_hooks or []),
-                "opportunity_reason": target_co.opportunity_reason or ""
-            })
+            with ObservabilityService.track_latency("gpt_draft_generation"):
+                drafts = await chain.ainvoke({
+                    "sender_name": sender_name,
+                    "sender_services": sender_services,
+                    "sender_map": sender_map,
+                    "prospect_name": prospect_name,
+                    "prospect_first_name": first_name,
+                    "target_company": target_company_name,
+                    "prospect_role": prospect_role,
+                    "prospect_seniority": prospect_seniority,
+                    "research_summary": research_summary,
+                    "growth_hooks": growth_hooks,
+                    "pain_hooks": pain_hooks,
+                    "news_hooks": news_hooks,
+                    "opportunity_reason": opportunity_reason
+                })
             
             # Clean single line breaks to prevent jagged hard-wrapping on UI
             cleaned_body = re.sub(r'(?<!\n)\n(?!\n)', ' ', drafts.body)
@@ -133,5 +155,5 @@ class DraftingService:
                 drafts.personalization_hook
             )
         except Exception as e:
-            logger.error(f"Drafting error for {target_co.domain}: {e}")
+            logger.error(f"Drafting error for {target_company_name}: {e}")
             return None

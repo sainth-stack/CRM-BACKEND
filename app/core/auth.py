@@ -210,7 +210,7 @@ class CalAuthService:
             "client_id": CAL_CLIENT_ID,
             "redirect_uri": CAL_REDIRECT_URI,
             "response_type": "code",
-            "scope": "booking:read booking:write",
+            "scope": "BOOKING_READ BOOKING_WRITE PROFILE_READ",
             "state": state
         }
         

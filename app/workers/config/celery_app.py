@@ -112,9 +112,23 @@ if redis_url.startswith("rediss"):
     )
 
 # --- Task Routing Architecture ---
-# Separates heavy/slow polling from mission-critical campaign logic
+# Split queues by workload to guarantee zero delay for critical flows.
 celery_app.conf.task_routes = {
-    "app.workers.tasks.inbox_worker.*": {"queue": "inbox"},
+    # 1. Heavy AI and Deep Research Workloads (extremely slow, heavy CPU/RAM)
+    "app.workers.tasks.intel_worker.*": {"queue": "heavy_research"},
+    "app.workers.tasks.discovery_worker.*": {"queue": "heavy_research"},
+    "app.workers.tasks.ghostwriter_worker.*": {"queue": "heavy_research"},
+
+    # 2. Critical Outbound Email Dispatches (low latency, high priority)
+    "app.workers.tasks.outbound_worker.*": {"queue": "outbound_dispatch"},
+
+    # 3. High-Frequency Inbox Polling (independent email sweeps)
+    "app.workers.tasks.inbox_worker.*": {"queue": "inbox_polling"},
+
+    # 4. Orchestration & Scheduler Sweepers (infrastructure and lifecycle tasks)
+    "app.workers.tasks.orchestrator_worker.*": {"queue": "orchestrator"},
+    "app.workers.tasks.reminders_worker.*": {"queue": "orchestrator"},
+    "app.workers.tasks.sweeper_worker.*": {"queue": "orchestrator"},
 }
 
 celery_app.conf.beat_schedule = {

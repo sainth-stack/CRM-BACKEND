@@ -4,6 +4,7 @@ from app.agents.email_drafter import draft_personalized_email, draft_followup_em
 from app.services.drafting_service import DraftingService
 from app.workers.config.celery_app import celery_app
 from app.core.logging_config import logger
+from sqlalchemy.exc import IntegrityError
 import json
 import datetime
 import gc
@@ -29,24 +30,31 @@ def _next_discovery_draft_index(db, dm_id: str) -> int:
     return max(max(existing_indices), DISCOVERY_DRAFT_START_INDEX - 1) + 1
 
 
+from app.services.observability_service import ObservabilityService
+
+
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+@ObservabilityService.track_celery_task("draft_emails_worker")
 def draft_emails_worker(self, campaign_id: str):
     """
     Phase 3: AI-powered ghostwriting cluster.
     Generates hyper-personalized outreach content for all stakeholders identified in previous phases.
     Uses deep research data to ensure relevance and high conversion rates.
     """
-    db = SessionLocal()
     worker_id = self.request.id
-    try:
-        from app.core.security import acquire_lock, release_lock
-        
-        lock_key = f"campaign_stage6:{campaign_id}"
-        if not acquire_lock(lock_key, ttl=3600): return
+    from app.core.security import acquire_lock, release_lock
+    
+    lock_key = f"campaign_stage6:{campaign_id}"
+    if not acquire_lock(lock_key, ttl=3600): return
 
-        logger.info(f"[MISSION CONTROL] Transition: Initiating Ghostwriting Cluster for {campaign_id}")
+    logger.info(f"[MISSION CONTROL] Transition: Initiating Ghostwriting Cluster for {campaign_id}")
+    
+    # 1. Fetch active target list in a short read session
+    db = SessionLocal()
+    try:
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         if not campaign or not campaign.user_intel:
+            release_lock(lock_key)
             return
 
         # Temporal Boundary Check: Security gate for trial accounts
@@ -54,126 +62,127 @@ def draft_emails_worker(self, campaign_id: str):
         if owner and owner.is_demo and owner.demo_expires_at:
             if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
                 logger.info(f"[MISSION CONTROL] Suspension: Campaign {campaign_id} owner trial expired.")
+                release_lock(lock_key)
                 return
 
-        user_intel_raw = campaign.user_intel
-        offerings = []
-        try:
-            offerings = json.loads(user_intel_raw.offerings)
-            if not isinstance(offerings, list):
-                offerings = [str(offerings)]
-        except:
-            offerings = [str(user_intel_raw.offerings)]
-
-        user_intel = {
-            "company_name": user_intel_raw.company_name,
-            "moto": user_intel_raw.motto or "N/A",
-            "offerings": offerings,
-            "deep_research": user_intel_raw.deep_research
-        }
-
-        # V2 Drafting Initializer
-        drafter = DraftingService()
-
         dm_ids = [row[0] for row in db.query(models.DecisionMaker.id).filter(models.DecisionMaker.campaign_id == campaign_id).all()]
-        logger.info(f"[GHOSTWRITER] Generating personalized content for {len(dm_ids)} validated stakeholders.")
+    finally:
+        db.close()
 
-        processed_count = 0
-        BATCH_SIZE = 10
-        for dm_id in dm_ids:
-            processed_count += 1
+    logger.info(f"[GHOSTWRITER] Generating personalized content for {len(dm_ids)} validated stakeholders.")
+    drafter = DraftingService()
+    processed_count = 0
+    BATCH_SIZE = 10
+
+    for dm_id in dm_ids:
+        processed_count += 1
+
+        # Check if already drafted, load dm & company in a short read transaction
+        db = SessionLocal()
+        try:
             # Heartbeat Pulse
             if processed_count % 5 == 0:
                 heartbeat_lease(db, campaign_id, worker_id)
 
+            if db.query(models.EmailDraft).filter(models.EmailDraft.decision_maker_id == dm_id).first():
+                continue
+
             dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
             if not dm: continue
-
-            # Skip if already drafted
-            if db.query(models.EmailDraft).filter(models.EmailDraft.decision_maker_id == dm.id).first():
-                continue
-
-            target_co = db.query(models.TargetCompany).filter(models.TargetCompany.id == dm.target_company_id).first()
-            if not target_co: continue
-
-            try:
-                # V2 Strategic Drafting Cluster
-                # Injects 3 variants and strategic reasoning directly into the draft record
-                draft_set = drafter.generate_draft_set(db, dm.id)
-                
-                if draft_set:
-                    from sqlalchemy.exc import IntegrityError
-                    try:
-                        with db.begin_nested():
-                            # V3 "Apex" Drafting: Use the single high-fidelity primary synthesis
-                            primary_variant = draft_set.variants.get("primary", list(draft_set.variants.values())[0])
-                            
-                            new_draft = models.EmailDraft(
-                                campaign_id=campaign_id,
-                                decision_maker_id=dm.id,
-                                subject=primary_variant.get("subject"),
-                                body=primary_variant.get("body"),
-                                status="DRAFTED",
-                                followup_index=0,
-                                draft_type="INITIAL",
-                                # V2 Metadata Storage
-                                variants=draft_set.variants,
-                                strategic_observation=draft_set.strategic_observation,
-                                pain_hypothesis=draft_set.pain_hypothesis,
-                                personalization_hook=draft_set.personalization_hook
-                            )
-                            db.add(new_draft)
-                            transition_prospect(
-                                db,
-                                dm,
-                                state=models.ProspectState.DRAFTED,
-                                status="DRAFTED",
-                                reason="INITIAL_DRAFTED",
-                                actor="ghostwriter",
-                                metadata={"draft_type": "INITIAL", "v2_enhanced": True},
-                            )
-                            db.flush()
-                    except IntegrityError:
-                        logger.info(f"[IDEMPOTENCY] Benign Collision: Initial draft for DM {dm.id} already exists.")
-                        continue
-                else:
-                    logger.warning(f"[GHOSTWRITER] Null Draft Set for {dm.name}")
-            except Exception as draft_e:
-                logger.error(f"Drafting Failure for {dm.name}: {draft_e}")
-                continue
-                
-            if processed_count % BATCH_SIZE == 0:
-                db.commit()
-
-        # Honest Outcome Audit: High-Fidelity Classification
-        expected_count = db.query(models.DecisionMaker.id).filter(models.DecisionMaker.campaign_id == campaign_id).count()
-        drafted_count = db.query(models.EmailDraft.id).filter(models.EmailDraft.campaign_id == campaign_id).count()
-
-        if expected_count == 0:
-            campaign.status = models.CampaignStatus.PARTIAL_SUCCESS
-            campaign.status_reason = "Mission stalled: Zero stakeholders identified during previous phases."
-            logger.warning(f"[MISSION CONTROL] Campaign {campaign_id} stalled: Zero stakeholders identified.")
-        elif drafted_count >= expected_count:
-            campaign.status = models.CampaignStatus.COMPLETED
-            campaign.status_reason = f"Mission successful: {drafted_count}/{expected_count} drafts secured."
-            logger.info(f"[MISSION CONTROL] SUCCESS: {drafted_count}/{expected_count} drafts secured for {campaign_id}.")
-        elif drafted_count > 0:
-            campaign.status = models.CampaignStatus.PARTIAL_SUCCESS
-            campaign.status_reason = f"Partial Success: Only {drafted_count}/{expected_count} drafts could be generated."
-            logger.warning(f"[MISSION CONTROL] PARTIAL SUCCESS: {drafted_count}/{expected_count} drafts secured for {campaign_id}.")
-        else:
-            campaign.status = models.CampaignStatus.FAILED
-            campaign.status_reason = "Mission Failure: Zero drafts could be generated despite identified stakeholders."
-            logger.error(f"[MISSION CONTROL] MISSION FAILURE: 0/{expected_count} drafts secured for {campaign_id}.")
             
-        db.commit()
-        release_lock(lock_key)
-    except Exception as e:
-        logger.error(f"Critical error in Email Ghostwriter Cluster: {e}", exc_info=True)
-        release_lock(f"campaign_stage6:{campaign_id}")
-        self.retry(exc=e)
+            dm_name = dm.name
+            target_co_id = dm.target_company_id
+        finally:
+            db.close()
+
+        # Check target company
+        db = SessionLocal()
+        try:
+            target_co = db.query(models.TargetCompany).filter(models.TargetCompany.id == target_co_id).first()
+            if not target_co: continue
+        finally:
+            db.close()
+
+        # V2 Strategic Drafting Cluster runs with ZERO database sessions held
+        try:
+            draft_set = drafter.generate_draft_set(None, dm_id)
+            
+            if draft_set:
+                from sqlalchemy.exc import IntegrityError
+                # Save draft in a short write session
+                db = SessionLocal()
+                try:
+                    dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
+                    if dm:
+                        primary_variant = draft_set.variants.get("primary", list(draft_set.variants.values())[0])
+                        new_draft = models.EmailDraft(
+                            campaign_id=campaign_id,
+                            decision_maker_id=dm.id,
+                            subject=primary_variant.get("subject"),
+                            body=primary_variant.get("body"),
+                            status="DRAFTED",
+                            followup_index=0,
+                            draft_type="INITIAL",
+                            # V2 Metadata Storage
+                            variants=draft_set.variants,
+                            strategic_observation=draft_set.strategic_observation,
+                            pain_hypothesis=draft_set.pain_hypothesis,
+                            personalization_hook=draft_set.personalization_hook
+                        )
+                        db.add(new_draft)
+                        transition_prospect(
+                            db,
+                            dm,
+                            state=models.ProspectState.DRAFTED,
+                            status="DRAFTED",
+                            reason="INITIAL_DRAFTED",
+                            actor="ghostwriter",
+                            metadata={"draft_type": "INITIAL", "v2_enhanced": True},
+                        )
+                        db.commit()
+                except IntegrityError:
+                    db.rollback()
+                    logger.info(f"[IDEMPOTENCY] Benign Collision: Initial draft for DM {dm_id} already exists.")
+                    continue
+                except Exception as save_e:
+                    db.rollback()
+                    logger.error(f"Failed to save draft for {dm_name}: {save_e}")
+                finally:
+                    db.close()
+            else:
+                logger.warning(f"[GHOSTWRITER] Null Draft Set for {dm_name}")
+        except Exception as draft_e:
+            logger.error(f"Drafting Failure for {dm_name}: {draft_e}")
+            continue
+
+    # Final Campaign Status Update in a short write session
+    db = SessionLocal()
+    try:
+        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        if campaign:
+            expected_count = db.query(models.DecisionMaker.id).filter(models.DecisionMaker.campaign_id == campaign_id).count()
+            drafted_count = db.query(models.EmailDraft.id).filter(models.EmailDraft.campaign_id == campaign_id).count()
+
+            if expected_count == 0:
+                campaign.status = models.CampaignStatus.PARTIAL_SUCCESS
+                campaign.status_reason = "Mission stalled: Zero stakeholders identified during previous phases."
+                logger.warning(f"[MISSION CONTROL] Campaign {campaign_id} stalled: Zero stakeholders identified.")
+            elif drafted_count >= expected_count:
+                campaign.status = models.CampaignStatus.COMPLETED
+                campaign.status_reason = f"Mission successful: {drafted_count}/{expected_count} drafts secured."
+                logger.info(f"[MISSION CONTROL] SUCCESS: {drafted_count}/{expected_count} drafts secured for {campaign_id}.")
+            elif drafted_count > 0:
+                campaign.status = models.CampaignStatus.PARTIAL_SUCCESS
+                campaign.status_reason = f"Partial Success: Only {drafted_count}/{expected_count} drafts could be generated."
+                logger.warning(f"[MISSION CONTROL] PARTIAL SUCCESS: {drafted_count}/{expected_count} drafts secured for {campaign_id}.")
+            else:
+                campaign.status = models.CampaignStatus.FAILED
+                campaign.status_reason = "Mission Failure: Zero drafts could be generated despite identified stakeholders."
+                logger.error(f"[MISSION CONTROL] MISSION FAILURE: 0/{expected_count} drafts secured for {campaign_id}.")
+            db.commit()
     finally:
         db.close()
+        release_lock(lock_key)
 
 
 def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False):
@@ -311,7 +320,6 @@ def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
         )
 
         if draft:
-            from sqlalchemy.exc import IntegrityError
             try:
                 new_draft = models.EmailDraft(
                     campaign_id=campaign.id,

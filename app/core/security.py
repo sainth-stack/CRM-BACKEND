@@ -261,3 +261,13 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
             )
 
     return user
+
+def get_visibility_filter(db: Session, current_user: models.User):
+    """Enforces the Zero-Trust multi-tenant data isolation boundary."""
+    if str(current_user.role).lower().split('.')[-1] == "super_admin":
+        raise HTTPException(status_code=403, detail="Sovereign authority cannot access localized operational data.")
+    elif str(current_user.role).lower().split('.')[-1] == "admin":
+        target_user_ids = db.query(models.User.id).filter(models.User.created_by_id == current_user.id)
+        return models.Campaign.user_id.in_(target_user_ids)
+    return models.Campaign.user_id == current_user.id
+

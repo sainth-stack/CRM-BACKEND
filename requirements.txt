@@ -12,7 +12,6 @@ langgraph
 apscheduler
 tavily-python
 python-multipart
-hubspot-api-client
 python-dotenv
 alembic
 pydantic[email]
@@ -31,3 +30,5 @@ redis
 slowapi
 pandas
 openpyxl
+boto3
+psutil

@@ -278,6 +278,8 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
         msg_id = msg_data["id"]
         thread_id = msg_data["thread_id"]
 
+        from app.services.observability_service import ObservabilityService
+        
         sent_at = datetime.datetime.now(UTC).replace(tzinfo=None)
         hs_status = _apply_sent_draft_effects(
             db,
@@ -293,9 +295,11 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
 
             hubspot_provider.update_lead_status(db_draft.dm.hubspot_id, hs_status)
 
+        ObservabilityService.increment_metric("dispatch_success")
         return {"status": "sent", "message": "Engagement protocol mobilized."}
     except Exception as exc:
         db.rollback()
+        from app.services.observability_service import ObservabilityService
         if msg_id and sent_at:
             recovered, recovered_hs_status = _recover_sent_draft_persistence(
                 draft_id,
@@ -316,12 +320,15 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
                             hubspot_provider.update_lead_status(dm.hubspot_id, recovered_hs_status)
                     except Exception:
                         logger.warning(f"[DISPATCH] CRM sync still pending after recovery for draft {draft_id}.")
+                
+                ObservabilityService.increment_metric("dispatch_recovered")
                 return {
                     "status": "recovered",
                     "message": "Engagement protocol mobilized. Internal reconciliation completed after a transient persistence failure.",
                 }
 
         _mark_draft_dispatch_failure(draft_id, str(exc))
+        ObservabilityService.increment_metric("dispatch_failed")
         logger.error(f"Tactical Deployment Failure for draft {draft_id}: {exc}", exc_info=True)
         return {"status": "failed", "message": f"Tactical deployment failed: {str(exc)}"}
     finally:

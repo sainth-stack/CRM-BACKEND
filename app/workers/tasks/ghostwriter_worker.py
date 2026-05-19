@@ -161,11 +161,7 @@ def draft_emails_worker(self, campaign_id: str):
 
         # V2 Strategic Drafting Cluster runs with ZERO database sessions held
         try:
-            draft_set = drafter.create_outreach_dossier(
-                campaign_id=campaign_id,
-                dm_id=dm_id,
-                company_id=company_id
-            )
+            draft_set = drafter.generate_draft_set(None, dm_id)
             
             if draft_set and draft_set.variants:
                 pending_drafts.append((dm_id, draft_set))
@@ -207,7 +203,7 @@ def draft_emails_worker(self, campaign_id: str):
             else:
                 campaign.status = models.CampaignStatus.FAILED
                 campaign.status_reason = "Mission Failure: Zero drafts could be generated despite identified stakeholders."
-                logger.error(f"[MISSION CONTROL] MISSION FAILURE: 0/{expected_count} drafts secured for {campaign_id}.")
+                logger.error(f"[CAMPAIGN] Mission Failure: 0/{expected_count} drafts generated for {campaign_id}.")
             db.commit()
     finally:
         db.close()

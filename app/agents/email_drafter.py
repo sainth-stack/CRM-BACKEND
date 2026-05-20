@@ -4,6 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 from app.core.logging_config import logger
 from app.core.llm_resilience import run_openai_guarded
+import re
 
 load_dotenv()
 
@@ -48,7 +49,7 @@ NARRATIVE STRATEGY:
 STRICT CONSTRAINTS:
 1. NO PLACEHOLDERS. (No [Name], [Company Name], etc.). 
 2. NO generic openers like "Hope this finds you well" or "I was doing research".
-3. NO signature blocks. End with just "{user_company_name}".
+3. NO signature blocks. End with just "{user_company_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
 4. Tone: Senior, direct, and insight-driven. Avoid "marketing-speak".
 5. Paragraph Formatting: Each paragraph must be a single continuous string. Use double line breaks (\\n\\n) between sections.
 6. Length: Under 150 words.
@@ -75,17 +76,44 @@ Communication History (Most recent first):
 
 STRATEGY:
 - Be polite and professional.
-    - If MODE is 'COORDINATION': Politely ask them to share 2-3 time slots that work for them next week for a 15-min discovery call.
+    - If MODE is 'COORDINATION': Acknowledge the specific day/time availability they just shared in the latest communication log (e.g., "Wednesday at 3 PM EST"). Politely apologize for a quick calendar synchronization issue on our end, confirm that this time works perfectly, and let them know you are sending over a calendar invitation directly to their inbox. Keep it direct and natural.
 - If MODE is 'NUDGE': Directly address the prospect's previous neutral points. Re-iterate strategic match.
 - The goal is a "Discovery Call".
 
 STRICT CONSTRAINTS:
 1. NO PLACEHOLDERS.
-2. NO bracketed signatures. Just the company name "{user_company_name}".
+2. NO bracketed signatures. Just the company name "{user_company_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
 3. Keep length under 100 words.
 4. STRICT FORMATTING: Do NOT use mid-paragraph line breaks. Each paragraph must be a single continuous string. Only use double line breaks (\\n\\n) to separate sections.
 5. Return ONLY the JSON with subject and body.
 """
+
+def clean_email_body(body: str) -> str:
+    """Cleans single line breaks inside paragraphs to prevent jagged wrapping, while preserving signature spacing."""
+    if not body:
+        return ""
+    body = body.replace("\r\n", "\n")
+    body = re.sub(r'\n{3,}', '\n\n', body)
+    
+    parts = body.split('\n\n')
+    cleaned_parts = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        
+        # Protect signature blocks from having newlines stripped/mangled into a single line
+        sign_off_match = re.search(r'^(best regards|best|sincerely|regards|thanks|warmly|cheers|best wishes),?\s*\n\s*(.+)$', part, re.IGNORECASE)
+        if sign_off_match:
+            sign_off = sign_off_match.group(1)
+            company = sign_off_match.group(2)
+            cleaned_parts.append(f"{sign_off},\n\n{company}")
+        else:
+            cleaned_part = re.sub(r'(?<!\n)\n(?!\n)', ' ', part)
+            cleaned_parts.append(cleaned_part)
+            
+    return '\n\n'.join(cleaned_parts).strip()
+
 
 from pydantic import BaseModel, Field
 
@@ -119,7 +147,11 @@ def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_nam
             }),
             fallback=None,
         )
-        return data.model_dump() if data else None
+        if data:
+            dumped = data.model_dump()
+            dumped["body"] = clean_email_body(dumped["body"])
+            return dumped
+        return None
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Outreach drafting critical failure: {e}", exc_info=True)
         return None
@@ -149,7 +181,11 @@ def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: s
             }),
             fallback=None,
         )
-        return data.model_dump() if data else None
+        if data:
+            dumped = data.model_dump()
+            dumped["body"] = clean_email_body(dumped["body"])
+            return dumped
+        return None
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Follow-up drafting failure: {e}")
         return None
@@ -169,7 +205,7 @@ def draft_nudge_email(dm_name: str, user_company_name: str):
     
     STRICT CONSTRAINTS:
     1. NO PLACEHOLDERS.
-    2. NO bracketed signatures. Just the company name "{user_company_name}".
+    2. NO bracketed signatures. Just the company name "{user_company_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
     4. STRICT FORMATTING: No mid-paragraph breaks. Just a single block of text for the body.
     5. Return ONLY the JSON.
     """)
@@ -181,9 +217,9 @@ def draft_nudge_email(dm_name: str, user_company_name: str):
             lambda: chain.invoke({"dm_name": dm_name, "user_company_name": user_company_name}),
             fallback=None,
         )
-        if not response:
-            return f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"
-        return response.body if hasattr(response, 'body') else f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"
+        if response and hasattr(response, 'body'):
+            return clean_email_body(response.body)
+        return f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Nudge generation compromised: {e}")
         return f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"
@@ -217,11 +253,13 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
     
     STRICT CONSTRAINTS:
     1. NO PLACEHOLDERS.
-    2. End with Brand Name: "{user_name}".
+    2. End with Brand Name: "{user_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
     3. Keep it under 80 words.
+    4. Never ask the prospect to share "2-3 time slots" or "multiple slots". Strictly ask them for a single convenient timeslot or time to connect (e.g. "Please let me know a convenient time for you").
+    5. STRICT FORMATTING: Do NOT use mid-paragraph line breaks or random newlines. Each paragraph must be a single continuous string. Only use double line breaks (\\n\\n) to separate sections.
     """
     
-    booking_context = f"Since you've shown interest, please pick a slot here to synchronize: {booked_link}" if booked_link else "I would love to coordinate a brief 15-minute discovery call so we can properly align our solutions with your organization's specific needs. Please let me know when might be a convenient time for you to connect, and I will gladly adjust my schedule to accommodate yours."
+    booking_context = f"Since you've shown interest, please pick a slot here to synchronize: {booked_link}" if booked_link else "I would love to coordinate a brief 15-minute discovery call so we can properly align our solutions with your organization's specific needs. Please let me know a convenient time for you to connect, and I will gladly adjust my schedule to accommodate."
 
     prompt = ChatPromptTemplate.from_template(prompt_text)
     chain = prompt | structured_llm
@@ -242,7 +280,11 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
             }),
             fallback=None,
         )
-        return data.model_dump() if data else None
+        if data:
+            dumped = data.model_dump()
+            dumped["body"] = clean_email_body(dumped["body"])
+            return dumped
+        return None
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Discovery drafting failure: {e}")
         return None

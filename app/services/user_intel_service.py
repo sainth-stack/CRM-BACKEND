@@ -5,10 +5,9 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 from typing import List
-from dotenv import load_dotenv
 import logging
+from app.core.config import settings
 
-load_dotenv()
 logger = logging.getLogger("Phase1V2")
 
 class CapabilityPainMatch(BaseModel):
@@ -29,7 +28,7 @@ class UserCompanyDossier(BaseModel):
 
 class UserIntelService:
     def __init__(self):
-        self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+        self.tavily = TavilyClient(api_key=settings.TAVILY_API_KEY)
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
     def get_context_from_db(self, db, campaign_id: str):

@@ -1,16 +1,12 @@
 import os
 from datetime import datetime, timedelta, timezone
-
 import requests
-from dotenv import load_dotenv
-
 from app.core.logging_config import logger
+from app.core.config import settings
 
-load_dotenv()
-
-CAL_API_KEY = os.getenv("CAL_API_KEY")
-CAL_EVENT_TYPE_ID = int(os.getenv("CAL_EVENT_TYPE_ID", "5137238"))
-CAL_TIMEZONE = os.getenv("CAL_TIMEZONE", "UTC")
+CAL_API_KEY = settings.CAL_API_KEY
+CAL_EVENT_TYPE_ID = settings.CAL_EVENT_TYPE_ID
+CAL_TIMEZONE = settings.CAL_TIMEZONE
 
 
 from app.core.retry_utils import with_retries
@@ -24,12 +20,49 @@ class CalProvider:
     def __init__(self):
         self.base_url = "https://api.cal.com/v2"
 
+    def get_event_types(self, db, user) -> list[dict]:
+        """
+        Fetches all event types for the authenticated user from Cal.com.
+        Returns a list of dicts with id, title, slug, and duration.
+        """
+        token = self.get_valid_access_token(db, user)
+        if not token:
+            return []
+        try:
+            response = requests.get(
+                f"{self.base_url}/event-types",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "cal-api-version": "2024-06-14",
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            body = response.json()
+            # API v2 returns { status: "success", data: { eventTypeGroups: [...] } }
+            data = body.get("data", {})
+            event_type_groups = data.get("eventTypeGroups", [])
+            results = []
+            for group in event_type_groups:
+                for et in group.get("eventTypes", []):
+                    results.append({
+                        "id": et.get("id"),
+                        "title": et.get("title"),
+                        "slug": et.get("slug"),
+                        "duration": et.get("length") or et.get("duration"),
+                    })
+            return results
+        except Exception as e:
+            logger.error(f"[CAL] Failed to fetch event types: {e}")
+            return []
+
     def get_valid_access_token(self, db, user) -> str | None:
         """
         Decrypted Cal.com access token for the user, refreshing it synchronously if expired.
+        Requires the user to have a connected Cal.com account.
         """
         if not user or not user.cal_refresh_token:
-            logger.warning(f"[CAL] User has no connected Cal.com account.")
+            logger.warning(f"[CAL] User {user.email if user else 'anonymous'} has no connected Cal.com account.")
             return None
 
         from app.core.security import decrypt_token, encrypt_token
@@ -57,10 +90,27 @@ class CalProvider:
                 else:
                     user.cal_token_expires_at = datetime.now() + timedelta(seconds=1800)
                     
-                db.commit()
+                db.flush()
                 logger.info(f"[CAL] Access token successfully refreshed for user {user.email}")
             except Exception as e:
-                logger.error(f"[CAL] Failed to refresh access token for user {user.email}: {e}")
+                error_str = str(e).lower()
+                # 400 Bad Request = the refresh token itself is invalid/revoked.
+                # Auto-clear stale tokens so the frontend can detect this and prompt re-auth.
+                is_unrecoverable = "400" in error_str or "bad request" in error_str or "invalid" in error_str
+                if is_unrecoverable:
+                    logger.warning(
+                        f"[CAL] Refresh token for {user.email} is invalid or revoked. "
+                        "Clearing stale credentials — user must re-authorize Cal.com."
+                    )
+                    user.cal_access_token = None
+                    user.cal_refresh_token = None
+                    user.cal_token_expires_at = None
+                    try:
+                        db.flush()
+                    except Exception:
+                        pass
+                else:
+                    logger.error(f"[CAL] Failed to refresh access token for user {user.email}: {e}")
                 return None
 
         try:
@@ -73,15 +123,15 @@ class CalProvider:
     def get_first_available_slot(self, db, user, days_ahead: int = 3):
         token = self.get_valid_access_token(db, user)
         if not token:
-            logger.warning("[CAL] Cannot fetch availability slots: missing or invalid user token.")
+            logger.warning("[CAL] Cannot fetch availability slots: Cal.com account not connected or token invalid. Please connect your Cal.com account in Settings.")
             return None
 
-        event_type_id = user.cal_event_type_id
+        event_type_id = (user.cal_event_type_id if user else None) or CAL_EVENT_TYPE_ID
         if not event_type_id:
-            logger.warning(f"[CAL] User {user.email} has no configured cal_event_type_id.")
+            logger.warning(f"[CAL] User has no configured event type and no global CAL_EVENT_TYPE_ID fallback configured.")
             return None
 
-        timezone_str = user.cal_timezone or "UTC"
+        timezone_str = (user.cal_timezone if user else None) or CAL_TIMEZONE or "UTC"
 
         start_time = (
             datetime.now(timezone.utc) + timedelta(days=1)
@@ -124,15 +174,15 @@ class CalProvider:
     ):
         token = self.get_valid_access_token(db, user)
         if not token:
-            logger.error("[CAL] Cannot book meeting: missing or invalid user token.")
+            logger.warning(f"[CAL] Cannot book meeting for {email}: Cal.com account is not connected or token could not be refreshed. Please connect Cal.com in Settings.")
             return None
 
-        event_type_id = user.cal_event_type_id
+        event_type_id = (user.cal_event_type_id if user else None) or CAL_EVENT_TYPE_ID
         if not event_type_id:
-            logger.warning(f"[CAL] User {user.email} has no configured cal_event_type_id.")
+            logger.warning(f"[CAL] Cannot book meeting for {email}: User has no configured cal_event_type_id and no global fallback configured.")
             return None
 
-        timezone_str = user.cal_timezone or "UTC"
+        timezone_str = (user.cal_timezone if user else None) or CAL_TIMEZONE or "UTC"
 
         slot_start = start_time or self.get_first_available_slot(db, user)
         if not slot_start:

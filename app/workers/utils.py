@@ -1,10 +1,28 @@
 import datetime
+from contextlib import contextmanager
 from datetime import UTC
 from sqlalchemy.orm import Session
 from app.db import models
 from app.core.logging_config import logger
 from typing import Callable, Any, Optional
 from app.db.database import SessionLocal
+
+
+@contextmanager
+def db_session():
+    """
+    Canonical context manager for short-lived DB sessions in Celery workers.
+    Eliminates the manual SessionLocal() + try/finally db.close() boilerplate.
+
+    Usage:
+        with db_session() as db:
+            result = db.query(models.Campaign).first()
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 def acquire_lease(db: Session, campaign_id: str, worker_id: str) -> bool:
     """

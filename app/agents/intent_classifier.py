@@ -19,6 +19,7 @@ llm = ChatOpenAI(
 
 class IntentType(str, enum.Enum):
     POSITIVE = "POSITIVE"
+    BOOKING = "BOOKING"
     NEGATIVE = "NEGATIVE"
     NEUTRAL = "NEUTRAL"
 
@@ -36,9 +37,10 @@ Prospect's Reply:
 {prospect_reply}
 
 CLASSIFICATION RULES:
-1. POSITIVE: The prospect is interested, wants a meeting, asks for a call, wants a demo, or expresses clear interest in the next steps (e.g., "Ready for a call", "Send me a calendar link").
-2. NEGATIVE: The prospect says "No", "Not interested", "Stop emailing me", "Remove from list", or clearly rejects the proposal.
-3. NEUTRAL: The prospect is hesitant, asks a general question, says "Check back later", expresses mild skepticism but doesn't say No, or provides a non-committal answer that requires further convincing.
+1. BOOKING: The prospect is interested AND explicitly shares a specific day, date, time, or scheduling slot they are available for (e.g., "available on Wednesday at 4.00 PM EST", "How about tomorrow morning at 10am?", "Let's meet Monday at 2pm", "I can do 2 PM on Thursday").
+2. POSITIVE: The prospect is interested, wants a meeting, asks for a call, wants a demo, or expresses clear interest in next steps, but does NOT provide any specific date, day, time, or availability slot yet (e.g., "Yes, I would be interested", "Sure, let's talk next week", "Send me more details and a calendar link", "I'd love to connect").
+3. NEGATIVE: The prospect says "No", "Not interested", "Stop emailing me", "Remove from list", or clearly rejects the proposal.
+4. NEUTRAL: The prospect is hesitant, asks a general question, says "Check back later", expresses mild skepticism but doesn't say No, or provides a non-committal answer that requires further convincing.
 
 STRICT CONSTRAINTS:
 - No assumptions.

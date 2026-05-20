@@ -1,0 +1,17 @@
+# Backend Docker build context exclusions
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.env
+*.env
+celerybeat-schedule*
+scratch/
+tests/
+.git/
+.gitignore
+uploads/
+*.sh
+runtime.txt
+README.md

@@ -60,13 +60,24 @@ class EmailService:
 
         is_html = any(tag in body.lower() for tag in ["<html", "<div", "<p", "<table", "<body"])
         
-        if is_html:
-            # Wrap in standard HTML perimeter if not present
-            if "<html>" not in body.lower():
-                body = f"<html><body style='margin:0;padding:0;'>{body}</body></html>"
-            msg_type = MIMEText(body, 'html')
-        else:
-            msg_type = MIMEText(body, 'plain')
+        if not is_html:
+            # Fluid HTML conversion to prevent automatic hard-wrapping at 70 characters
+            paragraphs = body.split('\n\n')
+            html_paragraphs = []
+            for p in paragraphs:
+                p_clean = p.strip()
+                if not p_clean:
+                    continue
+                p_html = p_clean.replace('\n', '<br/>')
+                html_paragraphs.append(
+                    f'<p style="margin: 0 0 1.2em 0; line-height: 1.5; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif; font-size: 15px; color: #334155;">{p_html}</p>'
+                )
+            body = "<html><body style='margin:0;padding:0;background-color:#ffffff;'>" + "".join(html_paragraphs) + "</body></html>"
+            is_html = True
+            
+        if "<html>" not in body.lower():
+            body = f"<html><body style='margin:0;padding:0;'>{body}</body></html>"
+        msg_type = MIMEText(body, 'html')
             
         message.attach(msg_type)
         
@@ -93,7 +104,8 @@ class EmailService:
         sourced from environmental synchronization (GMAIL_TOKEN_JSON).
         """
         import json
-        token_json = os.getenv("GMAIL_TOKEN_JSON")
+        from app.core.config import settings
+        token_json = settings.GMAIL_TOKEN_JSON
         if not token_json:
             logger.error("Identity Infrastructure Failure: System vault (GMAIL_TOKEN_JSON) not identified in environment.")
             raise Exception("Identity Infrastructure Failure: System vault (GMAIL_TOKEN_JSON) not identified.")

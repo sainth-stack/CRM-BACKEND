@@ -1,4 +1,3 @@
-from app.db.database import SessionLocal
 from app.db import models
 from app.agents.email_drafter import draft_personalized_email, draft_followup_email, draft_nudge_email, draft_discovery_request
 from app.services.drafting_service import DraftingService
@@ -10,7 +9,7 @@ import datetime
 import gc
 from datetime import UTC
 from app.workers.lifecycle import transition_prospect
-from app.workers.utils import heartbeat_lease
+from app.workers.utils import heartbeat_lease, db_session
 
 
 DISCOVERY_DRAFT_START_INDEX = 100
@@ -38,150 +37,98 @@ def _save_drafts_batch(campaign_id: str, drafts_batch: list):
     Issue 1: Batch-commits a collection of drafts to the database at once.
     This significantly reduces transaction overhead, locks, and connection counts.
     """
-    db = SessionLocal()
-    try:
-        for dm_id, draft_set in drafts_batch:
-            dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
-            if dm:
-                primary_variant = draft_set.variants.get("primary", list(draft_set.variants.values())[0])
-                new_draft = models.EmailDraft(
-                    campaign_id=campaign_id,
-                    decision_maker_id=dm.id,
-                    subject=primary_variant.get("subject"),
-                    body=primary_variant.get("body"),
-                    status="DRAFTED",
-                    followup_index=0,
-                    draft_type="INITIAL",
-                    variants=draft_set.variants,
-                    strategic_observation=draft_set.strategic_observation,
-                    pain_hypothesis=draft_set.pain_hypothesis,
-                    personalization_hook=draft_set.personalization_hook
-                )
-                db.add(new_draft)
-                transition_prospect(
-                    db,
-                    dm,
-                    state=models.ProspectState.DRAFTED,
-                    status="DRAFTED",
-                    reason="INITIAL_DRAFTED",
-                    actor="ghostwriter",
-                    metadata={"draft_type": "INITIAL", "v2_enhanced": True},
-                )
-        db.commit()
-        logger.info(f"[BATCH] Committed batch of {len(drafts_batch)} drafts.")
-    except Exception as e:
-        db.rollback()
-        logger.error(f"[BATCH] Failed to commit drafts batch: {e}")
-    finally:
-        db.close()
-
-
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-@ObservabilityService.track_celery_task("draft_emails_worker")
-def draft_emails_worker(self, campaign_id: str):
-    """
-    Phase 3: Personalization and drafting worker.
-    Generates personalized outreach content for all stakeholders identified in previous phases.
-    """
-    worker_id = self.request.id
-    from app.core.security import acquire_lock, release_lock
-    
-    lock_key = f"campaign_stage6:{campaign_id}"
-    if not acquire_lock(lock_key, ttl=3600): return
-
-    logger.info(f"[CAMPAIGN] Initiating draft generation for campaign {campaign_id}")
-    
-    # 1. Fetch active target list in a paginated, short read session
-    db = SessionLocal()
-    dm_data_list = []
-    try:
-        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-        if not campaign or not campaign.user_intel:
-            release_lock(lock_key)
-            return
-
-        # Temporal Boundary Check: Security gate for trial accounts
-        owner = campaign.owner
-        if owner and owner.is_demo and owner.demo_expires_at:
-            if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
-                logger.info(f"[CAMPAIGN] Campaign {campaign_id} trial expired.")
-                release_lock(lock_key)
-                return
-
-        # Issue 5: Paginate dataset queries to keep memory utilization flat
-        PAGE_SIZE = 500
-        offset = 0
-        while True:
-            dms_page = (db.query(models.DecisionMaker)
-                        .options(joinedload(models.DecisionMaker.target_company))
-                        .filter(models.DecisionMaker.campaign_id == campaign_id)
-                        .order_by(models.DecisionMaker.id)
-                        .limit(PAGE_SIZE)
-                        .offset(offset)
-                        .all())
-            if not dms_page:
-                break
-            
-            for dm in dms_page:
-                # Issue 5: Filter out pre-drafted items early to avoid massive object overhead
-                exists = db.query(models.EmailDraft.id).filter(models.EmailDraft.decision_maker_id == dm.id).first() is not None
-                if not exists:
-                    dm_data_list.append({
-                        "id": dm.id,
-                        "name": dm.name,
-                        "target_company_id": dm.target_company_id,
-                        "target_company_name": dm.target_company.name if dm.target_company else None
-                    })
-            offset += PAGE_SIZE
-    finally:
-        db.close()
-
-    logger.info(f"[GHOSTWRITER] Generating content for {len(dm_data_list)} prospects.")
-    drafter = DraftingService()
-    processed_count = 0
-    BATCH_SIZE = 10
-    pending_drafts = []
-
-    for item in dm_data_list:
-        processed_count += 1
-        dm_id = item["id"]
-        dm_name = item["name"]
-        company_id = item["target_company_id"]
-        company_name = item["target_company_name"]
-
-        # Heartbeat Pulse inside the loop (session-safe)
-        if processed_count % 5 == 0:
-            db_heartbeat = SessionLocal()
-            try:
-                heartbeat_lease(db_heartbeat, campaign_id, worker_id)
-            except Exception:
-                pass
-            finally:
-                db_heartbeat.close()
-
-        # V2 Strategic Drafting Cluster runs with ZERO database sessions held
+    with db_session() as db:
         try:
-            draft_set = drafter.generate_draft_set(None, dm_id)
-            
-            if draft_set and draft_set.variants:
-                pending_drafts.append((dm_id, draft_set))
+            for dm_id, draft_set in drafts_batch:
+                # Idempotency Gate: Prevent duplicate initial drafts inside the write block
+                exists = db.query(models.EmailDraft.id).filter(
+                    models.EmailDraft.decision_maker_id == dm_id,
+                    models.EmailDraft.followup_index == 0
+                ).first() is not None
                 
-                # Check if we should commit the accumulated batch
-                if len(pending_drafts) >= BATCH_SIZE:
-                    _save_drafts_batch(campaign_id, pending_drafts)
-                    pending_drafts.clear()
-            else:
-                logger.warning(f"[GHOSTWRITER] Null Draft Set for {dm_name}")
-        except Exception as draft_e:
-            logger.error(f"Drafting Failure for {dm_name}: {draft_e}")
-            continue
+                if exists:
+                    logger.info(f"[BATCH IDEMPOTENCY] Initial email draft already exists for DM {dm_id}. Skipping insertion.")
+                    continue
 
-    # Commit any remaining drafts in the final batch
-    if pending_drafts:
-        _save_drafts_batch(campaign_id, pending_drafts)
+                dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
+                if dm:
+                    primary_variant = draft_set.variants.get("primary", list(draft_set.variants.values())[0])
+                    new_draft = models.EmailDraft(
+                        campaign_id=campaign_id,
+                        decision_maker_id=dm.id,
+                        subject=primary_variant.get("subject"),
+                        body=primary_variant.get("body"),
+                        status="DRAFTED",
+                        followup_index=0,
+                        draft_type="INITIAL",
+                        variants=draft_set.variants,
+                        strategic_observation=draft_set.strategic_observation,
+                        pain_hypothesis=draft_set.pain_hypothesis,
+                        personalization_hook=draft_set.personalization_hook
+                    )
+                    db.add(new_draft)
+                    transition_prospect(
+                        db, dm,
+                        state=models.ProspectState.DRAFTED,
+                        status="DRAFTED",
+                        reason="INITIAL_DRAFTED",
+                        actor="ghostwriter",
+                        metadata={"draft_type": "INITIAL", "v2_enhanced": True},
+                    )
+            db.commit()
+            logger.info(f"[BATCH] Committed batch of {len(drafts_batch)} drafts.")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"[BATCH] Failed to commit drafts batch: {e}")
 
-    # Final Campaign Status Update in a short write session
-    db = SessionLocal()
+
+def _get_pending_prospects(db, campaign_id: str, lock_key: str) -> list[dict]:
+    dm_data_list = []
+    campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+    if not campaign or not campaign.user_intel:
+        from app.core.security import release_lock
+        release_lock(lock_key)
+        return []
+
+    # Temporal Boundary Check: Security gate for trial accounts
+    owner = campaign.owner
+    if owner and owner.is_demo and owner.demo_expires_at:
+        if owner.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
+            logger.info(f"[CAMPAIGN] Campaign {campaign_id} trial expired.")
+            from app.core.security import release_lock
+            release_lock(lock_key)
+            return []
+
+    # Issue 5: Paginate dataset queries to keep memory utilization flat
+    PAGE_SIZE = 500
+    offset = 0
+    while True:
+        dms_page = (db.query(models.DecisionMaker)
+                    .options(joinedload(models.DecisionMaker.target_company))
+                    .filter(models.DecisionMaker.campaign_id == campaign_id)
+                    .order_by(models.DecisionMaker.id)
+                    .limit(PAGE_SIZE)
+                    .offset(offset)
+                    .all())
+        if not dms_page:
+            break
+        
+        for dm in dms_page:
+            # Issue 5: Filter out pre-drafted items early to avoid massive object overhead
+            exists = db.query(models.EmailDraft.id).filter(models.EmailDraft.decision_maker_id == dm.id).first() is not None
+            if not exists:
+                dm_data_list.append({
+                    "id": dm.id,
+                    "name": dm.name,
+                    "target_company_id": dm.target_company_id,
+                    "target_company_name": dm.target_company.name if dm.target_company else None
+                })
+        offset += PAGE_SIZE
+    return dm_data_list
+
+
+def _update_campaign_draft_status(db, campaign_id: str, lock_key: str) -> None:
+    from app.core.security import release_lock
     try:
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         if campaign:
@@ -206,8 +153,75 @@ def draft_emails_worker(self, campaign_id: str):
                 logger.error(f"[CAMPAIGN] Mission Failure: 0/{expected_count} drafts generated for {campaign_id}.")
             db.commit()
     finally:
-        db.close()
         release_lock(lock_key)
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+@ObservabilityService.track_celery_task("draft_emails_worker")
+def draft_emails_worker(self, campaign_id: str):
+    """
+    Phase 3: Personalization and drafting worker.
+    Generates personalized outreach content for all stakeholders identified in previous phases.
+    """
+    worker_id = self.request.id
+    from app.core.security import acquire_lock
+    
+    lock_key = f"campaign_stage6:{campaign_id}"
+    if not acquire_lock(lock_key, ttl=3600): return
+
+    logger.info(f"[CAMPAIGN] Initiating draft generation for campaign {campaign_id}")
+    
+    # 1. Fetch active target list in a paginated, short read session
+    dm_data_list = []
+    with db_session() as db:
+        dm_data_list = _get_pending_prospects(db, campaign_id, lock_key)
+
+    if not dm_data_list:
+        return
+
+    logger.info(f"[GHOSTWRITER] Generating content for {len(dm_data_list)} prospects.")
+    drafter = DraftingService()
+    processed_count = 0
+    BATCH_SIZE = 10
+    pending_drafts = []
+
+    for item in dm_data_list:
+        processed_count += 1
+        dm_id = item["id"]
+        dm_name = item["name"]
+
+        # Heartbeat Pulse inside the loop (session-safe)
+        if processed_count % 5 == 0:
+            with db_session() as db_heartbeat:
+                try:
+                    heartbeat_lease(db_heartbeat, campaign_id, worker_id)
+                except Exception:
+                    pass
+
+        # V2 Strategic Drafting Cluster runs with ZERO database sessions held
+        try:
+            draft_set = drafter.generate_draft_set(None, dm_id)
+            
+            if draft_set and draft_set.variants:
+                pending_drafts.append((dm_id, draft_set))
+                
+                # Check if we should commit the accumulated batch
+                if len(pending_drafts) >= BATCH_SIZE:
+                    _save_drafts_batch(campaign_id, pending_drafts)
+                    pending_drafts.clear()
+            else:
+                logger.warning(f"[GHOSTWRITER] Null Draft Set for {dm_name}")
+        except Exception as draft_e:
+            logger.error(f"Drafting Failure for {dm_name}: {draft_e}")
+            continue
+
+    # Commit any remaining drafts in the final batch
+    if pending_drafts:
+        _save_drafts_batch(campaign_id, pending_drafts)
+
+    # Final Campaign Status Update in a short write session
+    with db_session() as db:
+        _update_campaign_draft_status(db, campaign_id, lock_key)
 
 
 def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False):
@@ -215,10 +229,10 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False):
     Persistence Engine: Nudge Dispatcher.
     Also handles 'Manual Coordination' fallbacks when the auto-booking probe fails.
     """
-    should_close = False
+    db_ctx = None
     if db is None:
-        db = SessionLocal()
-        should_close = True
+        db_ctx = db_session()
+        db = db_ctx.__enter__()
     try:
         dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
         if not dm: return
@@ -291,14 +305,18 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False):
                 dm.termination_reason = None
                 dm.retry_after = None
                     
-                db.commit()
+                if db_ctx:
+                    db.commit()
+                else:
+                    db.flush()
                 logger.info(f"[FOLLOW-UP] Persistence triggered for {dm.name} | Index: {dm.followup_count} | Mode: {'ManualCoord' if manual_scheduling else 'Nudge'}")
             except IntegrityError:
-                db.rollback()
+                if db_ctx:
+                    db.rollback()
                 logger.info(f"[IDEMPOTENCY] Benign Collision: Follow-up {dm.followup_count} for DM {dm.id} already exists.")
     finally:
-        if should_close:
-            db.close()
+        if db_ctx:
+            db_ctx.__exit__(None, None, None)
 
 
 def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
@@ -306,10 +324,10 @@ def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
     Discovery Protocol Engine.
     Drafts the formal discovery call request after successful interest classification or auto-booking coordination.
     """
-    should_close = False
+    db_ctx = None
     if db is None:
-        db = SessionLocal()
-        should_close = True
+        db_ctx = db_session()
+        db = db_ctx.__enter__()
     try:
         dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
         if not dm: return
@@ -368,16 +386,16 @@ def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
                 dm.next_action_at = None
                 dm.termination_reason = None
                 dm.retry_after = None
-                if should_close:
+                if db_ctx:
                     db.commit()
                 logger.info(f"[DISCOVERY] Draft persistent for {dm.name} | Protocol: DISCOVERY_CALL")
             except IntegrityError:
-                if should_close: db.rollback()
+                if db_ctx: db.rollback()
                 logger.info(f"[IDEMPOTENCY] Discovery draft already exists for {dm.name}")
     except Exception as e:
-        if should_close: db.rollback()
+        if db_ctx: db.rollback()
         logger.error(f"Discovery Protocol Failure for DM {dm_id}: {e}", exc_info=True)
         raise e
     finally:
-        if should_close:
-            db.close()
+        if db_ctx:
+            db_ctx.__exit__(None, None, None)

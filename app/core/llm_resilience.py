@@ -1,12 +1,20 @@
 import os
-
+import pickle
+import hashlib
+import json
+import datetime
 from app.core.circuit_breaker import CircuitBreakerConfig, run_with_circuit_breaker
+from app.core.security import _get_redis
+from app.core.logging_config import setup_logging
+from app.core.config import settings
+from langchain_community.callbacks import get_openai_callback
 
+logger = setup_logging()
 
 OPENAI_CIRCUIT = CircuitBreakerConfig(
     name="openai:primary",
-    failure_threshold=int(os.getenv("OPENAI_CIRCUIT_FAILURE_THRESHOLD", "3")),
-    recovery_timeout_seconds=int(os.getenv("OPENAI_CIRCUIT_RECOVERY_TIMEOUT", "180")),
+    failure_threshold=settings.OPENAI_CIRCUIT_FAILURE_THRESHOLD,
+    recovery_timeout_seconds=settings.OPENAI_CIRCUIT_RECOVERY_TIMEOUT,
 )
 
 _OPENAI_PROVIDER_MARKERS = (
@@ -30,7 +38,6 @@ _OPENAI_PROVIDER_MARKERS = (
     "504",
 )
 
-
 def is_openai_provider_failure(exc: Exception) -> bool:
     message = str(exc).lower()
     class_name = exc.__class__.__name__.lower()
@@ -45,11 +52,105 @@ def is_openai_provider_failure(exc: Exception) -> bool:
     return any(marker in message for marker in _OPENAI_PROVIDER_MARKERS)
 
 
+def _generate_cache_key(operation_name: str, action) -> str:
+    """
+    Generates a secure SHA-256 cache key based on the operation name 
+    and the closure variables/context inside the action lambda.
+    """
+    hash_obj = hashlib.sha256(operation_name.encode('utf-8'))
+    if hasattr(action, '__closure__') and action.__closure__:
+        for cell in action.__closure__:
+            try:
+                val = cell.cell_contents
+                if isinstance(val, dict):
+                    serialized = json.dumps(val, sort_keys=True)
+                elif hasattr(val, 'dict'):
+                    serialized = json.dumps(val.dict(), sort_keys=True)
+                else:
+                    serialized = str(val)
+                hash_obj.update(serialized.encode('utf-8'))
+            except Exception:
+                pass
+    return f"llm_cache:{hash_obj.hexdigest()}"
+
+
 def run_openai_guarded(operation_name: str, action, fallback=None):
+    """
+    Guarded OpenAI Executor with Production-Grade Cost Governance:
+    1. Multi-layer Request Caching (via Redis).
+    2. Dynamic daily dollar quota checks.
+    3. LangChain Callback-driven exact token & USD cost tracking.
+    4. Circuit breaker failure isolation.
+    """
+    r = _get_redis()
+    today = datetime.date.today().isoformat()
+    
+    # --- 1. Daily Quota Check ---
+    daily_budget = settings.LLM_DAILY_BUDGET_USD
+    if r:
+        try:
+            current_cost = float(r.get(f"llm_cost:{today}") or 0.0)
+            if current_cost >= daily_budget:
+                logger.error(
+                    f"🚨 [COST GOVERNANCE] Daily OpenAI budget exceeded (${current_cost:.4f} / ${daily_budget:.2f}). "
+                    f"Blocking call and failing safe."
+                )
+                if fallback is not None:
+                    return fallback() if callable(fallback) else fallback
+                raise Exception("Daily OpenAI API cost quota exceeded. Blocked for cost governance.")
+        except Exception as q_err:
+            if "cost quota exceeded" in str(q_err):
+                raise q_err
+            logger.warning(f"Failed to check daily quota: {q_err}")
+
+    # --- 2. Request Cache Lookup ---
+    cache_key = _generate_cache_key(operation_name, action)
+    if r and settings.LLM_CACHE_ENABLED:
+        try:
+            cached_val = r.get(cache_key)
+            if cached_val:
+                logger.info(f"✨ [LLM CACHE HIT] {operation_name} response resolved from Redis.")
+                return pickle.loads(cached_val)
+        except Exception as c_err:
+            logger.warning(f"Cache resolution error: {c_err}")
+
+    # --- 3. Guarded Execution & Token Tracking ---
+    def execute_with_tracking():
+        with get_openai_callback() as cb:
+            result = action()
+            
+            # Record Token Consumption Metrics
+            if cb.total_tokens > 0:
+                logger.info(
+                    f"📊 [LLM COST] {operation_name} -> Tokens: {cb.total_tokens} "
+                    f"(Prompt: {cb.prompt_tokens}, Completion: {cb.completion_tokens}) | Cost: ${cb.total_cost:.5f}"
+                )
+                if r:
+                    try:
+                        r.incrbyfloat(f"llm_cost:{today}", cb.total_cost)
+                        r.expire(f"llm_cost:{today}", 172800) # Keep day's cost for 48h
+                        
+                        # Increment Prometheus/Telemetry aggregate counters
+                        r.incrby(f"llm_tokens_total", cb.total_tokens)
+                        r.incrbyfloat(f"llm_cost_total", cb.total_cost)
+                    except Exception as metric_err:
+                        logger.warning(f"Failed to update cost metrics: {metric_err}")
+            
+            # --- 4. Cache Insertion ---
+            if r and result and settings.LLM_CACHE_ENABLED:
+                try:
+                    cache_ttl = settings.LLM_CACHE_TTL_SECONDS
+                    r.setex(cache_key, cache_ttl, pickle.dumps(result))
+                    logger.debug(f"💾 [LLM CACHE WRITE] Cached {operation_name} result in Redis.")
+                except Exception as w_err:
+                    logger.warning(f"Cache write error: {w_err}")
+                    
+            return result
+
     return run_with_circuit_breaker(
         OPENAI_CIRCUIT,
         operation_name,
-        action,
+        execute_with_tracking,
         should_trip=is_openai_provider_failure,
         on_open=fallback,
     )

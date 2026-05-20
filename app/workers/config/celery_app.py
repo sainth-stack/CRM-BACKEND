@@ -48,30 +48,65 @@ class CampaignBaseTask(Task):
         Terminal Failure Handler: Ensures campaigns don't stay in 'PENDING' forever
         if a worker crashes or retries are exhausted.
         """
-        from app.db.database import SessionLocal
+        from app.workers.utils import db_session
         from app.db import models
 
         campaign_id = args[0] if args else kwargs.get("campaign_id")
         if not campaign_id:
             return
 
-        db = SessionLocal()
+        with db_session() as db:
+            try:
+                campaign = db.query(models.Campaign).filter(
+                    models.Campaign.id == campaign_id
+                ).first()
+                if campaign and campaign.status not in [
+                    models.CampaignStatus.COMPLETED,
+                    models.CampaignStatus.FAILED
+                ]:
+                    campaign.status = models.CampaignStatus.FAILED
+                    db.commit()
+                    logger.error(f"[TERMINAL FAILURE] Campaign {campaign_id} marked FAILED "
+                                 f"after exhausting all retries. Root cause: {exc}")
+            except Exception as db_err:
+                logger.critical(f"[TERMINAL FAILURE] Could not update campaign status: {db_err}")
+
+
+from celery.signals import task_failure
+
+@task_failure.connect
+def handle_task_failure(sender=None, task_id=None, exception=None, args=None, kwargs=None, traceback=None, einfo=None, **extra):
+    """
+    Automatic Operational Alerting Hook:
+    Intercepts any background Celery task failure and dispatches structured operational alerts
+    to stderr/logs (and Slack if SLACK_WEBHOOK_URL is configured).
+    """
+    task_name = sender.name if sender else "UnknownTask"
+    error_msg = (
+        f"🚨 *[CELERY FAILURE]* Task `{task_name}` (ID: `{task_id}`) failed in production!\n"
+        f"*Args*: `{args}`\n"
+        f"*Kwargs*: `{kwargs}`\n"
+        f"*Exception*: `{exception}`"
+    )
+    logger.critical(error_msg, exc_info=True)
+    
+    slack_webhook = os.getenv("SLACK_WEBHOOK_URL")
+    if slack_webhook:
         try:
-            campaign = db.query(models.Campaign).filter(
-                models.Campaign.id == campaign_id
-            ).first()
-            if campaign and campaign.status not in [
-                models.CampaignStatus.COMPLETED,
-                models.CampaignStatus.FAILED
-            ]:
-                campaign.status = models.CampaignStatus.FAILED
-                db.commit()
-                logger.error(f"[TERMINAL FAILURE] Campaign {campaign_id} marked FAILED "
-                             f"after exhausting all retries. Root cause: {exc}")
-        except Exception as db_err:
-            logger.critical(f"[TERMINAL FAILURE] Could not update campaign status: {db_err}")
-        finally:
-            db.close()
+            import httpx
+            payload = {
+                "attachments": [
+                    {
+                        "title": f"🚨 Background Operational Alert - Task Failure",
+                        "text": error_msg,
+                        "color": "#FF0000",
+                        "mrkdwn_in": ["text"]
+                    }
+                ]
+            }
+            httpx.post(slack_webhook, json=payload, timeout=5.0)
+        except Exception as slack_err:
+            logger.error(f"Failed to dispatch Slack webhook notification for Celery error: {slack_err}")
 
 
 celery_app = Celery(
@@ -132,9 +167,9 @@ celery_app.conf.task_routes = {
 }
 
 celery_app.conf.beat_schedule = {
-    "poll-inboxes-every-20-minutes": {
+    "poll-inboxes-every-2-minutes": {
         "task": "app.workers.tasks.inbox_worker.poll_all_users_task",
-        "schedule": 1200.0,
+        "schedule": 120.0,
     },
     "check-meetings-every-30-minutes": {
         "task": "app.workers.tasks.reminders_worker.check_upcoming_meetings_task",

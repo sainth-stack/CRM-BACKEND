@@ -15,7 +15,8 @@ from app.core.logging_config import logger
 from app.core.security import acquire_lock, release_lock
 from app.core.token_service import TokenService
 from app.db import models
-from app.db.database import SessionLocal
+from app.workers.config.celery_app import celery_app
+from app.workers.utils import db_session
 from app.integrations.cal import cal_provider
 from app.integrations.gmail import GmailProvider
 from app.integrations.hubspot import hubspot_provider
@@ -43,8 +44,7 @@ def _lock_query(query, *, skip_locked: bool = False):
 
 @celery_app.task
 def check_upcoming_meetings_task():
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         now = datetime.datetime.now(UTC)
         booked_dm_ids = (
             db.query(models.DecisionMaker.id)
@@ -73,8 +73,6 @@ def check_upcoming_meetings_task():
                     _send_reminder(db, dm, "1h")
                     dm.reminder_1h_sent = True
                     db.commit()
-    finally:
-        db.close()
 
 
 def _send_reminder(db, dm, reminder_type: str):

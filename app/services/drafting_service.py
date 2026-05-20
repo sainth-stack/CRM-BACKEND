@@ -105,7 +105,7 @@ class DraftingService:
         STRICT CONSTRAINTS:
         - NO placeholders whatsoever. 
         - DO NOT include bracketed signature blocks. 
-        - Sign off using only the Brand Name: "{sender_name}".
+        - Sign off using only the Brand Name: "{sender_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
         - Tone: Senior, direct, insight-driven. Zero marketing fluff.
         - LENGTH: 100-120 words.
         """)
@@ -136,7 +136,8 @@ class DraftingService:
                 })
             
             # Clean single line breaks to prevent jagged hard-wrapping on UI
-            cleaned_body = re.sub(r'(?<!\n)\n(?!\n)', ' ', drafts.body)
+            from app.agents.email_drafter import clean_email_body
+            cleaned_body = clean_email_body(drafts.body)
             
             # 3. Post-process into a structured response for workers
             final_drafts = {

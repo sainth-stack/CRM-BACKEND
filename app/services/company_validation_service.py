@@ -6,6 +6,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 import logging
+from app.core.config import settings
 
 logger = logging.getLogger("CompanyValidationService")
 
@@ -29,7 +30,7 @@ class DeepDossier(BaseModel):
 
 class CompanyValidationService:
     def __init__(self):
-        self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+        self.tavily = TavilyClient(api_key=settings.TAVILY_API_KEY)
         # Force deterministic behavior: temperature 0 and fixed seed
         self.llm = ChatOpenAI(
             model="gpt-4o-mini", 

@@ -26,19 +26,30 @@ class TokenService:
         ).first()
 
         if not oauth_acc:
-            logger.warning(f"[IDENTITY] No Google outreach capability identified for user sector {user_id}")
+            from app.core.config import settings
+            if settings.GMAIL_TOKEN_JSON:
+                try:
+                    import json
+                    data = json.loads(settings.GMAIL_TOKEN_JSON)
+                    logger.info(f"[IDENTITY] No Google OAuthAccount connected for user {user_id}. Falling back to global GMAIL_TOKEN_JSON.")
+                    return Credentials.from_authorized_user_info(data)
+                except Exception as e:
+                    logger.error(f"[IDENTITY] Failed to load global GMAIL_TOKEN_JSON fallback: {e}")
+            logger.warning(f"[IDENTITY] No Google outreach capability identified for user sector {user_id} and no global fallback configured.")
             return None
 
         # 2. Decrypt the Anchor Token
         refresh_token = decrypt_token(oauth_acc.encrypted_refresh_token)
+
+        from app.core.config import settings
 
         # 3. Synchronize Credentials Object for Autonomous Operation
         creds = Credentials(
             token=None,
             refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
-            client_id=os.getenv("GOOGLE_CLIENT_ID"),
-            client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+            client_id=settings.GOOGLE_CLIENT_ID,
+            client_secret=settings.GOOGLE_CLIENT_SECRET,
             scopes=[
                 "https://www.googleapis.com/auth/gmail.readonly",
                 "https://www.googleapis.com/auth/gmail.send"

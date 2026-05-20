@@ -408,6 +408,7 @@ def get_me(current_user: models.User = Depends(get_current_user), db: Session = 
     Identity Profile Audit.
     Retrieves the authenticated actor's profile, including role-based capabilities and trial boundary status.
     """
+    from app.core.config import settings
     oauth_account = db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == current_user.id).first()
     has_mailbox = oauth_account is not None
     has_calendar = current_user.cal_refresh_token is not None
@@ -1059,17 +1060,36 @@ def connect_cal_calendar(
 
 @capability_router.get("/cal/status")
 def get_cal_status(
+    db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
     """
     Returns the current Cal.com integration status.
+    Includes reauth_required flag when tokens have been auto-cleared due to expiry.
     """
+    from app.core.config import settings
     is_connected = current_user.cal_refresh_token is not None
     return {
         "connected": is_connected,
-        "cal_event_type_id": current_user.cal_event_type_id,
-        "cal_timezone": current_user.cal_timezone
+        "cal_event_type_id": current_user.cal_event_type_id or settings.CAL_EVENT_TYPE_ID,
+        "cal_timezone": current_user.cal_timezone or settings.CAL_TIMEZONE,
+        "reauth_required": not is_connected and current_user.cal_event_type_id is not None,
     }
+
+
+@capability_router.get("/cal/event-types")
+def get_cal_event_types(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Fetches all event types from the user's connected Cal.com account.
+    """
+    from app.integrations.cal import cal_provider
+    if not current_user.cal_refresh_token:
+        return {"event_types": []}
+    event_types = cal_provider.get_event_types(db, current_user)
+    return {"event_types": event_types}
 
 
 @capability_router.post("/cal/settings")

@@ -57,14 +57,14 @@ class GmailProvider:
         try:
             service = build('gmail', 'v1', credentials=self.creds)
             
-            # 1. High-Performance Query: Filter for unread messages only if cursor is active
-            query = "label:INBOX"
+            # 1. High-Performance Query: recent unread inbox messages only
+            query = "label:INBOX newer_than:30d"
             if unread_only:
                 query += " label:UNREAD"
                 
             messages = []
             next_page = None
-            # Limit to 5 pages (75 messages) per poll for safety
+            # Limit to 5 pages (75 messages) per poll
             for _ in range(5):
                 results = service.users().messages().list(
                     userId='me', q=query, maxResults=15, pageToken=next_page

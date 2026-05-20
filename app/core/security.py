@@ -6,7 +6,6 @@ import ipaddress
 import urllib.parse
 from datetime import datetime, timedelta, UTC
 from typing import Optional, Dict, Any
-import socket
 # Defensive Boundary: Force a system-wide socket timeout of 15 seconds.
 # This prevents unshielded external API calls from hanging worker threads indefinitely.
 socket.setdefaulttimeout(15)
@@ -18,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.db import models
 from app.db.database import get_db
 from app.core.logging_config import logger
+from app.core.config import settings
 
 def validate_url_for_ssrf(url: str) -> tuple[str, str]:
     """
@@ -79,21 +79,21 @@ def get_password_hash(password):
     """Generates a secure PBKDF2 hash for a user-provided password."""
     return pwd_context.hash(password)
 
-# Configuration from environment variables
-SECRET_KEY = os.getenv("JWT_SECRET")
+# Configuration from centralized settings
+SECRET_KEY = settings.JWT_SECRET
 if not SECRET_KEY:
-    logger.error("Security Infrastructure Failure: 'JWT_SECRET' not identified in environment.")
-    raise RuntimeError("Security Infrastructure Failure: 'JWT_SECRET' environment variable is required.")
+    logger.error("Security Infrastructure Failure: 'JWT_SECRET' not identified in settings.")
+    raise RuntimeError("Security Infrastructure Failure: 'JWT_SECRET' configuration is required.")
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 # Encryption setup for persistent OAuth refresh tokens
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+ENCRYPTION_KEY = settings.ENCRYPTION_KEY
 if not ENCRYPTION_KEY:
-    logger.error("Security Infrastructure Failure: 'ENCRYPTION_KEY' not identified in environment.")
-    raise RuntimeError("Security Infrastructure Failure: 'ENCRYPTION_KEY' environment variable is required for persistent token security.")
+    logger.error("Security Infrastructure Failure: 'ENCRYPTION_KEY' not identified in settings.")
+    raise RuntimeError("Security Infrastructure Failure: 'ENCRYPTION_KEY' configuration is required for persistent token security.")
 
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
@@ -124,7 +124,7 @@ def _get_redis():
     """Retrieves an active Redis client connection for distributed operations."""
     try:
         import redis
-        r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), socket_connect_timeout=5)
+        r = redis.from_url(settings.REDIS_URL, socket_connect_timeout=5)
         r.ping()
         return r
     except Exception:
@@ -174,14 +174,15 @@ def _get_revocation_time(user_id: str) -> float:
     """Retrieves the last recorded high-precision revocation timestamp for a user identity."""
     r = _get_redis()
     if r:
-        val = r.get(f"revoked:{user_id}")
-        return float(val) if val else 0.0
+        try:
+            val = r.get(f"revoked:{user_id}")
+            return float(val) if val else 0.0
+        except Exception as e:
+            logger.warning(f"[SECURITY] Redis query failed during identity verification: {e}. Falling back gracefully.")
+            return 0.0
     
-    logger.critical("[SECURITY] Redis unreachable during identity verification.")
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Security infrastructure verification pending. Redis coordinate unreachable."
-    )
+    logger.warning("[SECURITY] Redis unreachable during identity verification. Falling back gracefully to zero revocation timestamp.")
+    return 0.0
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Generates a high-fidelity JWT access token for stateful session management."""

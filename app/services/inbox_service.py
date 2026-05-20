@@ -2,9 +2,6 @@ from sqlalchemy.orm import Session
 from app.db import models
 from app.core.logging_config import logger
 from app.agents.intent_classifier import classify_reply_intent, extract_schedule_info
-from app.workers.lifecycle import utcnow_naive
-from app.workers.discovery_scheduling import _process_booking, _request_scheduling_clarification
-from app.services.outreach_service import outreach_service
 import datetime
 from datetime import UTC
 
@@ -20,6 +17,10 @@ class InboxService:
         Processes a single incoming reply.
         Records communication logs, classifies intent, and triggers downstream transitions.
         """
+        from app.services.outreach_service import outreach_service
+        from app.workers.lifecycle import utcnow_naive
+        from app.workers.discovery_scheduling import _process_booking, _request_scheduling_clarification
+
         reply_received_at = reply.get("received_at") or utcnow_naive()
         
         # 1. Update State Anchors
@@ -63,12 +64,7 @@ class InboxService:
         db.flush()
 
         # 5. Transition Coordination
-        # Handle Discovery/Scheduling path vs. Standard Outreach path
-        if dm.state in [
-            models.ProspectState.DISCOVERY_CALL,
-            models.ProspectState.WAITING_FOR_REPLY,
-            models.ProspectState.DISCOVERY_EXPIRED,
-        ]:
+        if intent == "BOOKING":
             today_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d")
             extract = extract_schedule_info(
                 reply["body"],
@@ -76,9 +72,7 @@ class InboxService:
                 dm.target_company.location if dm.target_company else "Global",
             )
             
-            if intent == "NEGATIVE":
-                outreach_service.process_intent_transition(db, dm, intent)
-            elif extract and extract.get("date") and extract.get("time"):
+            if extract and extract.get("date") and extract.get("time"):
                 _process_booking(db, dm, extract)
             else:
                 _request_scheduling_clarification(db, dm, source="missing_date_or_time")

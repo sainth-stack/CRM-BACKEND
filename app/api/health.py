@@ -158,6 +158,124 @@ def get_system_metrics(
     }
 
 
+from fastapi import Response
+
+@router.get("/prometheus")
+def prometheus_metrics(
+    db: Session = Depends(get_db)
+):
+    """
+    Prometheus Exposition Text Endpoint.
+    Enables native, out-of-the-box monitoring and alerting via Prometheus and Grafana.
+    """
+    lines = []
+    
+    # 1. DB connection pool stats
+    pool_size = 0
+    checked_out = 0
+    try:
+        pool = db.bind.pool
+        pool_size = pool.size()
+        checked_out = pool.checkedout()
+    except Exception:
+        pass
+        
+    lines.append("# HELP outreach_db_pool_size Database connection pool capacity size")
+    lines.append("# TYPE outreach_db_pool_size gauge")
+    lines.append(f"outreach_db_pool_size {pool_size}")
+    
+    lines.append("# HELP outreach_db_connections_active Active checked out DB connections")
+    lines.append("# TYPE outreach_db_connections_active gauge")
+    lines.append(f"outreach_db_connections_active {checked_out}")
+
+    # 2. Redis Metrics
+    celery_len = 0
+    redis_latency = 0.0
+    daily_llm_cost = 0.0
+    total_llm_cost = 0.0
+    total_llm_tokens = 0
+    try:
+        import time
+        import datetime
+        r = _get_redis()
+        if r:
+            start_time = time.time()
+            r.ping()
+            redis_latency = (time.time() - start_time) * 1000
+            celery_len = r.llen("celery") or 0
+            
+            # AI Governance telemetry
+            today = datetime.date.today().isoformat()
+            daily_llm_cost = float(r.get(f"llm_cost:{today}") or 0.0)
+            total_llm_cost = float(r.get("llm_cost_total") or 0.0)
+            total_llm_tokens = int(r.get("llm_tokens_total") or 0)
+    except Exception:
+        pass
+        
+    lines.append("# HELP outreach_redis_latency_ms Redis connection ping latency in milliseconds")
+    lines.append("# TYPE outreach_redis_latency_ms gauge")
+    lines.append(f"outreach_redis_latency_ms {redis_latency:.2f}")
+
+    lines.append("# HELP outreach_celery_queue_length Celery default task queue length")
+    lines.append("# TYPE outreach_celery_queue_length gauge")
+    lines.append(f"outreach_celery_queue_length {celery_len}")
+
+    lines.append("# HELP outreach_llm_daily_cost_usd Daily OpenAI API cost in USD")
+    lines.append("# TYPE outreach_llm_daily_cost_usd gauge")
+    lines.append(f"outreach_llm_daily_cost_usd {daily_llm_cost:.5f}")
+
+    lines.append("# HELP outreach_llm_total_cost_usd Cumulative OpenAI API cost in USD")
+    lines.append("# TYPE outreach_llm_total_cost_usd counter")
+    lines.append(f"outreach_llm_total_cost_usd {total_llm_cost:.5f}")
+
+    lines.append("# HELP outreach_llm_total_tokens Cumulative tokens consumed across all LLM operations")
+    lines.append("# TYPE outreach_llm_total_tokens counter")
+    lines.append(f"outreach_llm_total_tokens {total_llm_tokens}")
+
+    # 3. Process Resources
+    cpu_percent = 0.0
+    mem_rss = 0.0
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        cpu_percent = process.cpu_percent(interval=0.01)
+        mem_rss = process.memory_info().rss / (1024 * 1024)
+    except Exception:
+        pass
+
+    lines.append("# HELP outreach_process_cpu_percent Process CPU utilization percentage")
+    lines.append("# TYPE outreach_process_cpu_percent gauge")
+    lines.append(f"outreach_process_cpu_percent {cpu_percent:.2f}")
+
+    lines.append("# HELP outreach_process_memory_rss_mb Process resident set memory size in megabytes")
+    lines.append("# TYPE outreach_process_memory_rss_mb gauge")
+    lines.append(f"outreach_process_memory_rss_mb {mem_rss:.2f}")
+
+    # 4. Observability Service Telemetry
+    try:
+        from app.services.observability_service import ObservabilityService
+        telemetry = ObservabilityService.get_metrics_summary()
+        
+        # Counters
+        for k, v in telemetry.get("counters", {}).items():
+            sanitized_name = k.replace(":", "_").replace("-", "_")
+            lines.append(f"# HELP outreach_{sanitized_name} Live system telemetry counter for {k}")
+            lines.append(f"# TYPE outreach_{sanitized_name} counter")
+            lines.append(f"outreach_{sanitized_name} {v}")
+            
+        # Latencies
+        for k, v in telemetry.get("latencies_avg_sec", {}).items():
+            sanitized_name = k.replace(":", "_").replace("-", "_")
+            lines.append(f"# HELP outreach_{sanitized_name}_avg_seconds Average duration latency for {k}")
+            lines.append(f"# TYPE outreach_{sanitized_name}_avg_seconds gauge")
+            lines.append(f"outreach_{sanitized_name}_avg_seconds {v:.4f}")
+    except Exception:
+        pass
+
+    content = "\n".join(lines) + "\n"
+    return Response(content=content, media_type="text/plain")
+
+
 @router.get("")
 def health():
     """System Vitality Check."""

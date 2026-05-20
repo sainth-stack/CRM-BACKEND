@@ -39,7 +39,6 @@ class OutreachService:
             # Case: Already in a discovery/waiting state, just update status
             if dm.state in [
                 models.ProspectState.DISCOVERY_CALL,
-                models.ProspectState.WAITING_FOR_REPLY,
                 models.ProspectState.DISCOVERY_EXPIRED,
             ]:
                 if dm.target_company:

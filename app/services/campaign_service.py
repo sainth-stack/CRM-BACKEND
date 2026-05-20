@@ -426,27 +426,49 @@ class CampaignService:
         try:
             total_dms = 0
             for dm_data in dms_to_create:
-                new_dm = models.DecisionMaker(
-                    campaign_id=campaign_id,
-                    target_company_id=dm_data["target_company_id"],
-                    name=dm_data["name"],
-                    position=dm_data["position"],
-                    seniority=dm_data["seniority"],
-                    location=dm_data["location"],
-                    email=dm_data["email"],
-                    phone=dm_data["phone"],
-                    company_phone=dm_data["company_phone"],
-                    linkedin=dm_data["linkedin"],
-                    time_in_role=dm_data["time_in_role"],
-                    time_at_company=dm_data["time_at_company"],
-                    is_email_verified=dm_data["is_email_verified"],
-                    relevance_score=dm_data["relevance_score"],
-                    relevance_explanation=dm_data["relevance_explanation"],
-                    status="NEW",
-                    state=models.ProspectState.NEW
-                )
-                temp_db.add(new_dm)
-                total_dms += 1
+                # Idempotency Gate: Prevent UniqueViolation on campaign_id + email
+                existing_dm = temp_db.query(models.DecisionMaker).filter(
+                    models.DecisionMaker.campaign_id == campaign_id,
+                    models.DecisionMaker.email == dm_data["email"]
+                ).first()
+                
+                if existing_dm:
+                    # Update fields to keep coordinates fresh and avoid UniqueViolations
+                    existing_dm.name = dm_data["name"]
+                    existing_dm.position = dm_data["position"]
+                    existing_dm.seniority = dm_data["seniority"]
+                    existing_dm.location = dm_data["location"]
+                    existing_dm.phone = dm_data["phone"]
+                    existing_dm.company_phone = dm_data["company_phone"]
+                    existing_dm.linkedin = dm_data["linkedin"]
+                    existing_dm.time_in_role = dm_data["time_in_role"]
+                    existing_dm.time_at_company = dm_data["time_at_company"]
+                    existing_dm.is_email_verified = dm_data["is_email_verified"]
+                    existing_dm.relevance_score = dm_data["relevance_score"]
+                    existing_dm.relevance_explanation = dm_data["relevance_explanation"]
+                    logger.info(f"[IDEMPOTENCY] Updated existing decision maker: {dm_data['email']}")
+                else:
+                    new_dm = models.DecisionMaker(
+                        campaign_id=campaign_id,
+                        target_company_id=dm_data["target_company_id"],
+                        name=dm_data["name"],
+                        position=dm_data["position"],
+                        seniority=dm_data["seniority"],
+                        location=dm_data["location"],
+                        email=dm_data["email"],
+                        phone=dm_data["phone"],
+                        company_phone=dm_data["company_phone"],
+                        linkedin=dm_data["linkedin"],
+                        time_in_role=dm_data["time_in_role"],
+                        time_at_company=dm_data["time_at_company"],
+                        is_email_verified=dm_data["is_email_verified"],
+                        relevance_score=dm_data["relevance_score"],
+                        relevance_explanation=dm_data["relevance_explanation"],
+                        status="NEW",
+                        state=models.ProspectState.NEW
+                    )
+                    temp_db.add(new_dm)
+                    total_dms += 1
 
             for co_id in company_status_updates:
                 co = temp_db.query(models.TargetCompany).filter(models.TargetCompany.id == co_id).first()
@@ -465,9 +487,9 @@ class CampaignService:
         finally:
             temp_db.close()
 
-    async def process_state_machine(self, db: Session, campaign_id: str, csv_content: str = None):
+    def process_state_machine(self, db: Session, campaign_id: str, csv_content: str = None):
         """
-        The Indestructible Orchestrator (Async V3).
+        The Indestructible Orchestrator (Sync V3).
         Checks status and executes the next logical stage based on SSoT presence.
         """
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()

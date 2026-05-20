@@ -1,12 +1,10 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 import os
-from dotenv import load_dotenv
+from app.core.config import settings
 from app.core.logging_config import logger
 
-load_dotenv()
-
-DATABASE_URL = os.getenv("NEON_DB_URL") or os.getenv("DATABASE_URL")
+DATABASE_URL = settings.NEON_DB_URL or os.getenv("DATABASE_URL")
 if DATABASE_URL:
     DATABASE_URL = DATABASE_URL.strip("'").strip('"')
 
@@ -50,4 +48,7 @@ def get_db():
     try:
         yield db
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception as e:
+            logger.warning(f"[DB] Session close encountered an exception (connection likely already terminated): {e}")

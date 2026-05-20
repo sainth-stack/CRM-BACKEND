@@ -136,14 +136,18 @@ def _process_booking(db, dm, extract):
         return
 
     user = dm.campaign.owner
-    booking = cal_provider.book_meeting(
-        db=db,
-        user=user,
-        email=dm.email,
-        name=dm.name,
-        start_time=ist_iso,
-        booking_timezone=IST_TIMEZONE,
-    )
+    try:
+        booking = cal_provider.book_meeting(
+            db=db,
+            user=user,
+            email=dm.email,
+            name=dm.name,
+            start_time=ist_iso,
+            booking_timezone=IST_TIMEZONE,
+        )
+    except Exception as e:
+        logger.error(f"[DISCOVERY] Cal.com booking failed with exception: {e}", exc_info=True)
+        booking = None
     if booking:
         transition_prospect(
             db,

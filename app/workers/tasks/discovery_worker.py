@@ -1,8 +1,7 @@
-from app.db.database import SessionLocal
 from app.db import models
 from app.workers.config.celery_app import celery_app
+from app.workers.utils import acquire_lease, release_lease, db_session
 from app.core.logging_config import logger
-from app.workers.utils import acquire_lease, release_lease
 import datetime
 from datetime import UTC
 
@@ -18,17 +17,13 @@ def find_companies_worker(self, campaign_id: str):
     if not acquire_lock(lock_key, ttl=1200): return
 
     # 1. Short read transaction to load CSV contents
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         if not campaign:
             release_lock(lock_key)
             return
-
         content = campaign.trimmed_csv_data
         csv_file_url = campaign.csv_file_url
-    finally:
-        db.close()
 
     if not content and csv_file_url:
         import os
@@ -38,30 +33,24 @@ def find_companies_worker(self, campaign_id: str):
     
     if content:
         # Load unique companies in a short read session
-        db = SessionLocal()
-        try:
+        with db_session() as db:
             from app.services.csv_service import CSVProcessingService
             csv_svc = CSVProcessingService()
             _, unique_cos = csv_svc.process_csv_content(content.encode('utf-8'), None, None, None, campaign_id, db)
-        finally:
-            db.close()
         
         # 2. Stage 3 logic runs with ZERO database sessions held
         import asyncio
         asyncio.run(campaign_service.stage_3_icp_filtering(None, campaign_id, unique_cos))
         
         # 3. Short write transaction to update campaign status and trigger state machine
-        db = SessionLocal()
-        try:
+        with db_session() as db:
             campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
             if campaign:
                 campaign.status = models.CampaignStatus.STAGE_3_ICP_FILTERED
                 db.commit()
             
             logger.info(f"✅ [STAGE 3] ICP Filtering Complete for {campaign_id}. Triggering State Machine.")
-            asyncio.run(campaign_service.process_state_machine(db, campaign_id))
-        finally:
-            db.close()
+            campaign_service.process_state_machine(db, campaign_id)
     
     release_lock(lock_key)
 
@@ -87,17 +76,14 @@ def deep_research_worker(self, campaign_id: str):
         return
 
     # 2. Short write transaction to finalize Stage 4 and pulse State Machine
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         if campaign:
             campaign.status = models.CampaignStatus.STAGE_4_RESEARCH_COMPLETE
             db.commit()
 
         logger.info(f"✅ [STAGE 4] Deep Research Complete for {campaign_id}. Triggering State Machine.")
-        asyncio.run(campaign_service.process_state_machine(db, campaign_id))
-    finally:
-        db.close()
+        campaign_service.process_state_machine(db, campaign_id)
         
     release_lock(lock_key)
 
@@ -113,17 +99,13 @@ def find_dms_worker(self, campaign_id: str):
     if not acquire_lock(lock_key, ttl=1200): return
 
     # 1. Short read transaction to load CSV data
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         if not campaign:
             release_lock(lock_key)
             return
-
         content = campaign.trimmed_csv_data
         csv_file_url = campaign.csv_file_url
-    finally:
-        db.close()
 
     if not content and csv_file_url:
         import os
@@ -133,29 +115,23 @@ def find_dms_worker(self, campaign_id: str):
     
     if content:
         # Load contacts map in a short read session
-        db = SessionLocal()
-        try:
+        with db_session() as db:
             from app.services.csv_service import CSVProcessingService
             csv_svc = CSVProcessingService()
             contacts_map, _ = csv_svc.process_csv_content(content.encode('utf-8'), None, None, None, campaign_id, db)
-        finally:
-            db.close()
         
         # 2. Stage 5 logic runs with ZERO database sessions held
         import asyncio
         asyncio.run(campaign_service.stage_5_stakeholder_ranking(None, campaign_id, contacts_map))
         
         # 3. Short write transaction to update status and trigger state machine
-        db = SessionLocal()
-        try:
+        with db_session() as db:
             campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
             if campaign:
                 campaign.status = models.CampaignStatus.STAGE_5_STAKEHOLDERS_RANKED
                 db.commit()
 
             logger.info(f"✅ [STAGE 5] Stakeholder Ranking Complete for {campaign_id}. Triggering State Machine.")
-            asyncio.run(campaign_service.process_state_machine(db, campaign_id))
-        finally:
-            db.close()
+            campaign_service.process_state_machine(db, campaign_id)
     
     release_lock(lock_key)

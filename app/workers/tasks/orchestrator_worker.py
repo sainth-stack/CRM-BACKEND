@@ -15,7 +15,7 @@ from app.core.logging_config import logger
 from app.core.security import acquire_lock, release_lock
 from app.core.token_service import TokenService
 from app.db import models
-from app.db.database import SessionLocal
+from app.workers.utils import db_session
 from app.integrations.cal import cal_provider
 from app.integrations.gmail import GmailProvider
 from app.integrations.hubspot import hubspot_provider
@@ -54,42 +54,40 @@ def _begin_outbound_dispatch(
     *,
     started_at: datetime.datetime,
 ) -> tuple[bool, str | None]:
-    dispatch_db = SessionLocal()
-    try:
-        dispatch = _lock_query(
-            dispatch_db.query(models.OutboundDispatch).filter(
-                models.OutboundDispatch.dispatch_key == dispatch_key
-            )
-        ).first()
-        if dispatch:
-            if dispatch.state == "SENT" and dispatch.message_id:
-                return False, "already_sent"
-            if (
-                dispatch.state == "IN_PROGRESS"
-                and dispatch.dispatch_started_at
-                and dispatch.dispatch_started_at >= started_at - datetime.timedelta(minutes=settings.NUDGE_DISPATCH_STALE_MINUTES)
-            ):
-                return False, "in_progress"
-        else:
-            dispatch = models.OutboundDispatch(
-                campaign_id=campaign_id,
-                dm_id=dm_id,
-                action_type=action_type,
-                dispatch_key=dispatch_key,
-            )
-            dispatch_db.add(dispatch)
+    with db_session() as dispatch_db:
+        try:
+            dispatch = _lock_query(
+                dispatch_db.query(models.OutboundDispatch).filter(
+                    models.OutboundDispatch.dispatch_key == dispatch_key
+                )
+            ).first()
+            if dispatch:
+                if dispatch.state == "SENT" and dispatch.message_id:
+                    return False, "already_sent"
+                if (
+                    dispatch.state == "IN_PROGRESS"
+                    and dispatch.dispatch_started_at
+                    and dispatch.dispatch_started_at >= started_at - datetime.timedelta(minutes=settings.NUDGE_DISPATCH_STALE_MINUTES)
+                ):
+                    return False, "in_progress"
+            else:
+                dispatch = models.OutboundDispatch(
+                    campaign_id=campaign_id,
+                    dm_id=dm_id,
+                    action_type=action_type,
+                    dispatch_key=dispatch_key,
+                )
+                dispatch_db.add(dispatch)
 
-        dispatch.state = "IN_PROGRESS"
-        dispatch.dispatch_started_at = started_at
-        dispatch.dispatch_completed_at = None
-        dispatch.dispatch_error = None
-        dispatch_db.commit()
-        return True, None
-    except Exception:
-        dispatch_db.rollback()
-        raise
-    finally:
-        dispatch_db.close()
+            dispatch.state = "IN_PROGRESS"
+            dispatch.dispatch_started_at = started_at
+            dispatch.dispatch_completed_at = None
+            dispatch.dispatch_error = None
+            dispatch_db.commit()
+            return True, None
+        except Exception:
+            dispatch_db.rollback()
+            raise
 
 
 def _mark_outbound_dispatch_state(
@@ -101,140 +99,123 @@ def _mark_outbound_dispatch_state(
     completed_at: datetime.datetime | None = None,
     error: str | None = None,
 ) -> None:
-    dispatch_db = SessionLocal()
+    with db_session() as dispatch_db:
+        try:
+            dispatch = _lock_query(
+                dispatch_db.query(models.OutboundDispatch).filter(
+                    models.OutboundDispatch.dispatch_key == dispatch_key
+                )
+            ).first()
+            if not dispatch:
+                return
+            dispatch.state = state
+            if message_id:
+                dispatch.message_id = message_id
+            if thread_id:
+                dispatch.thread_id = thread_id
+            if completed_at:
+                dispatch.dispatch_completed_at = completed_at
+            if error:
+                dispatch.dispatch_error = error[:1000]
+            dispatch_db.commit()
+        except Exception as exc:
+            dispatch_db.rollback()
+            logger.error(f"[DISPATCH] Failed to persist outbound dispatch state for {dispatch_key}: {exc}", exc_info=True)
+def _audit_single_prospect(db, candidate_id: str, now: datetime.datetime) -> None:
+    lock_key = f"orchestrator:dm:{candidate_id}"
+    if not acquire_lock(lock_key, ttl=600):
+        return
+
     try:
-        dispatch = _lock_query(
-            dispatch_db.query(models.OutboundDispatch).filter(
-                models.OutboundDispatch.dispatch_key == dispatch_key
-            )
+        dm = _lock_query(
+            db.query(models.DecisionMaker).filter(models.DecisionMaker.id == candidate_id),
+            skip_locked=True,
         ).first()
-        if not dispatch:
+        if not dm:
             return
 
-        dispatch.state = state
-        if message_id:
-            dispatch.message_id = message_id
-        if thread_id:
-            dispatch.thread_id = thread_id
-        if completed_at:
-            dispatch.dispatch_completed_at = completed_at
-        if error:
-            dispatch.dispatch_error = error[:1000]
-        dispatch_db.commit()
+        from app.workers.tasks.ghostwriter_worker import draft_followup_worker
+
+        state = dm.state
+        if state in [
+            models.ProspectState.INITIAL_SENT,
+            models.ProspectState.FOLLOWUP_ACTIVE,
+            models.ProspectState.REMINDER_1_SENT,
+            models.ProspectState.REMINDER_2_SENT,
+        ]:
+            if dm.reminder_count < 2:
+                reminder_number = dm.reminder_count + 1
+                new_state = (
+                    models.ProspectState.REMINDER_1_SENT
+                    if reminder_number == 1
+                    else models.ProspectState.REMINDER_2_SENT
+                )
+                logger.info(f"[ORCHESTRATOR] Inactivity detected for {dm.name}. Deploying Reminder #{reminder_number}")
+                _deploy_nudge(db, dm, new_state, reminder_number=reminder_number)
+            else:
+                logger.info(f"[ORCHESTRATOR] Maximum silence reached for {dm.name}. Terminating mission.")
+                terminate_prospect(
+                    db, dm,
+                    models.ProspectTerminationReason.NO_RESPONSE,
+                    retryable=True, now=now, actor="orchestrator",
+                )
+                hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (System Timeout)")
+        elif state == models.ProspectState.WAITING_FOR_REPLY:
+            reminder_number = dm.reminder_count + 1
+            logger.info(f"[ORCHESTRATOR] Discovery scheduling timeout for {dm.name}. Deploying reminder #{reminder_number}")
+            _deploy_nudge(
+                db, dm, models.ProspectState.WAITING_FOR_REPLY,
+                is_discovery=True, reminder_number=reminder_number,
+                expire_after_send=reminder_number >= 2,
+            )
+        elif state == models.ProspectState.NEUTRAL:
+            if dm.followup_count < settings.MAX_NEUTRAL_FOLLOWUPS:
+                logger.info(f"[ORCHESTRATOR] Processing Neutral persistence for {dm.name} (Nudge #{dm.followup_count + 1})")
+                draft_followup_worker(dm.id, db=db)
+            else:
+                logger.info(f"[ORCHESTRATOR] Exhausted neutral follow-ups for {dm.name}. Terminating.")
+                terminate_prospect(
+                    db, dm,
+                    models.ProspectTerminationReason.FOLLOWUP_EXHAUSTED,
+                    retryable=True, now=now, actor="orchestrator",
+                )
+                hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (Exhausted Threshold)")
+
+        db.commit()
     except Exception as exc:
-        dispatch_db.rollback()
-        logger.error(f"[DISPATCH] Failed to persist outbound dispatch state for {dispatch_key}: {exc}", exc_info=True)
+        db.rollback()
+        logger.error(f"[ORCHESTRATOR] Protocol failure for DM {candidate_id}: {exc}", exc_info=True)
     finally:
-        dispatch_db.close()
+        release_lock(lock_key)
+
+
 @celery_app.task
 def outreach_orchestrator_worker():
     """Audits the lifecycle of all active outreach prospects and triggers reminders."""
     logger.info("[ORCHESTRATOR] Auditing active outreach lifecycle...")
-    db = SessionLocal()
-    try:
-        now = utcnow_naive()
-        prospect_ids = (
-            db.query(models.DecisionMaker.id)
-            .filter(
-                models.DecisionMaker.next_action_at <= now,
-                models.DecisionMaker.state.notin_(
-                    [
-                        models.ProspectState.TERMINATED,
-                        models.ProspectState.MEETING_BOOKED,
-                        models.ProspectState.ON_HOLD,
-                        models.ProspectState.DISCOVERY_EXPIRED,
-                    ]
-                ),
+    with db_session() as db:
+        try:
+            now = utcnow_naive()
+            prospect_ids = (
+                db.query(models.DecisionMaker.id)
+                .filter(
+                    models.DecisionMaker.next_action_at <= now,
+                    models.DecisionMaker.state.notin_(
+                        [
+                            models.ProspectState.TERMINATED,
+                            models.ProspectState.MEETING_BOOKED,
+                            models.ProspectState.ON_HOLD,
+                            models.ProspectState.DISCOVERY_EXPIRED,
+                        ]
+                    ),
+                )
+                .all()
             )
-            .all()
-        )
 
-        for (candidate_id,) in prospect_ids:
-            lock_key = f"orchestrator:dm:{candidate_id}"
-            if not acquire_lock(lock_key, ttl=600):
-                continue
-
-            try:
-                dm = _lock_query(
-                    db.query(models.DecisionMaker).filter(models.DecisionMaker.id == candidate_id),
-                    skip_locked=True,
-                ).first()
-                if not dm:
-                    continue
-
-                from app.workers.tasks.ghostwriter_worker import draft_followup_worker
-
-                state = dm.state
-                if state in [
-                    models.ProspectState.INITIAL_SENT,
-                    models.ProspectState.FOLLOWUP_ACTIVE,
-                    models.ProspectState.REMINDER_1_SENT,
-                    models.ProspectState.REMINDER_2_SENT,
-                ]:
-                    if dm.reminder_count < 2:
-                        reminder_number = dm.reminder_count + 1
-                        new_state = (
-                            models.ProspectState.REMINDER_1_SENT
-                            if reminder_number == 1
-                            else models.ProspectState.REMINDER_2_SENT
-                        )
-                        logger.info(f"[ORCHESTRATOR] Inactivity detected for {dm.name}. Deploying Reminder #{reminder_number}")
-                        _deploy_nudge(
-                            db,
-                            dm,
-                            new_state,
-                            reminder_number=reminder_number,
-                        )
-                    else:
-                        logger.info(f"[ORCHESTRATOR] Maximum silence reached for {dm.name}. Terminating mission.")
-                        terminate_prospect(
-                            db,
-                            dm,
-                            models.ProspectTerminationReason.NO_RESPONSE,
-                            retryable=True,
-                            now=now,
-                            actor="orchestrator",
-                        )
-                        hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (System Timeout)")
-                elif state == models.ProspectState.WAITING_FOR_REPLY:
-                    reminder_number = dm.reminder_count + 1
-                    logger.info(f"[ORCHESTRATOR] Discovery scheduling timeout for {dm.name}. Deploying reminder #{reminder_number}")
-                    _deploy_nudge(
-                        db,
-                        dm,
-                        models.ProspectState.WAITING_FOR_REPLY,
-                        is_discovery=True,
-                        reminder_number=reminder_number,
-                        expire_after_send=reminder_number >= 2,
-                    )
-                elif state == models.ProspectState.NEUTRAL:
-                    if dm.followup_count < settings.MAX_NEUTRAL_FOLLOWUPS:
-                        logger.info(
-                            f"[ORCHESTRATOR] Processing Neutral persistence for {dm.name} (Nudge #{dm.followup_count + 1})"
-                        )
-                        draft_followup_worker(dm.id, db=db)
-                    else:
-                        logger.info(f"[ORCHESTRATOR] Exhausted neutral follow-ups for {dm.name}. Terminating.")
-                        terminate_prospect(
-                            db,
-                            dm,
-                            models.ProspectTerminationReason.FOLLOWUP_EXHAUSTED,
-                            retryable=True,
-                            now=now,
-                            actor="orchestrator",
-                        )
-                        hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (Exhausted Threshold)")
-
-                db.commit()
-            except Exception as exc:
-                db.rollback()
-                logger.error(f"[ORCHESTRATOR] Protocol failure for DM {candidate_id}: {exc}", exc_info=True)
-            finally:
-                release_lock(lock_key)
-    except Exception as exc:
-        logger.error(f"[ORCHESTRATOR] Master audit failure: {exc}", exc_info=True)
-    finally:
-        db.close()
+            for (candidate_id,) in prospect_ids:
+                _audit_single_prospect(db, candidate_id, now)
+        except Exception as exc:
+            logger.error(f"[ORCHESTRATOR] Master audit failure: {exc}", exc_info=True)
 
 
 def _apply_nudge_effects(
@@ -335,57 +316,42 @@ def _recover_nudge_persistence(
     expire_after_send: bool,
     dispatch_error: str,
 ) -> tuple[bool, list[tuple[str | None, str]]]:
-    recovery_db = SessionLocal()
-    try:
-        dm = _lock_query(
-            recovery_db.query(models.DecisionMaker)
-            .options(joinedload(models.DecisionMaker.campaign).joinedload(models.Campaign.user_intel))
-            .options(joinedload(models.DecisionMaker.target_company))
-            .filter(models.DecisionMaker.id == dm_id)
-        ).first()
-        if not dm:
-            _mark_outbound_dispatch_state(dispatch_key, "FAILED", error=dispatch_error)
-            return False, []
+    with db_session() as recovery_db:
+        try:
+            dm = _lock_query(
+                recovery_db.query(models.DecisionMaker)
+                .options(joinedload(models.DecisionMaker.campaign).joinedload(models.Campaign.user_intel))
+                .options(joinedload(models.DecisionMaker.target_company))
+                .filter(models.DecisionMaker.id == dm_id)
+            ).first()
+            if not dm:
+                _mark_outbound_dispatch_state(dispatch_key, "FAILED", error=dispatch_error)
+                return False, []
 
-        hubspot_updates = _apply_nudge_effects(
-            recovery_db,
-            dm,
-            next_state=next_state,
-            reminder_number=reminder_number,
-            subject=subject,
-            body=body,
-            message_id=message_id,
-            thread_id=thread_id,
-            sent_at=sent_at,
-            is_discovery=is_discovery,
-            expire_after_send=expire_after_send,
-        )
-        recovery_db.commit()
-        _mark_outbound_dispatch_state(
-            dispatch_key,
-            "REQUIRES_REVIEW",
-            message_id=message_id,
-            thread_id=thread_id,
-            completed_at=sent_at,
-            error=dispatch_error,
-        )
-        logger.error(
-            f"[DISPATCH] Recovered outbound nudge {dispatch_key} after post-send persistence failure."
-        )
-        return True, hubspot_updates
-    except Exception as exc:
-        recovery_db.rollback()
-        _mark_outbound_dispatch_state(
-            dispatch_key,
-            "FAILED",
-            message_id=message_id,
-            thread_id=thread_id,
-            error=f"{dispatch_error} | Recovery failure: {exc}",
-        )
-        logger.error(f"[DISPATCH] Recovery failed for outbound nudge {dispatch_key}: {exc}", exc_info=True)
-        return False, []
-    finally:
-        recovery_db.close()
+            hubspot_updates = _apply_nudge_effects(
+                recovery_db, dm,
+                next_state=next_state, reminder_number=reminder_number,
+                subject=subject, body=body, message_id=message_id,
+                thread_id=thread_id, sent_at=sent_at,
+                is_discovery=is_discovery, expire_after_send=expire_after_send,
+            )
+            recovery_db.commit()
+            _mark_outbound_dispatch_state(
+                dispatch_key, "REQUIRES_REVIEW",
+                message_id=message_id, thread_id=thread_id,
+                completed_at=sent_at, error=dispatch_error,
+            )
+            logger.error(f"[DISPATCH] Recovered outbound nudge {dispatch_key} after post-send persistence failure.")
+            return True, hubspot_updates
+        except Exception as exc:
+            recovery_db.rollback()
+            _mark_outbound_dispatch_state(
+                dispatch_key, "FAILED",
+                message_id=message_id, thread_id=thread_id,
+                error=f"{dispatch_error} | Recovery failure: {exc}",
+            )
+            logger.error(f"[DISPATCH] Recovery failed for outbound nudge {dispatch_key}: {exc}", exc_info=True)
+            return False, []
 
 
 def _deploy_nudge(
@@ -511,21 +477,17 @@ def _deploy_nudge(
 
 @celery_app.task
 def reactivate_terminated_prospects_task():
-    db = SessionLocal()
-    try:
-        from app.workers.tasks.ghostwriter_worker import draft_followup_worker
-
-        prospects = reactivate_due_prospects(db)
-        db.commit()
-
-        for dm in prospects:
-            draft_followup_worker(dm.id, db=db)
-            hubspot_provider.update_lead_status(dm.hubspot_id, "Reactivated")
-    except Exception as exc:
-        db.rollback()
-        logger.error(f"[RETRY] Reactivation cycle failed: {exc}", exc_info=True)
-    finally:
-        db.close()
+    with db_session() as db:
+        try:
+            from app.workers.tasks.ghostwriter_worker import draft_followup_worker
+            prospects = reactivate_due_prospects(db)
+            db.commit()
+            for dm in prospects:
+                draft_followup_worker(dm.id, db=db)
+                hubspot_provider.update_lead_status(dm.hubspot_id, "Reactivated")
+        except Exception as exc:
+            db.rollback()
+            logger.error(f"[RETRY] Reactivation cycle failed: {exc}", exc_info=True)
 
 @celery_app.task
 def check_all_inactivity_task():

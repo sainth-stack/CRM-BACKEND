@@ -15,7 +15,7 @@ from app.core.logging_config import logger
 from app.core.security import acquire_lock, release_lock
 from app.core.token_service import TokenService
 from app.db import models
-from app.db.database import SessionLocal
+from app.workers.utils import db_session
 from app.integrations.cal import cal_provider
 from app.integrations.gmail import GmailProvider
 from app.integrations.hubspot import hubspot_provider
@@ -128,93 +128,90 @@ def poll_inbox_task(self, user_id: str):
         logger.debug(f"[SENTINEL] Lock active for user {user_id}. Skipping.")
         return
 
-    db = SessionLocal()
-    try:
-        creds = TokenService.get_google_credentials(db, user_id)
-        if not creds:
-            logger.warning(f"[SENTINEL] No credentials for user {user_id}.")
-            return
+    with db_session() as db:
+        try:
+            creds = TokenService.get_google_credentials(db, user_id)
+            if not creds:
+                logger.warning(f"[SENTINEL] No credentials for user {user_id}.")
+                return
 
-        provider = GmailProvider(creds)
-        scan_result = provider.scan_latest_replies()
-        _record_mailbox_health(
-            db,
-            user_id,
-            scan_result.get("status", "TRANSIENT_ERROR"),
-            scan_result.get("error"),
-        )
-        db.commit()
-
-        if scan_result.get("status") != "HEALTHY":
-            logger.warning(
-                "[SENTINEL] Gmail polling unhealthy for user %s: %s",
+            provider = GmailProvider(creds)
+            scan_result = provider.scan_latest_replies(unread_only=True)
+            _record_mailbox_health(
+                db,
                 user_id,
-                scan_result.get("error") or scan_result.get("status"),
+                scan_result.get("status", "TRANSIENT_ERROR"),
+                scan_result.get("error"),
             )
-            return
+            db.commit()
 
-        replies = scan_result.get("replies", [])
-        for reply in replies:
-            should_mark_read = False
-            dm = None
-            try:
-                with db.begin_nested():
-                    dm = _match_reply_to_prospect(db, user_id, reply)
-                    if not dm:
-                        terminated_dm = _match_reply_to_terminated_prospect(db, user_id, reply)
-                        if terminated_dm:
-                            logger.info(
-                                "[SENTINEL] Ignoring late reply for terminated prospect %s (%s).",
-                                terminated_dm.name,
-                                terminated_dm.id,
-                            )
-                            should_mark_read = True
+            if scan_result.get("status") != "HEALTHY":
+                logger.warning(
+                    "[SENTINEL] Gmail polling unhealthy for user %s: %s",
+                    user_id,
+                    scan_result.get("error") or scan_result.get("status"),
+                )
+                return
 
-                    if not dm:
-                        pass
-                    else:
-                        from app.core.logging_config import campaign_id_var
-
-                        token = campaign_id_var.set(dm.campaign_id)
-                        try:
-                            if dm.state == models.ProspectState.TERMINATED or dm.status == "TERMINATED":
-                                logger.info(f"[SENTINEL] Defensive skip: {dm.name} is terminated.")
+            replies = scan_result.get("replies", [])
+            for reply in replies:
+                should_mark_read = False
+                dm = None
+                try:
+                    with db.begin_nested():
+                        dm = _match_reply_to_prospect(db, user_id, reply)
+                        if not dm:
+                            terminated_dm = _match_reply_to_terminated_prospect(db, user_id, reply)
+                            if terminated_dm:
+                                logger.info(
+                                    "[SENTINEL] Ignoring late reply for terminated prospect %s (%s).",
+                                    terminated_dm.name,
+                                    terminated_dm.id,
+                                )
                                 should_mark_read = True
-                            else:
-                                existing_log = db.query(models.CommunicationLog).filter(
-                                    models.CommunicationLog.message_id == reply.get("message_id"),
-                                    models.CommunicationLog.direction == "RECEIVED",
-                                ).first()
-                                if existing_log:
+
+                        if not dm:
+                            pass
+                        else:
+                            from app.core.logging_config import campaign_id_var
+
+                            token = campaign_id_var.set(dm.campaign_id)
+                            try:
+                                if dm.state == models.ProspectState.TERMINATED or dm.status == "TERMINATED":
+                                    logger.info(f"[SENTINEL] Defensive skip: {dm.name} is terminated.")
                                     should_mark_read = True
                                 else:
-                                    # Delegate processing to Inbox Service
-                                    inbox_service.handle_prospect_reply(db, dm, reply)
-                                    should_mark_read = True
-                        finally:
-                            campaign_id_var.reset(token)
+                                    existing_log = db.query(models.CommunicationLog).filter(
+                                        models.CommunicationLog.message_id == reply.get("message_id"),
+                                        models.CommunicationLog.direction == "RECEIVED",
+                                    ).first()
+                                    if existing_log:
+                                        should_mark_read = True
+                                    else:
+                                        inbox_service.handle_prospect_reply(db, dm, reply)
+                                        should_mark_read = True
+                            finally:
+                                campaign_id_var.reset(token)
 
-                if not dm and not should_mark_read:
+                    if not dm and not should_mark_read:
+                        continue
+
+                    db.commit()
+                    if should_mark_read:
+                        provider.mark_as_read(reply["message_id"])
+                except Exception as exc:
+                    db.rollback()
+                    logger.error(f"[SENTINEL] Failed to process email {reply.get('message_id')}: {exc}", exc_info=True)
                     continue
 
-                db.commit()
-                if should_mark_read:
-                    provider.mark_as_read(reply["message_id"])
-            except Exception as exc:
-                db.rollback()
-                logger.error(f"[SENTINEL] Failed to process email {reply.get('message_id')}: {exc}", exc_info=True)
-                continue
-
-    except Exception as exc:
-        logger.error(f"[SENTINEL] Critical inbox sweep failure for {user_id}: {exc}", exc_info=True)
-    finally:
-        db.close()
-        release_lock(lock_key)
+        except Exception as exc:
+            logger.error(f"[SENTINEL] Critical inbox sweep failure for {user_id}: {exc}", exc_info=True)
+        finally:
+            release_lock(lock_key)
 # --- End of Inbox Polling ---
 @celery_app.task
 def poll_all_users_task():
-    db = SessionLocal()
-    try:
+    with db_session() as db:
         users = (
             db.query(models.User.id, models.User.is_demo, models.User.demo_expires_at)
             .join(models.OAuthAccount, models.OAuthAccount.user_id == models.User.id)
@@ -226,5 +223,3 @@ def poll_all_users_task():
                 if demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC):
                     continue
             poll_inbox_task.delay(user_id)
-    finally:
-        db.close()

@@ -10,9 +10,9 @@ from app.core.logging_config import logger
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="Impersonate.*")
 warnings.filterwarnings("ignore", category=UserWarning, message="Impersonate.*")
 
-load_dotenv()
+from app.core.config import settings
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+TAVILY_API_KEY = settings.TAVILY_API_KEY
 
 from app.core.retry_utils import with_retries
 

@@ -31,6 +31,11 @@ class User(Base):
     has_used_trial_quota = Column(Boolean, default=False)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
 
+    # Business Identity Profile (used to personalize AI-generated email drafts)
+    full_name = Column(String, nullable=True)
+    company_name = Column(String, nullable=True)
+    role_title = Column(String, nullable=True)
+
     # Cal.com OAuth & Scheduling Settings
     cal_access_token = Column(String, nullable=True)
     cal_refresh_token = Column(String, nullable=True)

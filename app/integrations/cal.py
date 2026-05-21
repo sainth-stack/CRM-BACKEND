@@ -39,21 +39,42 @@ class CalProvider:
             )
             response.raise_for_status()
             body = response.json()
-            # API v2 returns { status: "success", data: { eventTypeGroups: [...] } }
-            data = body.get("data", {})
-            event_type_groups = data.get("eventTypeGroups", [])
+            # API v2 can return { status: "success", data: [...] } or { status: "success", data: { eventTypeGroups: [...] } }
+            data = body.get("data", [])
             results = []
-            for group in event_type_groups:
-                for et in group.get("eventTypes", []):
+            
+            if isinstance(data, list):
+                for et in data:
                     results.append({
                         "id": et.get("id"),
                         "title": et.get("title"),
                         "slug": et.get("slug"),
                         "duration": et.get("length") or et.get("duration"),
                     })
+            elif isinstance(data, dict):
+                # 1. Fallback for nested eventTypeGroups structure
+                event_type_groups = data.get("eventTypeGroups", [])
+                for group in event_type_groups:
+                    for et in group.get("eventTypes", []):
+                        results.append({
+                            "id": et.get("id"),
+                            "title": et.get("title"),
+                            "slug": et.get("slug"),
+                            "duration": et.get("length") or et.get("duration"),
+                        })
+                # 2. Check for direct eventTypes list in the dictionary
+                for et in data.get("eventTypes", []):
+                    results.append({
+                        "id": et.get("id"),
+                        "title": et.get("title"),
+                        "slug": et.get("slug"),
+                        "duration": et.get("length") or et.get("duration"),
+                    })
+                    
+            logger.info(f"[CAL] Successfully fetched and parsed {len(results)} event types for {user.email}")
             return results
         except Exception as e:
-            logger.error(f"[CAL] Failed to fetch event types: {e}")
+            logger.error(f"[CAL] Failed to fetch event types: {e}", exc_info=True)
             return []
 
     def get_valid_access_token(self, db, user) -> str | None:
@@ -90,7 +111,7 @@ class CalProvider:
                 else:
                     user.cal_token_expires_at = datetime.now() + timedelta(seconds=1800)
                     
-                db.flush()
+                db.commit()
                 logger.info(f"[CAL] Access token successfully refreshed for user {user.email}")
             except Exception as e:
                 error_str = str(e).lower()
@@ -106,7 +127,7 @@ class CalProvider:
                     user.cal_refresh_token = None
                     user.cal_token_expires_at = None
                     try:
-                        db.flush()
+                        db.commit()
                     except Exception:
                         pass
                 else:
@@ -161,6 +182,49 @@ class CalProvider:
         except Exception as exc:
             logger.error(f"[CAL] Availability probe failure: {exc}", exc_info=True)
             raise exc
+
+    @with_retries(max_attempts=3, base_delay=2.0)
+    def get_upcoming_available_slots(self, db, user, days_ahead: int = 7, limit: int = 5) -> list[str]:
+        token = self.get_valid_access_token(db, user)
+        if not token:
+            logger.warning("[CAL] Cannot fetch availability slots: Cal.com account not connected or token invalid. Please connect your Cal.com account in Settings.")
+            return []
+
+        event_type_id = (user.cal_event_type_id if user else None) or CAL_EVENT_TYPE_ID
+        if not event_type_id:
+            logger.warning(f"[CAL] User has no configured event type and no global CAL_EVENT_TYPE_ID fallback configured.")
+            return []
+
+        timezone_str = (user.cal_timezone if user else None) or CAL_TIMEZONE or "UTC"
+
+        start_time = (
+            datetime.now(timezone.utc) + timedelta(days=1)
+        ).replace(hour=9, minute=0, second=0, microsecond=0)
+        end_time = start_time + timedelta(days=days_ahead)
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "cal-api-version": "2024-09-04",
+            "Content-Type": "application/json"
+        }
+
+        try:
+            response = requests.get(
+                f"{self.base_url}/slots",
+                headers=headers,
+                params={
+                    "eventTypeId": event_type_id,
+                    "start": start_time.strftime("%Y-%m-%d"),
+                    "end": end_time.strftime("%Y-%m-%d"),
+                    "timeZone": timezone_str,
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            return self._extract_slots(response.json(), limit=limit)
+        except Exception as exc:
+            logger.error(f"[CAL] Availability slots fetch failure: {exc}", exc_info=True)
+            return []
 
     @with_retries(max_attempts=3, base_delay=2.0)
     def book_meeting(
@@ -284,6 +348,37 @@ class CalProvider:
                     if slot:
                         return slot
         return None
+
+    def _extract_slots(self, payload: dict, limit: int = 5) -> list[str]:
+        slots = []
+        slot_maps = []
+
+        if isinstance(payload.get("slots"), dict):
+            slot_maps.append(payload["slots"])
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            if isinstance(data.get("slots"), dict):
+                slot_maps.append(data["slots"])
+            else:
+                # API v2 shape: data is the dict with date keys
+                slot_maps.append(data)
+
+        for slot_map in slot_maps:
+            for day in sorted(slot_map.keys()):
+                # Filter out metadata keys like 'status' or 'success' if present at top level in API v2
+                if day in ("status", "success"):
+                    continue
+                entries = slot_map.get(day) or []
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    slot = self._extract_slot_value(entry)
+                    if slot:
+                        slots.append(slot)
+                        if len(slots) >= limit:
+                            return slots
+        return slots
 
     @staticmethod
     def _extract_slot_value(entry) -> str | None:

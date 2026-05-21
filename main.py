@@ -43,6 +43,14 @@ async def log_requests(request: Request, call_next):
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 ALLOWED_ORIGINS = [FRONTEND_URL, "http://localhost:5173"]
 
+# Dynamically parse ALLOWED_ORIGINS env variable (comma-separated, resilient to quotes)
+env_origins = os.getenv("ALLOWED_ORIGINS")
+if env_origins:
+    for origin in env_origins.split(","):
+        clean_origin = origin.strip().strip('"').strip("'")
+        if clean_origin and clean_origin not in ALLOWED_ORIGINS:
+            ALLOWED_ORIGINS.append(clean_origin)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,

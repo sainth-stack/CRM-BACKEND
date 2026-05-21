@@ -23,11 +23,22 @@ class Settings:
     JWT_SECRET = os.getenv("JWT_SECRET", "AI_PRIORI_ENTERPRISE_IDENT_SESSION_KEY_PRODUCTION")
     ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,https://app.ai-priori.com")
     
+    # Resolve dynamic FRONTEND_URL fallback for config properties
+    _frontend_url = os.getenv("FRONTEND_URL")
+    if not _frontend_url:
+        _env_origins = os.getenv("ALLOWED_ORIGINS")
+        if _env_origins:
+            _first_origin = _env_origins.split(",")[0].strip().strip('"').strip("'")
+            if _first_origin:
+                _frontend_url = _first_origin
+    if not _frontend_url:
+        _frontend_url = "http://localhost:5173"
+
     # 5. GOOGLE IDENTITY BRIDGE & STATELESS GMAIL CREDENTIALS
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
     VITE_GOOGLE_CLIENT_ID = os.getenv("VITE_GOOGLE_CLIENT_ID")
     GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-    GOOGLE_REDIRECT_URL = os.getenv("GOOGLE_REDIRECT_URL", "http://localhost:5173/connect-mailbox")
+    GOOGLE_REDIRECT_URL = os.getenv("GOOGLE_REDIRECT_URL", f"{_frontend_url}/connect-mailbox")
     
     GMAIL_CREDENTIALS_JSON = os.getenv("GMAIL_CREDENTIALS_JSON")
     GMAIL_TOKEN_JSON = os.getenv("GMAIL_TOKEN_JSON")
@@ -35,7 +46,7 @@ class Settings:
     # 6. CAL.COM GATEWAY & SCHEDULING INTEGRATIONS
     CAL_CLIENT_ID = os.getenv("CAL_CLIENT_ID")
     CAL_CLIENT_SECRET = os.getenv("CAL_CLIENT_SECRET")
-    CAL_REDIRECT_URI = os.getenv("CAL_REDIRECT_URI", "http://localhost:5173/connect-calendar")
+    CAL_REDIRECT_URI = os.getenv("CAL_REDIRECT_URI", f"{_frontend_url}/connect-calendar")
     
     CAL_API_KEY = os.getenv("CAL_API_KEY")
     CAL_USERNAME = os.getenv("CAL_USERNAME")

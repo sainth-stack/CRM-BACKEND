@@ -27,13 +27,19 @@ class StorageService:
                 self.bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
                 self.region_name = os.getenv("AWS_REGION", "us-east-1")
                 
-                # Initialize S3 Client using environment parameters
-                self.s3_client = boto3.client(
-                    "s3",
-                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                    region_name=self.region_name
-                )
+                # Initialize S3 Client using environment parameters (with IAM Role fallback)
+                aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
+                aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+                
+                client_kwargs = {
+                    "region_name": self.region_name
+                }
+                
+                if aws_access_key and aws_secret_key:
+                    client_kwargs["aws_access_key_id"] = aws_access_key
+                    client_kwargs["aws_secret_access_key"] = aws_secret_key
+                    
+                self.s3_client = boto3.client("s3", **client_kwargs)
                 logger.info(f"Storage initialized in S3 mode targeting bucket: {self.bucket_name}")
 
         if self.mode == "local":

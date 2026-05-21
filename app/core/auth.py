@@ -11,11 +11,28 @@ from google_auth_oauthlib.flow import Flow
 # Environment setup
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URL", "http://localhost:5173/auth/google/callback")
+
+# Resolve FRONTEND_URL dynamically to avoid hardcoded localhost in redirects
+FRONTEND_URL = os.getenv("FRONTEND_URL")
+if not FRONTEND_URL:
+    env_origins = os.getenv("ALLOWED_ORIGINS")
+    if env_origins:
+        first_origin = env_origins.split(",")[0].strip().strip('"').strip("'")
+        if first_origin:
+            FRONTEND_URL = first_origin
+if not FRONTEND_URL:
+    FRONTEND_URL = "http://localhost:5173"
+
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URL")
+if not GOOGLE_REDIRECT_URI:
+    GOOGLE_REDIRECT_URI = f"{FRONTEND_URL}/auth/google/callback"
 
 CAL_CLIENT_ID = os.getenv("CAL_CLIENT_ID")
 CAL_CLIENT_SECRET = os.getenv("CAL_CLIENT_SECRET")
-CAL_REDIRECT_URI = os.getenv("CAL_REDIRECT_URI", "http://localhost:5173/connect-calendar")
+
+CAL_REDIRECT_URI = os.getenv("CAL_REDIRECT_URI")
+if not CAL_REDIRECT_URI:
+    CAL_REDIRECT_URI = f"{FRONTEND_URL}/connect-calendar"
 
 # Extra scopes for mailbox connection
 MAILBOX_SCOPES = [

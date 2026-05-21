@@ -224,7 +224,7 @@ def draft_emails_worker(self, campaign_id: str):
         _update_campaign_draft_status(db, campaign_id, lock_key)
 
 
-def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False):
+def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, alternative_slots: list = None):
     """
     Persistence Engine: Nudge Dispatcher.
     Also handles 'Manual Coordination' fallbacks when the auto-booking probe fails.
@@ -255,19 +255,26 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False):
         else:
             nudge_num = 0 # Coordination request
 
+        user_name = campaign.owner.full_name if campaign.owner else None
+        if not user_name:
+            user_name = campaign.owner.email.split('@')[0] if campaign.owner and campaign.owner.email else "Account Manager"
+
         draft_data = draft_followup_email(
             user_intel=user_intel,
             dm_info={"name": dm.name},
             target_company_name=dm.target_company.name,
             thread_history=history_text,
             followup_number=nudge_num,
-            manual_scheduling=manual_scheduling
+            manual_scheduling=manual_scheduling,
+            alternative_slots=alternative_slots,
+            user_name=user_name
         )
 
         if draft_data:
             from sqlalchemy.exc import IntegrityError
             try:
                 draft_index = _next_discovery_draft_index(db, dm.id) if manual_scheduling else dm.followup_count
+                coordination_dispatch_state = "REQUIRES_REVIEW" if manual_scheduling else "IDLE"
                 new_draft = models.EmailDraft(
                     campaign_id=campaign.id,
                     decision_maker_id=dm.id,
@@ -275,9 +282,25 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False):
                     body=draft_data["body"],
                     status="DRAFTED",
                     followup_index=draft_index,
-                    draft_type="FOLLOWUP" if not manual_scheduling else "DISCOVERY"
+                    draft_type="FOLLOWUP" if not manual_scheduling else "DISCOVERY",
+                    dispatch_state=coordination_dispatch_state
                 )
                 db.add(new_draft)
+                
+                if manual_scheduling:
+                    if alternative_slots:
+                        slot_list = ", ".join(alternative_slots)
+                        dm.scheduling_note = (
+                            f"[ACTION REQUIRED] Prospect requested a slot outside your available calendar hours. "
+                            f"Alternative slots suggested in draft: {slot_list}. "
+                            f"Review and send the coordination email manually."
+                        )
+                    else:
+                        dm.scheduling_note = (
+                            f"[ACTION REQUIRED] Booking failed and no alternative slots could be fetched from Cal.com. "
+                            f"Prospect is requesting a call - please check your Cal.com calendar and coordinate manually."
+                        )
+                    logger.info(f"[DISCOVERY] Coordination draft flagged REQUIRES_REVIEW for {dm.name}")
                 
                 if manual_scheduling:
                     transition_prospect(
@@ -286,9 +309,9 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False):
                         state=models.ProspectState.DISCOVERY_CALL,
                         status="COORDINATION_DRAFTED",
                         reason="DISCOVERY_DRAFTED",
-                            actor="ghostwriter",
-                            metadata={"draft_type": "DISCOVERY", "draft_index": draft_index},
-                        )
+                        actor="ghostwriter",
+                        metadata={"draft_type": "DISCOVERY", "draft_index": draft_index, "requires_review": True},
+                    )
                     dm.next_action_at = None
                 else:
                     transition_prospect(
@@ -348,6 +371,10 @@ def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
             "deep_research": user_intel_obj.deep_research
         }
 
+        user_real_name = campaign.owner.full_name if campaign.owner else None
+        if not user_real_name:
+            user_real_name = campaign.owner.email.split('@')[0] if campaign.owner and campaign.owner.email else "Account Manager"
+
         last_reply = db.query(models.CommunicationLog).filter(
             models.CommunicationLog.dm_id == dm.id,
             models.CommunicationLog.direction == "RECEIVED"
@@ -359,7 +386,8 @@ def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
             dm_position=dm.position,
             target_company=dm.target_company.name,
             last_interest=last_reply.body if last_reply else "Interest in AI solutions",
-            booked_link=dm.meeting_link if is_auto_booking else None
+            booked_link=dm.meeting_link if is_auto_booking else None,
+            user_real_name=user_real_name
         )
 
         if draft:

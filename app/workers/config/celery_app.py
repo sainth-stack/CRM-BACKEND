@@ -122,6 +122,7 @@ celery_app = Celery(
         "app.workers.tasks.orchestrator_worker",
         "app.workers.tasks.reminders_worker",
         "app.workers.tasks.sweeper_worker",
+        "app.workers.tasks.token_refresh_worker",
     ],
     task_cls=CampaignBaseTask
 )
@@ -164,27 +165,32 @@ celery_app.conf.task_routes = {
     "app.workers.tasks.orchestrator_worker.*": {"queue": "orchestrator"},
     "app.workers.tasks.reminders_worker.*": {"queue": "orchestrator"},
     "app.workers.tasks.sweeper_worker.*": {"queue": "orchestrator"},
+    "app.workers.tasks.token_refresh_worker.*": {"queue": "orchestrator"},
 }
 
 celery_app.conf.beat_schedule = {
-    "poll-inboxes-every-2-minutes": {
+    "poll-inboxes-every-10-minutes": {
         "task": "app.workers.tasks.inbox_worker.poll_all_users_task",
-        "schedule": 120.0,
+        "schedule": 600.0,
     },
-    "check-meetings-every-30-minutes": {
+    "check-meetings-every-60-minutes": {
         "task": "app.workers.tasks.reminders_worker.check_upcoming_meetings_task",
-        "schedule": 1800.0,
+        "schedule": 3600.0,
     },
     "check-inactivity-every-30-minutes": {
         "task": "app.workers.tasks.orchestrator_worker.check_all_inactivity_task",
         "schedule": 1800.0,
     },
-    "reactivate-terminated-every-6-hours": {
+    "reactivate-terminated-every-24-hours": {
         "task": "app.workers.tasks.orchestrator_worker.reactivate_terminated_prospects_task",
-        "schedule": 21600.0,
+        "schedule": 86400.0,
     },
-    "sweep-stuck-campaigns-every-15-minutes": {
+    "sweep-stuck-campaigns-every-30-minutes": {
         "task": "app.workers.tasks.sweeper_worker.sweep_stuck_campaigns_task",
-        "schedule": 900.0,
+        "schedule": 1800.0,
+    },
+    "refresh-oauth-tokens-every-6-hours": {
+        "task": "app.workers.tasks.token_refresh_worker.refresh_expiring_tokens_task",
+        "schedule": 21600.0,  # 6 hours in seconds
     },
 }

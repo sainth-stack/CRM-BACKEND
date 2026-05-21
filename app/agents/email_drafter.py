@@ -49,7 +49,11 @@ NARRATIVE STRATEGY:
 STRICT CONSTRAINTS:
 1. NO PLACEHOLDERS. (No [Name], [Company Name], etc.). 
 2. NO generic openers like "Hope this finds you well" or "I was doing research".
-3. NO signature blocks. End with just "{user_company_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
+3. Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
+   "Best regards,
+   
+   {user_name}
+   {user_company_name}"
 4. Tone: Senior, direct, and insight-driven. Avoid "marketing-speak".
 5. Paragraph Formatting: Each paragraph must be a single continuous string. Use double line breaks (\\n\\n) between sections.
 6. Length: Under 150 words.
@@ -59,7 +63,7 @@ FOLLOW_UP_PROMPT = """You are a World-Class Persistence Ghostwriter.
 Your task is to draft a short, convincing follow-up email.
 
 MODE: {outreach_mode}
-(Mode 'NUDGE' = persistence on a thread. Mode 'COORDINATION' = auto-booking failed, need to ask for their time manually).
+(Mode 'NUDGE' = persistence on a thread. Mode 'COORDINATION' = booking attempt failed, the requested slot was not available in our calendar. We need to offer specific alternative slots or request them.)
 
 Our Company Info:
 - Name: {user_company_name}
@@ -74,16 +78,26 @@ Communication History (Most recent first):
 
 {progress_context}
 
+ALTERNATIVE AVAILABLE SLOTS:
+{alternative_slots_context}
+
 STRATEGY:
 - Be polite and professional.
-    - If MODE is 'COORDINATION': Acknowledge the specific day/time availability they just shared in the latest communication log (e.g., "Wednesday at 3 PM EST"). Politely apologize for a quick calendar synchronization issue on our end, confirm that this time works perfectly, and let them know you are sending over a calendar invitation directly to their inbox. Keep it direct and natural.
+- If MODE is 'COORDINATION':
+    - If alternative slots are provided: Politely state that the specific time they requested was not available on our calendar. Offer the listed alternative slots as concrete options for them to choose from. Keep the tone warm and professional.
+    - If alternative slots are NOT provided (the list says 'None available'): Politely apologize that the requested slot didn't fit our current calendar, and ask them to suggest 2-3 alternative times that work for them, or share a link to check a common time.
+    - DO NOT claim the requested time 'works perfectly'. DO NOT say you will send a calendar invite if no booking was confirmed.
 - If MODE is 'NUDGE': Directly address the prospect's previous neutral points. Re-iterate strategic match.
 - The goal is a "Discovery Call".
 
 STRICT CONSTRAINTS:
 1. NO PLACEHOLDERS.
-2. NO bracketed signatures. Just the company name "{user_company_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
-3. Keep length under 100 words.
+2. Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
+   "Best regards,
+   
+   {user_name}
+   {user_company_name}"
+3. Keep length under 120 words.
 4. STRICT FORMATTING: Do NOT use mid-paragraph line breaks. Each paragraph must be a single continuous string. Only use double line breaks (\\n\\n) to separate sections.
 5. Return ONLY the JSON with subject and body.
 """
@@ -95,24 +109,35 @@ def clean_email_body(body: str) -> str:
     body = body.replace("\r\n", "\n")
     body = re.sub(r'\n{3,}', '\n\n', body)
     
+    # 1. Look for signature block starting with a signoff keyword at the end
+    signoff_pattern = r'\n+(best regards|best|sincerely|regards|thanks|warmly|cheers|best wishes),?\s*\n\s*(.+)$'
+    match = re.search(signoff_pattern, body, re.IGNORECASE | re.DOTALL)
+    
+    signature_block = ""
+    if match:
+        full_match = match.group(0)
+        body = body[:match.start()]
+        sign_off = match.group(1)
+        sig_lines = match.group(2).strip()
+        signature_block = f"\n\n{sign_off.capitalize()},\n\n{sig_lines}"
+        
+    # 2. Clean main paragraphs
     parts = body.split('\n\n')
     cleaned_parts = []
     for part in parts:
         part = part.strip()
         if not part:
             continue
+        cleaned_part = re.sub(r'(?<!\n)\n(?!\n)', ' ', part)
+        cleaned_parts.append(cleaned_part)
         
-        # Protect signature blocks from having newlines stripped/mangled into a single line
-        sign_off_match = re.search(r'^(best regards|best|sincerely|regards|thanks|warmly|cheers|best wishes),?\s*\n\s*(.+)$', part, re.IGNORECASE)
-        if sign_off_match:
-            sign_off = sign_off_match.group(1)
-            company = sign_off_match.group(2)
-            cleaned_parts.append(f"{sign_off},\n\n{company}")
-        else:
-            cleaned_part = re.sub(r'(?<!\n)\n(?!\n)', ' ', part)
-            cleaned_parts.append(cleaned_part)
-            
-    return '\n\n'.join(cleaned_parts).strip()
+    cleaned_body = '\n\n'.join(cleaned_parts).strip()
+    
+    # 3. Re-append protected signature block
+    if signature_block:
+        cleaned_body += signature_block
+        
+    return cleaned_body
 
 
 from pydantic import BaseModel, Field
@@ -121,7 +146,7 @@ class EmailDraftResponse(BaseModel):
     subject: str = Field(description="The personalized email subject line")
     body: str = Field(description="The full, hyper-personalized email body")
 
-def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_name: str, intel_hooks: dict):
+def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_name: str, intel_hooks: dict, user_name: str = "Account Manager"):
     """Generates a hyper-personalized outreach draft for a stakeholder using V2 hooks."""
     structured_llm = llm.with_structured_output(EmailDraftResponse)
     prompt = ChatPromptTemplate.from_template(EMAIL_DRAFTER_PROMPT)
@@ -143,7 +168,8 @@ def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_nam
                 "growth_hooks": ", ".join(intel_hooks.get("growth_hooks", [])),
                 "pain_hooks": ", ".join(intel_hooks.get("pain_hooks", [])),
                 "news_hooks": ", ".join(intel_hooks.get("news_hooks", [])),
-                "opportunity_reason": intel_hooks.get("opportunity_reason", "")
+                "opportunity_reason": intel_hooks.get("opportunity_reason", ""),
+                "user_name": user_name
             }),
             fallback=None,
         )
@@ -156,14 +182,22 @@ def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_nam
         logger.error(f"[GHOSTWRITER] Outreach drafting critical failure: {e}", exc_info=True)
         return None
 
-def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: str, thread_history: str, followup_number: int, manual_scheduling: bool = False):
+def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: str, thread_history: str, followup_number: int, manual_scheduling: bool = False, alternative_slots: list = None, user_name: str = "Account Manager"):
     """Drafts contextual follow-up emails based on previous thread history."""
     structured_llm = llm.with_structured_output(EmailDraftResponse)
     prompt = ChatPromptTemplate.from_template(FOLLOW_UP_PROMPT)
     chain = prompt | structured_llm
     
     mode = "COORDINATION" if manual_scheduling else "NUDGE"
-    progress = f"Current Progress: This is Follow-up #{followup_number} of 11." if not manual_scheduling else "Context: Manual scheduling request."
+    progress = f"Current Progress: This is Follow-up #{followup_number} of 11." if not manual_scheduling else "Context: Manual scheduling coordination required — booking attempt failed or slot was unavailable."
+
+    if manual_scheduling and alternative_slots:
+        slots_formatted = "\n".join([f"- {s}" for s in alternative_slots])
+        alternative_slots_context = f"The following slots are confirmed available in our calendar. Offer these to the prospect:\n{slots_formatted}"
+    elif manual_scheduling:
+        alternative_slots_context = "None available — ask the prospect to suggest 2-3 times that work for them."
+    else:
+        alternative_slots_context = "N/A (NUDGE mode — no slot coordination needed)"
 
     try:
         logger.info(f"[GHOSTWRITER] Drafting {mode} email for {dm_info.get('name')} (Followup #{followup_number})...")
@@ -177,7 +211,9 @@ def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: s
                 "dm_company": target_company_name,
                 "thread_history": thread_history,
                 "followup_number": followup_number,
-                "progress_context": progress
+                "progress_context": progress,
+                "alternative_slots_context": alternative_slots_context,
+                "user_name": user_name
             }),
             fallback=None,
         )
@@ -194,7 +230,7 @@ class NudgeDraftResponse(BaseModel):
     subject: str = Field(description="The short nudge subject")
     body: str = Field(description="The short nudge body")
 
-def draft_nudge_email(dm_name: str, user_company_name: str):
+def draft_nudge_email(dm_name: str, user_company_name: str, user_name: str = "Account Manager"):
     """Generates short inbox nudges for non-responsive prospects."""
     structured_llm = llm.with_structured_output(NudgeDraftResponse)
     prompt = ChatPromptTemplate.from_template("""
@@ -205,7 +241,11 @@ def draft_nudge_email(dm_name: str, user_company_name: str):
     
     STRICT CONSTRAINTS:
     1. NO PLACEHOLDERS.
-    2. NO bracketed signatures. Just the company name "{user_company_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
+    2. Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
+       "Best regards,
+       
+       {user_name}
+       {user_company_name}"
     4. STRICT FORMATTING: No mid-paragraph breaks. Just a single block of text for the body.
     5. Return ONLY the JSON.
     """)
@@ -214,17 +254,17 @@ def draft_nudge_email(dm_name: str, user_company_name: str):
         logger.info(f"[GHOSTWRITER] Generating inbox nudge for {dm_name}...")
         response = run_openai_guarded(
             "nudge_generation",
-            lambda: chain.invoke({"dm_name": dm_name, "user_company_name": user_company_name}),
+            lambda: chain.invoke({"dm_name": dm_name, "user_company_name": user_company_name, "user_name": user_name}),
             fallback=None,
         )
         if response and hasattr(response, 'body'):
             return clean_email_body(response.body)
-        return f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"
+        return f"Hi {dm_name}, just bringing this to the top of your inbox.\n\nBest regards,\n\n{user_name}\n{user_company_name}"
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Nudge generation compromised: {e}")
-        return f"Hi {dm_name}, just bringing this to the top of your inbox. Best, {user_company_name}"
+        return f"Hi {dm_name}, just bringing this to the top of your inbox.\n\nBest regards,\n\n{user_name}\n{user_company_name}"
 
-def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, target_company: str, last_interest: str, booked_link: str = None):
+def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, target_company: str, last_interest: str, booked_link: str = None, user_real_name: str = "Account Manager"):
     """
     Discovery Protocol: Interest-to-Call Conversion Agent.
     Drafts the formal request for a discovery call based on captured interest.
@@ -253,7 +293,11 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
     
     STRICT CONSTRAINTS:
     1. NO PLACEHOLDERS.
-    2. End with Brand Name: "{user_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
+    2. Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
+       "Best regards,
+       
+       {user_real_name}
+       {user_name}"
     3. Keep it under 80 words.
     4. Never ask the prospect to share "2-3 time slots" or "multiple slots". Strictly ask them for a single convenient timeslot or time to connect (e.g. "Please let me know a convenient time for you").
     5. STRICT FORMATTING: Do NOT use mid-paragraph line breaks or random newlines. Each paragraph must be a single continuous string. Only use double line breaks (\\n\\n) to separate sections.
@@ -276,7 +320,8 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
                 "dm_position": dm_position,
                 "target_company": target_company,
                 "last_interest": last_interest,
-                "booking_context": booking_context
+                "booking_context": booking_context,
+                "user_real_name": user_real_name
             }),
             fallback=None,
         )

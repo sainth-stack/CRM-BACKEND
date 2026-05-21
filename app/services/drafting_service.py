@@ -54,6 +54,12 @@ class DraftingService:
             sender_name = user_intel.company_name
             sender_services = user_intel.offerings
             sender_map = json.dumps(user_intel.v2_intel.get("capability_to_pain_map", [])) if user_intel.v2_intel else "[]"
+            
+            # Fetch campaign owner name
+            user_name = campaign.owner.full_name if campaign.owner else None
+            if not user_name:
+                user_name = campaign.owner.email.split('@')[0] if campaign.owner and campaign.owner.email else "Account Manager"
+
             prospect_name = dm.name
             target_company_name = target_co.name
             prospect_role = dm.position or "Executive"
@@ -102,10 +108,14 @@ class DraftingService:
         - Paragraph 2: The 'Business Case'. Link your service ({sender_services}) to a specific pain hypothesis derived from the research.
         - Paragraph 3: The 'Direct Ask'. Suggest a low-friction conversation based on their opportunity reason ({opportunity_reason}).
 
-        STRICT CONSTRAINTS:
+         STRICT CONSTRAINTS:
         - NO placeholders whatsoever. 
         - DO NOT include bracketed signature blocks. 
-        - Sign off using only the Brand Name: "{sender_name}". DO NOT invent, include, or refer to any individual human sender name, employee name, or personal signature under any circumstances.
+        - Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
+          "Best regards,
+          
+          {user_name}
+          {sender_name}"
         - Tone: Senior, direct, insight-driven. Zero marketing fluff.
         - LENGTH: 100-120 words.
         """)
@@ -132,7 +142,8 @@ class DraftingService:
                     "growth_hooks": growth_hooks,
                     "pain_hooks": pain_hooks,
                     "news_hooks": news_hooks,
-                    "opportunity_reason": opportunity_reason
+                    "opportunity_reason": opportunity_reason,
+                    "user_name": user_name
                 })
             
             # Clean single line breaks to prevent jagged hard-wrapping on UI

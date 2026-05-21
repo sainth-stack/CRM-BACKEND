@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Body, Request, Qu
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import aliased
 from typing import Dict, Any
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator
 import datetime
 from datetime import UTC, timedelta
 import random
@@ -40,7 +40,16 @@ def _lock_query(query):
         return query.with_for_update()
     return query
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+# Resolve FRONTEND_URL dynamically to avoid hardcoded localhost in email setup links
+FRONTEND_URL = os.getenv("FRONTEND_URL")
+if not FRONTEND_URL:
+    env_origins = os.getenv("ALLOWED_ORIGINS")
+    if env_origins:
+        first_origin = env_origins.split(",")[0].strip().strip('"').strip("'")
+        if first_origin:
+            FRONTEND_URL = first_origin
+if not FRONTEND_URL:
+    FRONTEND_URL = "http://localhost:5173"
 
 def issue_refresh_token(db: Session, user_id: str) -> str:
     """
@@ -439,7 +448,70 @@ def get_me(current_user: models.User = Depends(get_current_user), db: Session = 
         "demo_expires_at": current_user.demo_expires_at,
         "is_expired": is_expired,
         "has_used_trial_quota": current_user.has_used_trial_quota,
-        "created_at": current_user.created_at
+        "created_at": current_user.created_at,
+        "full_name": current_user.full_name,
+        "company_name": current_user.company_name,
+        "role_title": current_user.role_title,
+        "profile_complete": bool(current_user.full_name and current_user.company_name and current_user.role_title),
+    }
+
+# --- Business Identity Profile ---
+# Used downstream by the Ghostwriter agent to personalize AI-generated email drafts.
+
+class BusinessProfileUpdate(BaseModel):
+    full_name: str = Field(..., min_length=1, max_length=120)
+    company_name: str = Field(..., min_length=1, max_length=160)
+    role_title: str = Field(..., min_length=1, max_length=120)
+
+    @field_validator("full_name", "company_name", "role_title")
+    @classmethod
+    def _strip_and_require(cls, v: str) -> str:
+        cleaned = (v or "").strip()
+        if not cleaned:
+            raise ValueError("Field cannot be empty or whitespace.")
+        return cleaned
+
+
+@router.get("/profile")
+def get_business_profile(current_user: models.User = Depends(get_current_user)):
+    """
+    Business Identity Retrieval.
+    Returns the authenticated user's business profile fields used for AI email personalization.
+    The email is sourced from the authenticated session and is non-editable.
+    """
+    return {
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "company_name": current_user.company_name,
+        "role_title": current_user.role_title,
+    }
+
+
+@router.put("/profile")
+def update_business_profile(
+    payload: BusinessProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Business Identity Persistence.
+    Persists/updates the authenticated user's business profile. Email is intentionally
+    derived from the session and is never accepted from the request body.
+    """
+    current_user.full_name = payload.full_name
+    current_user.company_name = payload.company_name
+    current_user.role_title = payload.role_title
+    db.commit()
+    db.refresh(current_user)
+
+    return {
+        "message": "Business profile saved successfully.",
+        "profile": {
+            "email": current_user.email,
+            "full_name": current_user.full_name,
+            "company_name": current_user.company_name,
+            "role_title": current_user.role_title,
+        },
     }
 
 # --- Super Admin Sovereign Management Hub ---
@@ -1068,7 +1140,13 @@ def get_cal_status(
     Includes reauth_required flag when tokens have been auto-cleared due to expiry.
     """
     from app.core.config import settings
-    is_connected = current_user.cal_refresh_token is not None
+    from app.integrations.cal import cal_provider
+
+    # Resolve active access token to verify connection integrity.
+    # If the refresh token is revoked/invalid, it will automatically clear and commit, returning None.
+    token = cal_provider.get_valid_access_token(db, current_user)
+    is_connected = token is not None
+
     return {
         "connected": is_connected,
         "cal_event_type_id": current_user.cal_event_type_id or settings.CAL_EVENT_TYPE_ID,
@@ -1124,3 +1202,52 @@ def disconnect_cal_calendar(
     current_user.cal_timezone = "UTC"
     db.commit()
     return {"message": "Cal.com calendar disconnected successfully."}
+
+
+@capability_router.post("/refresh-tokens")
+def trigger_token_refresh(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Manually trigger token refresh for the current user.
+    Useful for testing or when user experiences auth failures.
+    Returns: Status of Gmail and Calendar token refresh operations.
+    """
+    from app.core.token_service import TokenService
+    
+    results = {
+        "google": {"status": "pending"},
+        "calendar": {"status": "pending"},
+        "timestamp": datetime.datetime.now(UTC).isoformat()
+    }
+    
+    try:
+        # Attempt to refresh Gmail token
+        gmail_success = TokenService.refresh_and_update_access(
+            db, current_user.id, provider="google"
+        )
+        results["google"]["status"] = "refreshed" if gmail_success else "failed"
+        logger.info(f"[TOKEN-REFRESH] Manual Gmail refresh for user {current_user.id}: {results['google']['status']}")
+    except Exception as e:
+        results["google"]["status"] = "error"
+        results["google"]["error"] = str(e)
+        logger.error(f"[TOKEN-REFRESH] Error during Gmail refresh for user {current_user.id}: {e}")
+    
+    try:
+        # Verify Cal.com token
+        cal_success = TokenService.refresh_and_update_access(
+            db, current_user.id, provider="cal.com"
+        )
+        results["calendar"]["status"] = "verified" if cal_success else "invalid"
+        logger.info(f"[TOKEN-REFRESH] Manual Cal.com verification for user {current_user.id}: {results['calendar']['status']}")
+    except Exception as e:
+        results["calendar"]["status"] = "error"
+        results["calendar"]["error"] = str(e)
+        logger.error(f"[TOKEN-REFRESH] Error during Cal.com verification for user {current_user.id}: {e}")
+    
+    return {
+        "message": "Token refresh completed",
+        "results": results,
+        "next_auto_refresh": (datetime.datetime.now(UTC) + timedelta(hours=6)).isoformat()
+    }

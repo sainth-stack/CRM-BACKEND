@@ -391,6 +391,10 @@ def _deploy_nudge(
     try:
         from app.agents.email_drafter import draft_nudge_email
 
+        user_name = dm.campaign.owner.full_name if dm.campaign.owner else None
+        if not user_name:
+            user_name = dm.campaign.owner.email.split('@')[0] if dm.campaign.owner and dm.campaign.owner.email else "Account Manager"
+
         last_sent = (
             db.query(models.CommunicationLog)
             .filter(
@@ -406,10 +410,13 @@ def _deploy_nudge(
                 f"Hi {dm.name},\n\n"
                 f"Just checking whether you had a chance to share a few time options for the discovery call "
                 f"with {dm.campaign.user_intel.company_name}.\n\n"
-                "Happy to work around your schedule.\n"
+                "Happy to work around your schedule.\n\n"
+                "Best regards,\n\n"
+                f"{user_name}\n"
+                f"{dm.campaign.user_intel.company_name}"
             )
         else:
-            body = draft_nudge_email(dm.name, dm.campaign.user_intel.company_name)
+            body = draft_nudge_email(dm.name, dm.campaign.user_intel.company_name, user_name)
         subject = f"Re: {last_sent.subject}" if last_sent else "Checking in"
 
         creds = TokenService.get_google_credentials(db, dm.campaign.user_id)

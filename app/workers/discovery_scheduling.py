@@ -89,11 +89,35 @@ def _resolve_schedule_timezone(dm, extract: dict | None) -> str:
     return _resolve_timezone_from_location(company_location)
 
 
-def _request_scheduling_clarification(db, dm, *, source: str):
+def format_slots_for_prospect(slots: list[str], tz_str: str) -> list[str]:
+    import pytz
+    
+    formatted = []
+    try:
+        target_tz = pytz.timezone(tz_str)
+    except Exception:
+        target_tz = pytz.timezone("UTC")
+        
+    for slot in slots:
+        try:
+            dt = date_parser.parse(slot)
+            if dt.tzinfo is None:
+                dt = pytz.UTC.localize(dt)
+            localized_dt = dt.astimezone(target_tz)
+            tz_display = localized_dt.strftime("%Z") or tz_str
+            formatted_str = localized_dt.strftime(f"%A, %B %d at %I:%M %p {tz_display}")
+            formatted.append(formatted_str)
+        except Exception as e:
+            logger.error(f"[DISCOVERY] Error formatting slot '{slot}': {e}")
+            
+    return formatted
+
+
+def _request_scheduling_clarification(db, dm, *, source: str, alternative_slots: list[str] = None):
     from app.workers.tasks.ghostwriter_worker import draft_followup_worker
 
     logger.info(
-        f"[DISCOVERY] Scheduling reply for {dm.name} is missing date/time details. Requesting next-week availability."
+        f"[DISCOVERY] Scheduling reply for {dm.name} is missing details or slot unavailable. Mode: {source}"
     )
 
     dm.termination_reason = None
@@ -114,36 +138,44 @@ def _request_scheduling_clarification(db, dm, *, source: str):
         metadata={"source": source, "source_state": dm.state.value if dm.state else None},
     )
     dm.next_action_at = None
-    draft_followup_worker(dm.id, db=db, manual_scheduling=True)
+    draft_followup_worker(dm.id, db=db, manual_scheduling=True, alternative_slots=alternative_slots)
 
 
 def _process_booking(db, dm, extract):
     source_tz_str = _resolve_schedule_timezone(dm, extract)
     source_tz = pytz.timezone(source_tz_str)
-    ist_tz = pytz.timezone(IST_TIMEZONE)
+
+    user = dm.campaign.owner
+    user_tz_str = (user.cal_timezone if user else None) or "UTC"
+    try:
+        user_tz = pytz.timezone(user_tz_str)
+    except Exception:
+        user_tz_str = "UTC"
+        user_tz = pytz.utc
 
     try:
         naive_dt = date_parser.parse(f"{extract['date']} {extract['time']}")
         localized_dt = source_tz.localize(naive_dt)
-        ist_dt = localized_dt.astimezone(ist_tz)
-        utc_dt = ist_dt.astimezone(pytz.UTC)
-        ist_iso = ist_dt.isoformat()
+        user_dt = localized_dt.astimezone(user_tz)
+        utc_dt = user_dt.astimezone(pytz.UTC)
+        user_iso = user_dt.isoformat()
         dm.scheduling_note = (
-            f"Scheduling reply resolved in {source_tz_str} and converted to {IST_TIMEZONE} for booking."
+            f"Scheduling reply resolved in {source_tz_str} and converted to {user_tz_str} for booking."
         )
     except Exception:
-        _request_scheduling_clarification(db, dm, source="date_time_parse_recheck")
+        raw_slots = cal_provider.get_upcoming_available_slots(db, user, limit=5)
+        alternative_slots = format_slots_for_prospect(raw_slots, source_tz_str) if raw_slots else None
+        _request_scheduling_clarification(db, dm, source="date_time_parse_recheck", alternative_slots=alternative_slots)
         return
 
-    user = dm.campaign.owner
     try:
         booking = cal_provider.book_meeting(
             db=db,
             user=user,
             email=dm.email,
             name=dm.name,
-            start_time=ist_iso,
-            booking_timezone=IST_TIMEZONE,
+            start_time=user_iso,
+            booking_timezone=user_tz_str,
         )
     except Exception as e:
         logger.error(f"[DISCOVERY] Cal.com booking failed with exception: {e}", exc_info=True)
@@ -162,7 +194,7 @@ def _process_booking(db, dm, extract):
         dm.retry_after = None
         dm.meeting_link = booking["link"]
         dm.scheduled_time_utc = utc_dt.replace(tzinfo=None)
-        dm.display_timezone = IST_TIMEZONE
+        dm.display_timezone = user_tz_str
         dm.next_action_at = None
         if dm.target_company:
             dm.target_company.status = "MEETING_BOOKED"
@@ -170,4 +202,6 @@ def _process_booking(db, dm, extract):
             hubspot_provider.update_lead_status(sibling.hubspot_id, "Terminated (Internal Lead Secured)")
         hubspot_provider.update_lead_status(dm.hubspot_id, "Meeting Booked")
     else:
-        _request_scheduling_clarification(db, dm, source="booking_retry_required")
+        raw_slots = cal_provider.get_upcoming_available_slots(db, user, limit=5)
+        alternative_slots = format_slots_for_prospect(raw_slots, source_tz_str) if raw_slots else None
+        _request_scheduling_clarification(db, dm, source="booking_retry_required", alternative_slots=alternative_slots)

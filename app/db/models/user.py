@@ -69,6 +69,8 @@ class OAuthAccount(Base):
     provider = Column(String)
     email_address = Column(String) # Email of the connected mailbox
     encrypted_refresh_token = Column(Text, nullable=False)
+    access_token = Column(Text, nullable=True)
+    token_expiry = Column(DateTime, nullable=True)
     mailbox_health_status = Column(String, default="UNKNOWN", index=True)
     mailbox_last_checked_at = Column(DateTime, nullable=True)
     mailbox_last_error = Column(Text, nullable=True)

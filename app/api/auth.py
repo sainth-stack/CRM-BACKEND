@@ -1003,11 +1003,15 @@ def connect_google_mailbox(
     ).first()
 
     encrypted_token = encrypt_token(refresh_token)
+    access_token_encrypted = encrypt_token(mailbox_data.get("access_token")) if mailbox_data.get("access_token") else None
+    token_expiry_dt = datetime.datetime.now(UTC).replace(tzinfo=None) + datetime.timedelta(seconds=3600)
 
     if oauth_acc:
         logger.info(f"[VAULT UPDATE] Updating established capability for user_id={current_user.id}")
         oauth_acc.email_address = email
         oauth_acc.encrypted_refresh_token = encrypted_token
+        oauth_acc.access_token = access_token_encrypted
+        oauth_acc.token_expiry = token_expiry_dt
         oauth_acc.mailbox_health_status = "HEALTHY"
         oauth_acc.mailbox_last_checked_at = datetime.datetime.now(UTC).replace(tzinfo=None)
         oauth_acc.mailbox_last_error = None
@@ -1018,6 +1022,8 @@ def connect_google_mailbox(
             provider="google",
             email_address=email,
             encrypted_refresh_token=encrypted_token,
+            access_token=access_token_encrypted,
+            token_expiry=token_expiry_dt,
             mailbox_health_status="HEALTHY",
             mailbox_last_checked_at=datetime.datetime.now(UTC).replace(tzinfo=None),
             mailbox_last_error=None,

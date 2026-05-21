@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
+from google.auth.exceptions import RefreshError
 from app.core.circuit_breaker import (
     CircuitBreakerConfig,
     circuit_is_open,
@@ -167,6 +168,9 @@ def _parse_internal_date(value):
 
 
 def _classify_gmail_scan_error(error: Exception) -> tuple[str, str]:
+    if isinstance(error, RefreshError):
+        return "AUTH_ERROR", f"Token has been expired or revoked: {str(error)}"
+
     if isinstance(error, HttpError):
         status_code = getattr(getattr(error, "resp", None), "status", None)
         details = ""

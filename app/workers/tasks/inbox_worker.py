@@ -151,6 +151,17 @@ def poll_inbox_task(self, user_id: str):
                     user_id,
                     scan_result.get("error") or scan_result.get("status"),
                 )
+                if scan_result.get("status") == "AUTH_ERROR":
+                    logger.warning(f"[SENTINEL] Auth failure detected. Deleting Google OAuth credentials for user {user_id}.")
+                    try:
+                        db.query(models.OAuthAccount).filter(
+                            models.OAuthAccount.user_id == user_id,
+                            models.OAuthAccount.provider == "google"
+                        ).delete()
+                        db.commit()
+                    except Exception as exc:
+                        db.rollback()
+                        logger.error(f"[SENTINEL] Failed to clear Google OAuth account for user {user_id}: {exc}")
                 return
 
             replies = scan_result.get("replies", [])

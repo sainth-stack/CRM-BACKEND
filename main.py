@@ -41,7 +41,12 @@ async def log_requests(request: Request, call_next):
 
 # --- CORS (Env-configured, production-safe) ---
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-ALLOWED_ORIGINS = [FRONTEND_URL, "http://localhost:5173"]
+_is_production = os.getenv("ENVIRONMENT", "development").lower() == "production"
+
+# In development always include localhost; in production only env-configured origins.
+ALLOWED_ORIGINS = [FRONTEND_URL]
+if not _is_production:
+    ALLOWED_ORIGINS.append("http://localhost:5173")
 
 # Dynamically parse ALLOWED_ORIGINS env variable (comma-separated, resilient to quotes)
 env_origins = os.getenv("ALLOWED_ORIGINS")

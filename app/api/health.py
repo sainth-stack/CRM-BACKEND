@@ -280,3 +280,44 @@ def prometheus_metrics(
 def health():
     """System Vitality Check."""
     return {"status": "ok"}
+
+
+@router.post("/fix-stuck-timezones")
+def fix_stuck_timezones(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    One-shot maintenance endpoint.
+    Clears the 'UTC' fallback stored on DMs that have a location string,
+    so the timezone resolver re-runs geopy on the next dispatch attempt
+    and can correctly assign e.g. Europe/London for United Kingdom prospects.
+    Restricted to SUPER_ADMIN.
+    """
+    if current_user.role != models.UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Restricted to super-admins.")
+
+    affected = (
+        db.query(models.DecisionMaker)
+        .filter(
+            models.DecisionMaker.display_timezone == "UTC",
+            models.DecisionMaker.location.isnot(None),
+            models.DecisionMaker.location != "",
+        )
+        .all()
+    )
+
+    cleared = []
+    for dm in affected:
+        dm.display_timezone = None
+        cleared.append({"id": dm.id, "name": dm.name, "location": dm.location})
+
+    db.commit()
+    return {
+        "cleared_count": len(cleared),
+        "message": (
+            "display_timezone reset to NULL for all DMs with a location that were "
+            "stuck on UTC. Timezone will be re-resolved on next dispatch attempt."
+        ),
+        "affected": cleared,
+    }

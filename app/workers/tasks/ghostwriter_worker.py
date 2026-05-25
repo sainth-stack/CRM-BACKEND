@@ -1,5 +1,5 @@
 from app.db import models
-from app.agents.email_drafter import draft_personalized_email, draft_followup_email, draft_nudge_email, draft_discovery_request
+from app.agents.email_drafter import draft_personalized_email, draft_followup_email, draft_discovery_request
 from app.services.drafting_service import DraftingService
 from app.workers.config.celery_app import celery_app
 from app.core.logging_config import logger
@@ -243,12 +243,21 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, 
             "deep_research": campaign.user_intel.deep_research
         }
 
+        tc = dm.target_company
+        target_company_intel = {
+            "research_summary": (tc.research_summary or "") if tc else "",
+            "growth_hooks": (tc.growth_hooks or []) if tc else [],
+            "pain_hooks": (tc.pain_hooks or []) if tc else [],
+            "news_hooks": (tc.news_hooks or []) if tc else [],
+            "opportunity_reason": (tc.opportunity_reason or "") if tc else "",
+        }
+
         logs = db.query(models.CommunicationLog).filter(
             models.CommunicationLog.dm_id == dm.id
         ).order_by(models.CommunicationLog.received_at.desc()).limit(5).all()
 
         history_text = "\n".join([f"{log.direction}: {log.body}" for log in logs])
-        
+
         if not manual_scheduling:
             dm.followup_count += 1
             nudge_num = dm.followup_count
@@ -262,12 +271,13 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, 
         draft_data = draft_followup_email(
             user_intel=user_intel,
             dm_info={"name": dm.name},
-            target_company_name=dm.target_company.name,
+            target_company_name=tc.name if tc else "",
             thread_history=history_text,
             followup_number=nudge_num,
             manual_scheduling=manual_scheduling,
             alternative_slots=alternative_slots,
-            user_name=user_name
+            user_name=user_name,
+            target_company_intel=target_company_intel,
         )
 
         if draft_data:

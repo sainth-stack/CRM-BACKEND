@@ -32,3 +32,6 @@ pandas
 openpyxl
 boto3
 psutil
+geopy
+timezonefinder
+httpx

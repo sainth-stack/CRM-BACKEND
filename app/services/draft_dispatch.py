@@ -256,8 +256,6 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
         prospect_email = db_draft.dm.email if db_draft.dm else None
         if not prospect_email:
             raise ValueError("Deployment coordinate (Email) missing. Please refine and synchronize stakeholder data.")
-        if not db_draft.is_approved:
-            raise PermissionError("Explicit approval required prior to live email engagement.")
 
         if not acquire_lock(lock_key, ttl=120):
             return {"status": "in_progress", "message": "Draft deployment lock already held."}

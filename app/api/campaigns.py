@@ -546,9 +546,132 @@ def update_campaign(
         db_campaign.target_location = sanitize_text(update.target_location, max_length=200)
 
     db.commit()
-    
+
     # Re-trigger validation if prompt was updated
     if update.prompt:
         validate_input_worker.delay(campaign_id)
-        
+
     return {"message": "Campaign updated successfully"}
+
+
+# ---------------------------------------------------------------------------
+# Dispatch All: bulk-schedule every pending DRAFTED email in a campaign
+# ---------------------------------------------------------------------------
+
+@router.post("/{campaign_id}/drafts/dispatch-all")
+@limiter.limit("5/minute")
+def dispatch_all_drafts(
+    request: Request,
+    campaign_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Bulk-schedule all pending DRAFTED emails in a campaign.
+    Runs the same timezone-aware delivery-window logic as the individual Deploy button.
+    Skips drafts that are already queued, in-progress, or already sent.
+    Returns a count summary so the frontend can display results.
+    """
+    import pytz
+    from app.core.scheduler import (
+        resolve_prospect_timezone,
+        calculate_next_send_slot,
+        format_scheduled_display,
+    )
+    from app.services.draft_dispatch import queue_draft_dispatch
+    from app.workers.tasks.outbound_worker import send_draft_worker
+
+    campaign = db.query(models.Campaign).filter(
+        models.Campaign.id == campaign_id,
+        get_visibility_filter(db, current_user),
+    ).first()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    # All drafts that are still waiting to be sent
+    pending_drafts = (
+        db.query(models.EmailDraft)
+        .filter(
+            models.EmailDraft.campaign_id == campaign_id,
+            models.EmailDraft.status == "DRAFTED",
+        )
+        .all()
+    )
+
+    scheduled, skipped, errors = [], [], []
+
+    for draft in pending_drafts:
+        draft_id = draft.id
+        dm = draft.dm
+
+        # Skip drafts missing an email address — cannot send
+        if not dm or not dm.email:
+            skipped.append({"draft_id": draft_id, "reason": "no_email"})
+            continue
+
+        # Transition to QUEUED (also catches already-sent / in-progress states)
+        queued_at = datetime.datetime.now(UTC).replace(tzinfo=None)
+        queue_state = queue_draft_dispatch(db, draft, queued_at=queued_at)
+
+        if queue_state == "already_sent":
+            skipped.append({"draft_id": draft_id, "dm_name": dm.name, "reason": "already_sent"})
+            continue
+        if queue_state in ("in_progress", "requires_review"):
+            skipped.append({"draft_id": draft_id, "dm_name": dm.name, "reason": queue_state})
+            continue
+        if queue_state == "queued" and draft.scheduled_at:
+            # Already has a slot — count as scheduled and move on
+            prospect_tz = dm.display_timezone or "UTC"
+            scheduled.append({
+                "draft_id": draft_id,
+                "dm_name": dm.name,
+                "display": format_scheduled_display(draft.scheduled_at, prospect_tz),
+                "timezone": prospect_tz,
+            })
+            continue
+
+        # Resolve timezone + pick next available delivery-window slot
+        try:
+            prospect_tz = resolve_prospect_timezone(db, dm)
+            slot = calculate_next_send_slot(campaign.user_id, prospect_tz, db)
+            draft.scheduled_at = slot
+            db.commit()
+
+            send_draft_worker.apply_async(
+                args=[draft_id],
+                eta=slot.replace(tzinfo=pytz.UTC),
+            )
+
+            scheduled.append({
+                "draft_id": draft_id,
+                "dm_name": dm.name,
+                "display": format_scheduled_display(slot, prospect_tz),
+                "timezone": prospect_tz,
+            })
+            logger.info(
+                f"[DISPATCH-ALL] Draft {draft_id} scheduled at {slot} UTC "
+                f"(tz: {prospect_tz}) for {dm.name}"
+            )
+        except Exception as exc:
+            db.rollback()
+            # Mark the draft as FAILED so it surfaces in the UI
+            try:
+                draft.dispatch_state = "FAILED"
+                draft.dispatch_error = f"Batch dispatch error: {str(exc)}"[:1000]
+                db.commit()
+            except Exception:
+                db.rollback()
+            logger.error(
+                f"[DISPATCH-ALL] Failed to schedule draft {draft_id}: {exc}",
+                exc_info=True,
+            )
+            errors.append({"draft_id": draft_id, "dm_name": dm.name if dm else "?", "reason": str(exc)[:120]})
+
+    return {
+        "scheduled_count": len(scheduled),
+        "skipped_count": len(skipped),
+        "error_count": len(errors),
+        "scheduled": scheduled,
+        "skipped": skipped,
+        "errors": errors,
+    }

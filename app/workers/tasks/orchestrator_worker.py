@@ -14,12 +14,14 @@ from app.core.email_service import email_service
 from app.core.logging_config import logger
 from app.core.security import acquire_lock, release_lock
 from app.core.token_service import TokenService
+from app.core.scheduler import resolve_prospect_timezone, calculate_next_send_slot, format_scheduled_display
 from app.db import models
 from app.workers.utils import db_session
 from app.integrations.cal import cal_provider
 from app.integrations.gmail import GmailProvider
 from app.integrations.hubspot import hubspot_provider
 from app.workers.config.celery_app import celery_app
+import pytz
 from app.workers.lifecycle import (
     hold_company_siblings,
     reactivate_due_prospects,
@@ -53,6 +55,7 @@ def _begin_outbound_dispatch(
     dispatch_key: str,
     *,
     started_at: datetime.datetime,
+    initial_state: str = "QUEUED",
 ) -> tuple[bool, str | None]:
     with db_session() as dispatch_db:
         try:
@@ -64,6 +67,8 @@ def _begin_outbound_dispatch(
             if dispatch:
                 if dispatch.state == "SENT" and dispatch.message_id:
                     return False, "already_sent"
+                if dispatch.state == "QUEUED":
+                    return False, "already_queued"
                 if (
                     dispatch.state == "IN_PROGRESS"
                     and dispatch.dispatch_started_at
@@ -79,7 +84,7 @@ def _begin_outbound_dispatch(
                 )
                 dispatch_db.add(dispatch)
 
-            dispatch.state = "IN_PROGRESS"
+            dispatch.state = initial_state
             dispatch.dispatch_started_at = started_at
             dispatch.dispatch_completed_at = None
             dispatch.dispatch_error = None
@@ -98,6 +103,7 @@ def _mark_outbound_dispatch_state(
     thread_id: str | None = None,
     completed_at: datetime.datetime | None = None,
     error: str | None = None,
+    scheduled_at: datetime.datetime | None = None,
 ) -> None:
     with db_session() as dispatch_db:
         try:
@@ -117,6 +123,8 @@ def _mark_outbound_dispatch_state(
                 dispatch.dispatch_completed_at = completed_at
             if error:
                 dispatch.dispatch_error = error[:1000]
+            if scheduled_at:
+                dispatch.scheduled_at = scheduled_at
             dispatch_db.commit()
         except Exception as exc:
             dispatch_db.rollback()
@@ -373,27 +381,25 @@ def _deploy_nudge(
         action_type,
         dispatch_key,
         started_at=started_at,
+        initial_state="QUEUED",
     )
     if not allowed:
         logger.info(
             "[ORCHESTRATOR] Skipping nudge %s for %s because dispatch is %s.",
-            dispatch_key,
-            dm.name,
-            blocked_reason,
+            dispatch_key, dm.name, blocked_reason,
         )
         return False
 
-    msg_data = None
-    sent_at = None
-    subject = None
-    body = None
-    hubspot_updates: list[tuple[str | None, str]] = []
     try:
-        from app.agents.email_drafter import draft_nudge_email
+        from app.agents.email_drafter import draft_reminder_escalation_email
 
         user_name = dm.campaign.owner.full_name if dm.campaign.owner else None
         if not user_name:
-            user_name = dm.campaign.owner.email.split('@')[0] if dm.campaign.owner and dm.campaign.owner.email else "Account Manager"
+            user_name = (
+                dm.campaign.owner.email.split("@")[0]
+                if dm.campaign.owner and dm.campaign.owner.email
+                else "Account Manager"
+            )
 
         last_sent = (
             db.query(models.CommunicationLog)
@@ -416,49 +422,122 @@ def _deploy_nudge(
                 f"{dm.campaign.user_intel.company_name}"
             )
         else:
-            body = draft_nudge_email(dm.name, dm.campaign.user_intel.company_name, user_name)
+            user_intel_obj = dm.campaign.user_intel
+            tc = dm.target_company
+            body = draft_reminder_escalation_email(
+                previous_email=last_sent.body if last_sent else "",
+                user_intel={
+                    "company_name": user_intel_obj.company_name,
+                    "deep_research": user_intel_obj.deep_research or "",
+                },
+                target_company_intel={
+                    "research_summary": (tc.research_summary or "") if tc else "",
+                    "growth_hooks": (tc.growth_hooks or []) if tc else [],
+                    "pain_hooks": (tc.pain_hooks or []) if tc else [],
+                    "news_hooks": (tc.news_hooks or []) if tc else [],
+                    "opportunity_reason": (tc.opportunity_reason or "") if tc else "",
+                },
+                dm_name=dm.name,
+                target_company_name=tc.name if tc else "",
+                user_name=user_name,
+                reminder_number=reminder_number,
+            )
         subject = f"Re: {last_sent.subject}" if last_sent else "Checking in"
 
-        creds = TokenService.get_google_credentials(db, dm.campaign.user_id)
-        msg_data = email_service.send_email(
-            to_email=dm.email,
-            subject=subject,
-            body=body,
-            creds=creds,
-            thread_id=dm.thread_id,
+        # Resolve timezone and book the next available slot
+        prospect_tz = resolve_prospect_timezone(db, dm)
+        slot = calculate_next_send_slot(dm.campaign.user_id, prospect_tz, db)
+        slot_aware = slot.replace(tzinfo=pytz.UTC)
+
+        # Persist scheduled_at on the OutboundDispatch record
+        _mark_outbound_dispatch_state(dispatch_key, "QUEUED", scheduled_at=slot)
+
+        # Schedule the deferred send task
+        send_scheduled_nudge_worker.apply_async(
+            args=[
+                dm.id,
+                next_state.value,
+                reminder_number,
+                is_discovery,
+                expire_after_send,
+                subject,
+                body,
+                dispatch_key,
+                dm.campaign.user_id,
+            ],
+            eta=slot_aware,
         )
 
-        sent_at = utcnow_naive()
-        hubspot_updates = _apply_nudge_effects(
-            db,
-            dm,
-            next_state=next_state,
-            reminder_number=reminder_number,
-            subject=subject,
-            body=body,
-            message_id=msg_data["id"],
-            thread_id=msg_data.get("thread_id"),
-            sent_at=sent_at,
-            is_discovery=is_discovery,
-            expire_after_send=expire_after_send,
-        )
         db.commit()
-        _mark_outbound_dispatch_state(
-            dispatch_key,
-            "SENT",
-            message_id=msg_data["id"],
-            thread_id=msg_data.get("thread_id"),
-            completed_at=sent_at,
+        logger.info(
+            "[ORCHESTRATOR] Nudge for %s scheduled at %s UTC (tz: %s) | key: %s",
+            dm.name, slot, prospect_tz, dispatch_key,
         )
-        for hubspot_id, status in hubspot_updates:
-            hubspot_provider.update_lead_status(hubspot_id, status)
         return True
+
     except Exception as exc:
         db.rollback()
-        if msg_data and sent_at and subject is not None and body is not None:
-            recovered, recovered_updates = _recover_nudge_persistence(
-                dm.id,
-                dispatch_key,
+        _mark_outbound_dispatch_state(dispatch_key, "FAILED", error=str(exc))
+        logger.error(f"[ORCHESTRATOR] Nudge scheduling failed for {dm.name}: {exc}", exc_info=True)
+        raise
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def send_scheduled_nudge_worker(
+    self,
+    dm_id: str,
+    next_state_value: str,
+    reminder_number: int,
+    is_discovery: bool,
+    expire_after_send: bool,
+    subject: str,
+    body: str,
+    dispatch_key: str,
+    user_id: str,
+):
+    """Fires at the scheduled eta to send a nudge/reminder and apply all lifecycle effects."""
+    from sqlalchemy.orm import joinedload
+
+    with db_session() as db:
+        dm = (
+            _lock_query(
+                db.query(models.DecisionMaker)
+                .options(
+                    joinedload(models.DecisionMaker.campaign)
+                    .joinedload(models.Campaign.user_intel)
+                )
+                .options(joinedload(models.DecisionMaker.target_company))
+                .filter(models.DecisionMaker.id == dm_id),
+                skip_locked=True,
+            )
+            .first()
+        )
+        if not dm:
+            _mark_outbound_dispatch_state(dispatch_key, "FAILED", error="DM not found at send time")
+            return
+
+        dispatch = db.query(models.OutboundDispatch).filter(
+            models.OutboundDispatch.dispatch_key == dispatch_key
+        ).first()
+        if dispatch and dispatch.state == "SENT":
+            return
+
+        _mark_outbound_dispatch_state(dispatch_key, "IN_PROGRESS")
+
+        try:
+            creds = TokenService.get_google_credentials(db, user_id)
+            msg_data = email_service.send_email(
+                to_email=dm.email,
+                subject=subject,
+                body=body,
+                creds=creds,
+                thread_id=dm.thread_id,
+            )
+            sent_at = utcnow_naive()
+            next_state = models.ProspectState(next_state_value)
+
+            hubspot_updates = _apply_nudge_effects(
+                db, dm,
                 next_state=next_state,
                 reminder_number=reminder_number,
                 subject=subject,
@@ -468,19 +547,23 @@ def _deploy_nudge(
                 sent_at=sent_at,
                 is_discovery=is_discovery,
                 expire_after_send=expire_after_send,
-                dispatch_error=f"Recovered after post-send persistence error: {exc}",
             )
-            if recovered:
-                for hubspot_id, status in recovered_updates:
-                    try:
-                        hubspot_provider.update_lead_status(hubspot_id, status)
-                    except Exception:
-                        logger.warning(f"[DISPATCH] CRM sync still pending after recovery for nudge {dispatch_key}.")
-                return True
+            db.commit()
+            _mark_outbound_dispatch_state(
+                dispatch_key, "SENT",
+                message_id=msg_data["id"],
+                thread_id=msg_data.get("thread_id"),
+                completed_at=sent_at,
+            )
+            for hs_id, status in hubspot_updates:
+                hubspot_provider.update_lead_status(hs_id, status)
+            logger.info(f"[OUTBOUND] Scheduled nudge delivered for {dm.name} | key: {dispatch_key}")
 
-        _mark_outbound_dispatch_state(dispatch_key, "FAILED", error=str(exc))
-        logger.error(f"[ORCHESTRATOR] Nudge deployment failed for {dm.name}: {exc}", exc_info=True)
-        raise
+        except Exception as exc:
+            db.rollback()
+            logger.error(f"[OUTBOUND] Scheduled nudge send failed for {dm.name}: {exc}", exc_info=True)
+            _mark_outbound_dispatch_state(dispatch_key, "FAILED", error=str(exc))
+            raise self.retry(exc=exc)
 
 @celery_app.task
 def reactivate_terminated_prospects_task():

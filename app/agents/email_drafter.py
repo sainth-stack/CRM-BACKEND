@@ -59,21 +59,27 @@ STRICT CONSTRAINTS:
 6. Length: Under 150 words.
 """
 
-FOLLOW_UP_PROMPT = """You are a World-Class Persistence Ghostwriter.
-Your task is to draft a short, convincing follow-up email.
+FOLLOW_UP_PROMPT = """You are an elite B2B sales ghostwriter specializing in high-stakes follow-up sequences.
 
 MODE: {outreach_mode}
-(Mode 'NUDGE' = persistence on a thread. Mode 'COORDINATION' = booking attempt failed, the requested slot was not available in our calendar. We need to offer specific alternative slots or request them.)
+(Mode 'NUDGE' = escalating research-driven persistence. Mode 'COORDINATION' = calendar coordination after a booking failure.)
 
-Our Company Info:
+Sender Company:
 - Name: {user_company_name}
-- Research: {user_company_research}
+- Capabilities & Research: {user_company_research}
 
-Decision Maker Info:
+Prospect:
 - Name: {dm_name}
 - Company: {dm_company}
 
-Communication History (Most recent first):
+Target Company Intelligence (use for NUDGE mode — pick a fresh hook NOT already in the thread):
+- Research Summary: {target_research_summary}
+- Growth Signals: {growth_hooks}
+- Pain Indicators: {pain_hooks}
+- News / Recent Triggers: {news_hooks}
+- Strategic Opportunity: {opportunity_reason}
+
+Communication Thread (most recent first):
 {thread_history}
 
 {progress_context}
@@ -82,24 +88,33 @@ ALTERNATIVE AVAILABLE SLOTS:
 {alternative_slots_context}
 
 STRATEGY:
-- Be polite and professional.
 - If MODE is 'COORDINATION':
-    - If alternative slots are provided: Politely state that the specific time they requested was not available on our calendar. Offer the listed alternative slots as concrete options for them to choose from. Keep the tone warm and professional.
-    - If alternative slots are NOT provided (the list says 'None available'): Politely apologize that the requested slot didn't fit our current calendar, and ask them to suggest 2-3 alternative times that work for them, or share a link to check a common time.
-    - DO NOT claim the requested time 'works perfectly'. DO NOT say you will send a calendar invite if no booking was confirmed.
-- If MODE is 'NUDGE': Directly address the prospect's previous neutral points. Re-iterate strategic match.
-- The goal is a "Discovery Call".
+    - If alternative slots are provided: Politely state the requested time was not available. Offer the listed slots as concrete options. Keep tone warm and professional.
+    - If no slots available: Apologize that the slot didn't fit, ask them to suggest 2-3 alternative times.
+    - DO NOT claim the requested time works. DO NOT promise a calendar invite without a confirmed booking.
+
+- If MODE is 'NUDGE':
+    1. OPEN with a NEW signal from the target company intelligence — a growth hook, pain indicator, or news trigger NOT already used in the thread above.
+    2. BRIDGE that signal to a specific capability of {user_company_name}.
+    3. PROOF: Add a concrete proof point, outcome metric, or cost-of-inaction statement that deepens the case — something specific, not generic.
+    4. CLOSE with one direct ask for a 15-minute discovery call.
+    5. Apply the escalation level: {escalation_level}
+       - Early (#1–3): Confident, insight-led. Fresh angle each email.
+       - Mid (#4–6): More direct. Stronger hook. Reference the ongoing thread.
+       - Late (#7–9): Build urgency. Make the cost of inaction visible.
+       - Final (#10–11): Last outreach. Be direct and blunt. Give them an easy out.
 
 STRICT CONSTRAINTS:
-1. NO PLACEHOLDERS.
-2. Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
+1. NO PLACEHOLDERS. NO "Hope this finds you well". NO generic filler.
+2. For NUDGE: Do NOT repeat an angle or hook already used in the thread.
+3. Sign off EXACTLY as follows, with a double line break after 'Best regards,' and a single line break between sender name and company name:
    "Best regards,
-   
+
    {user_name}
    {user_company_name}"
-3. Keep length under 120 words.
-4. STRICT FORMATTING: Do NOT use mid-paragraph line breaks. Each paragraph must be a single continuous string. Only use double line breaks (\\n\\n) to separate sections.
-5. Return ONLY the JSON with subject and body.
+4. 150–220 words total body. This must be longer and more substantive than the initial outreach.
+5. Each paragraph is a single continuous string. Double line breaks between sections only.
+6. Return ONLY valid JSON with "subject" and "body" fields.
 """
 
 def clean_email_body(body: str) -> str:
@@ -182,12 +197,23 @@ def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_nam
         logger.error(f"[GHOSTWRITER] Outreach drafting critical failure: {e}", exc_info=True)
         return None
 
-def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: str, thread_history: str, followup_number: int, manual_scheduling: bool = False, alternative_slots: list = None, user_name: str = "Account Manager"):
-    """Drafts contextual follow-up emails based on previous thread history."""
+def _followup_escalation_level(n: int) -> str:
+    if n <= 3:
+        return f"Early Stage — Follow-up #{n} of 11. Fresh angle, confident re-engagement."
+    elif n <= 6:
+        return f"Mid Stage — Follow-up #{n} of 11. More direct, stronger hook, reference thread context."
+    elif n <= 9:
+        return f"Late Stage — Follow-up #{n} of 11. Build urgency, make the cost of inaction visible."
+    else:
+        return f"Final Stage — Follow-up #{n} of 11. Last outreach before closing. Direct, blunt, give them an easy out."
+
+
+def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: str, thread_history: str, followup_number: int, manual_scheduling: bool = False, alternative_slots: list = None, user_name: str = "Account Manager", target_company_intel: dict = None):
+    """Drafts escalating follow-up emails using research data and thread history."""
     structured_llm = llm.with_structured_output(EmailDraftResponse)
     prompt = ChatPromptTemplate.from_template(FOLLOW_UP_PROMPT)
     chain = prompt | structured_llm
-    
+
     mode = "COORDINATION" if manual_scheduling else "NUDGE"
     progress = f"Current Progress: This is Follow-up #{followup_number} of 11." if not manual_scheduling else "Context: Manual scheduling coordination required — booking attempt failed or slot was unavailable."
 
@@ -199,21 +225,33 @@ def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: s
     else:
         alternative_slots_context = "N/A (NUDGE mode — no slot coordination needed)"
 
+    tc_intel = target_company_intel or {}
+
+    def _join(val):
+        if isinstance(val, list):
+            return ", ".join(str(v) for v in val) if val else "N/A"
+        return str(val) if val else "N/A"
+
     try:
-        logger.info(f"[GHOSTWRITER] Drafting {mode} email for {dm_info.get('name')} (Followup #{followup_number})...")
+        logger.info(f"[GHOSTWRITER] Drafting {mode} email for {dm_info.get('name')} (Follow-up #{followup_number})...")
         data = run_openai_guarded(
             "followup_draft_generation",
             lambda: chain.invoke({
                 "outreach_mode": mode,
                 "user_company_name": user_intel.get("company_name", ""),
-                "user_company_research": user_intel.get("deep_research", ""),
+                "user_company_research": user_intel.get("deep_research", "") or "N/A",
                 "dm_name": dm_info.get("name", ""),
                 "dm_company": target_company_name,
+                "target_research_summary": tc_intel.get("research_summary", "") or "N/A",
+                "growth_hooks": _join(tc_intel.get("growth_hooks")),
+                "pain_hooks": _join(tc_intel.get("pain_hooks")),
+                "news_hooks": _join(tc_intel.get("news_hooks")),
+                "opportunity_reason": tc_intel.get("opportunity_reason", "") or "N/A",
                 "thread_history": thread_history,
-                "followup_number": followup_number,
                 "progress_context": progress,
+                "escalation_level": _followup_escalation_level(followup_number) if not manual_scheduling else "N/A",
                 "alternative_slots_context": alternative_slots_context,
-                "user_name": user_name
+                "user_name": user_name,
             }),
             fallback=None,
         )
@@ -226,43 +264,100 @@ def draft_followup_email(user_intel: dict, dm_info: dict, target_company_name: s
         logger.error(f"[GHOSTWRITER] Follow-up drafting failure: {e}")
         return None
 
-class NudgeDraftResponse(BaseModel):
-    subject: str = Field(description="The short nudge subject")
-    body: str = Field(description="The short nudge body")
+REMINDER_ESCALATION_PROMPT = """You are an elite B2B sales ghostwriter. A prospect did not reply to the previous email. Your job is to draft a follow-up that is MORE compelling by attacking from a DIFFERENT angle — using fresh intelligence from the target company's research data.
 
-def draft_nudge_email(dm_name: str, user_company_name: str, user_name: str = "Account Manager"):
-    """Generates short inbox nudges for non-responsive prospects."""
-    structured_llm = llm.with_structured_output(NudgeDraftResponse)
-    prompt = ChatPromptTemplate.from_template("""
-    You are a polite business assistant. 
-    Draft a extremely short (under 30 words) nudge email for {dm_name}.
-    Context: You sent an email from {user_company_name} 2 days ago and haven't heard back.
-    Goal: Politely bring the conversation to the top of their inbox.
-    
-    STRICT CONSTRAINTS:
-    1. NO PLACEHOLDERS.
-    2. Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
-       "Best regards,
-       
-       {user_name}
-       {user_company_name}"
-    4. STRICT FORMATTING: No mid-paragraph breaks. Just a single block of text for the body.
-    5. Return ONLY the JSON.
-    """)
+Sender Company:
+- Name: {user_company_name}
+- Capabilities & Research: {user_company_research}
+
+Prospect:
+- Name: {dm_name}
+- Company: {target_company_name}
+
+Target Company Intelligence:
+- Research Summary: {target_research_summary}
+- Growth Signals: {growth_hooks}
+- Pain Indicators: {pain_hooks}
+- News / Recent Triggers: {news_hooks}
+- Strategic Opportunity: {opportunity_reason}
+
+Previous Email Sent (DO NOT reuse the same angle, hook, or opening from this):
+{previous_email}
+
+Escalation Level: {escalation_level}
+- Level 1: Confident re-engagement. Lead with a fresh insight from the intelligence above. Reinforce why the timing is right.
+- Level 2: Final, direct, high-stakes pitch. Be blunt about the missed window. Create genuine urgency — not aggression. This is the last outreach before the conversation closes.
+
+MISSION:
+1. OPEN with a specific NEW signal from the target company intelligence — a growth hook, pain indicator, or news trigger NOT already used in the previous email.
+2. BRIDGE: Map that signal precisely to a capability of {user_company_name}.
+3. PROOF: Add a concrete proof point, outcome, or consequence that makes the case undeniable — a metric, a pattern seen across similar companies, or a specific cost of inaction.
+4. CLOSE: One direct, low-friction ask for a 15-minute discovery call.
+
+STRICT CONSTRAINTS:
+1. NO PLACEHOLDERS. NO "Hope this finds you well". NO generic filler.
+2. Do NOT repeat the angle, hook, or framing from the previous email.
+3. Sign off EXACTLY as follows, with a double line break after 'Best regards,' and a single line break between sender name and company name:
+   "Best regards,
+
+   {user_name}
+   {user_company_name}"
+4. 150–220 words total body. This must be longer and more substantive than the initial outreach.
+5. Each paragraph is a single continuous string. Use double line breaks between sections only.
+6. Return ONLY valid JSON with "subject" and "body" fields.
+"""
+
+def draft_reminder_escalation_email(
+    previous_email: str,
+    user_intel: dict,
+    target_company_intel: dict,
+    dm_name: str,
+    target_company_name: str,
+    user_name: str = "Account Manager",
+    reminder_number: int = 1,
+) -> str:
+    """Drafts a research-driven escalation email that hits a fresh angle from target company intel."""
+    structured_llm = llm.with_structured_output(EmailDraftResponse)
+    prompt = ChatPromptTemplate.from_template(REMINDER_ESCALATION_PROMPT)
     chain = prompt | structured_llm
+
+    escalation_level = f"Level {reminder_number} of 2"
+    growth_hooks = target_company_intel.get("growth_hooks") or []
+    pain_hooks = target_company_intel.get("pain_hooks") or []
+    news_hooks = target_company_intel.get("news_hooks") or []
+
+    def _join(val):
+        if isinstance(val, list):
+            return ", ".join(str(v) for v in val) if val else "N/A"
+        return str(val) if val else "N/A"
+
     try:
-        logger.info(f"[GHOSTWRITER] Generating inbox nudge for {dm_name}...")
-        response = run_openai_guarded(
-            "nudge_generation",
-            lambda: chain.invoke({"dm_name": dm_name, "user_company_name": user_company_name, "user_name": user_name}),
+        logger.info(f"[GHOSTWRITER] Drafting reminder escalation #{reminder_number} for {dm_name} at {target_company_name}...")
+        data = run_openai_guarded(
+            "reminder_escalation_generation",
+            lambda: chain.invoke({
+                "user_company_name": user_intel.get("company_name", ""),
+                "user_company_research": user_intel.get("deep_research", "") or "N/A",
+                "dm_name": dm_name,
+                "target_company_name": target_company_name,
+                "target_research_summary": target_company_intel.get("research_summary", "") or "N/A",
+                "growth_hooks": _join(growth_hooks),
+                "pain_hooks": _join(pain_hooks),
+                "news_hooks": _join(news_hooks),
+                "opportunity_reason": target_company_intel.get("opportunity_reason", "") or "N/A",
+                "previous_email": previous_email or "(No previous email on record)",
+                "escalation_level": escalation_level,
+                "user_name": user_name,
+            }),
             fallback=None,
         )
-        if response and hasattr(response, 'body'):
-            return clean_email_body(response.body)
-        return f"Hi {dm_name}, just bringing this to the top of your inbox.\n\nBest regards,\n\n{user_name}\n{user_company_name}"
+        if data:
+            dumped = data.model_dump()
+            return clean_email_body(dumped["body"])
+        return f"Hi {dm_name}, I wanted to follow up on my previous message.\n\nBest regards,\n\n{user_name}\n{user_intel.get('company_name', '')}"
     except Exception as e:
-        logger.error(f"[GHOSTWRITER] Nudge generation compromised: {e}")
-        return f"Hi {dm_name}, just bringing this to the top of your inbox.\n\nBest regards,\n\n{user_name}\n{user_company_name}"
+        logger.error(f"[GHOSTWRITER] Reminder escalation drafting failure: {e}")
+        return f"Hi {dm_name}, I wanted to follow up on my previous message.\n\nBest regards,\n\n{user_name}\n{user_intel.get('company_name', '')}"
 
 def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, target_company: str, last_interest: str, booked_link: str = None, user_real_name: str = "Account Manager"):
     """

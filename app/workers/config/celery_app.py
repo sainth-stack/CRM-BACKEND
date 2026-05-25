@@ -189,6 +189,11 @@ celery_app.conf.beat_schedule = {
         "task": "app.workers.tasks.sweeper_worker.sweep_stuck_campaigns_task",
         "schedule": 1800.0,
     },
+    "sweep-stranded-dispatches-every-10-minutes": {
+        "task": "app.workers.tasks.sweeper_worker.sweep_stranded_dispatches_task",
+        "schedule": 600.0,   # every 10 minutes — fast enough to recover within one window
+        "options": {"queue": "orchestrator"},
+    },
     "refresh-oauth-tokens-every-6-hours": {
         "task": "app.workers.tasks.token_refresh_worker.refresh_expiring_tokens_task",
         "schedule": 21600.0,  # 6 hours in seconds

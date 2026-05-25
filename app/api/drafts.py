@@ -4,12 +4,18 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import datetime
 from datetime import UTC
+import pytz
 
 from app.db.database import get_db
 from app.db import models
 from app.core.security import get_current_user, get_visibility_filter
 from app.core.limiter import limiter
 from app.core.logging_config import setup_logging
+from app.core.scheduler import (
+    resolve_prospect_timezone,
+    calculate_next_send_slot,
+    format_scheduled_display,
+)
 from app.services.draft_dispatch import queue_draft_dispatch
 from app.workers.tasks.outbound_worker import send_draft_worker
 
@@ -57,28 +63,6 @@ def update_draft(
     return {"message": "Email Draft updated successfully"}
 
 
-@router.post("/{draft_id}/approve")
-def approve_draft(
-    draft_id: str, 
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    """
-    Engagement Protocol Authorization.
-    Authorizes a specific draft for tactical deployment.
-    """
-    db_draft = db.query(models.EmailDraft).join(models.Campaign).filter(
-        models.EmailDraft.id == draft_id,
-        get_visibility_filter(db, current_user)
-    ).first()
-    if not db_draft:
-        raise HTTPException(status_code=404, detail="Email Draft not found")
-    
-    db_draft.is_approved = True
-    db.commit()
-    return {"message": "Email Draft authorized for deployment."}
-
-
 @router.post("/{draft_id}/send")
 @limiter.limit("10/minute")
 def send_draft(
@@ -99,15 +83,10 @@ def send_draft(
 
     if db_draft.status == "SENT" and db_draft.message_id:
         return {"message": "Engagement protocol already deployed."}
-    
-    # 1. Coordinate Validation
+
     prospect_email = db_draft.dm.email if db_draft.dm else None
     if not prospect_email:
         raise HTTPException(status_code=400, detail="Deployment coordinate (Email) missing. Please refine and synchronize stakeholder data.")
-        
-    # 1.1 Approval Boundary Enforcement
-    if not db_draft.is_approved:
-        raise HTTPException(status_code=403, detail="Operational Gate: Explicit approval required prior to live email engagement.")
 
     queue_state = queue_draft_dispatch(
         db,
@@ -116,6 +95,14 @@ def send_draft(
     )
     if queue_state == "already_sent":
         return {"message": "Engagement protocol already deployed."}
+    if queue_state == "queued" and db_draft.scheduled_at:
+        prospect_tz = db_draft.dm.display_timezone or "UTC"
+        return {
+            "message": "already_scheduled",
+            "scheduled_at": db_draft.scheduled_at.isoformat(),
+            "timezone": prospect_tz,
+            "display": format_scheduled_display(db_draft.scheduled_at, prospect_tz),
+        }
     if queue_state == "in_progress":
         raise HTTPException(status_code=429, detail="Operational Lock: This draft is currently being deployed by another worker.")
     if queue_state == "requires_review":
@@ -124,9 +111,14 @@ def send_draft(
             detail="Operational Review Required: Previous deployment attempt is still unresolved for this draft."
         )
 
+    # Resolve timezone and calculate the next available slot
+    prospect_tz = resolve_prospect_timezone(db, db_draft.dm)
+    slot = calculate_next_send_slot(db_draft.campaign.user_id, prospect_tz, db)
+    db_draft.scheduled_at = slot
+
     db.commit()
     try:
-        send_draft_worker.delay(draft_id)
+        send_draft_worker.apply_async(args=[draft_id], eta=slot.replace(tzinfo=pytz.UTC))
     except Exception as exc:
         db.rollback()
         recovery_draft = _lock_query(
@@ -137,11 +129,19 @@ def send_draft(
         ).first()
         if recovery_draft and recovery_draft.status != "SENT":
             recovery_draft.dispatch_state = "FAILED"
-            recovery_draft.dispatch_error = f"Failed to enqueue outbound delivery: {str(exc)}"[:1000]
+            recovery_draft.dispatch_error = f"Failed to schedule outbound delivery: {str(exc)}"[:1000]
             db.commit()
-        logger.error(f"[DISPATCH] Failed to enqueue draft {draft_id}: {exc}", exc_info=True)
+        logger.error(f"[DISPATCH] Failed to schedule draft {draft_id}: {exc}", exc_info=True)
         raise HTTPException(
             status_code=503,
             detail="Outbound dispatch infrastructure is temporarily unavailable. Please retry shortly.",
         )
-    return {"message": "Engagement protocol queued for deployment."}
+
+    display = format_scheduled_display(slot, prospect_tz)
+    logger.info(f"[DISPATCH] Draft {draft_id} scheduled at {slot} UTC (prospect tz: {prospect_tz})")
+    return {
+        "message": "scheduled",
+        "scheduled_at": slot.isoformat(),
+        "timezone": prospect_tz,
+        "display": display,
+    }

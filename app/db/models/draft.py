@@ -22,10 +22,11 @@ class EmailDraft(Base):
     followup_index = Column(Integer, default=0) # 0 for initial, 1-11 for follow-ups
     draft_type = Column(String, default="INITIAL") # INITIAL, FOLLOWUP, REMINDER, DISCOVERY
     dispatch_state = Column(String, default="IDLE", index=True) # IDLE, QUEUED, IN_PROGRESS, SENT, FAILED, REQUIRES_REVIEW
+    scheduled_at = Column(DateTime, nullable=True, index=True)
     dispatch_started_at = Column(DateTime, nullable=True)
     dispatch_completed_at = Column(DateTime, nullable=True)
     dispatch_error = Column(Text, nullable=True)
-    
+
     # V2 Intelligence Upgrades
     variants = Column(JSON, nullable=True) # Stores the 3 high-impact variants
     strategic_observation = Column(Text, nullable=True)
@@ -48,9 +49,10 @@ class OutboundDispatch(Base):
     draft_id = Column(String, ForeignKey("email_drafts.id", ondelete="SET NULL"), index=True, nullable=True)
     action_type = Column(String, nullable=False, index=True)
     dispatch_key = Column(String, nullable=False, index=True)
-    state = Column(String, default="IDLE", index=True)  # IDLE, IN_PROGRESS, SENT, FAILED, REQUIRES_REVIEW
+    state = Column(String, default="IDLE", index=True)  # IDLE, QUEUED, IN_PROGRESS, SENT, FAILED, REQUIRES_REVIEW
     message_id = Column(String, nullable=True)
     thread_id = Column(String, nullable=True)
+    scheduled_at = Column(DateTime, nullable=True, index=True)
     dispatch_started_at = Column(DateTime, nullable=True)
     dispatch_completed_at = Column(DateTime, nullable=True)
     dispatch_error = Column(Text, nullable=True)

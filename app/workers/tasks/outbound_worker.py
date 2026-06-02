@@ -101,7 +101,9 @@ def send_draft_worker(self, draft_id: str):
                         "display": display,
                         "seconds_away": int(seconds_away),
                     }
-                # Slot is within threshold — we're in a window with no conflicts
+                # Slot is within threshold — commit the resolved timezone before
+                # the session closes, then fall through to execute_draft_send.
+                db.commit()
     finally:
         db.close()
 

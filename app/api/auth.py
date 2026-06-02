@@ -317,6 +317,41 @@ def reset_password(request: Request, payload: ResetPasswordRequest, db: Session 
 
     return {"message": "Identity credentials updated. You may now initialize a secure session."}
 
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_password: str
+
+@router.post("/change-password")
+@limiter.limit("5/minute")
+def change_password(
+    request: Request,
+    payload: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Authenticated Credential Alteration.
+    Allows authenticated users to change their account password.
+    """
+    if payload.new_password != payload.confirm_password:
+        raise HTTPException(status_code=400, detail="New passwords do not match.")
+        
+    if not current_user.hashed_password:
+        raise HTTPException(
+            status_code=400,
+            detail="Current credentials invalid. Please contact administrator or use password recovery."
+        )
+        
+    if not verify_password(payload.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect current password.")
+
+    current_user.hashed_password = get_password_hash(payload.new_password)
+    db.commit()
+    return {"message": "Password updated successfully."}
+
+
 @router.post("/refresh")
 @limiter.limit("15/minute")
 def refresh_token(request: Request, payload: RefreshRequest, db: Session = Depends(get_db)):

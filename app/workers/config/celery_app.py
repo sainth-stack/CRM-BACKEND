@@ -133,7 +133,8 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-    task_track_started=True,
+    task_track_started=False,
+    task_ignore_result=True,      # Do not store results in Redis to save commands
     task_time_limit=3600,
     task_acks_late=True,          # Acknowledge AFTER task completes (not before)
     task_reject_on_worker_lost=True,  # Re-queue if worker crashes mid-execution

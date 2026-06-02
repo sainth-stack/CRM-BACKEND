@@ -125,7 +125,7 @@ class DecisionMaker(Base):
     
     # Meeting & Reminder Synchronization
     scheduled_time_utc = Column(DateTime, nullable=True) # Canonical UTC coordinate
-    display_timezone = Column(String, default="UTC") # Prospect's local timezone
+    display_timezone = Column(String, nullable=True, default=None) # NULL = not resolved yet; set by scheduler on first dispatch
     meeting_link = Column(String, nullable=True)
     scheduling_note = Column(Text, nullable=True)
     reminder_24h_sent = Column(Boolean, default=False)

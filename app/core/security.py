@@ -125,7 +125,6 @@ def _get_redis():
     try:
         import redis
         r = redis.from_url(settings.REDIS_URL, socket_connect_timeout=5)
-        r.ping()
         return r
     except Exception:
         return None

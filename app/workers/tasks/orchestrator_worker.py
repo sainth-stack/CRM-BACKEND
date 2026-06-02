@@ -130,10 +130,6 @@ def _mark_outbound_dispatch_state(
             dispatch_db.rollback()
             logger.error(f"[DISPATCH] Failed to persist outbound dispatch state for {dispatch_key}: {exc}", exc_info=True)
 def _audit_single_prospect(db, candidate_id: str, now: datetime.datetime) -> None:
-    lock_key = f"orchestrator:dm:{candidate_id}"
-    if not acquire_lock(lock_key, ttl=600):
-        return
-
     try:
         dm = _lock_query(
             db.query(models.DecisionMaker).filter(models.DecisionMaker.id == candidate_id),
@@ -193,37 +189,44 @@ def _audit_single_prospect(db, candidate_id: str, now: datetime.datetime) -> Non
     except Exception as exc:
         db.rollback()
         logger.error(f"[ORCHESTRATOR] Protocol failure for DM {candidate_id}: {exc}", exc_info=True)
-    finally:
-        release_lock(lock_key)
 
 
 @celery_app.task
 def outreach_orchestrator_worker():
     """Audits the lifecycle of all active outreach prospects and triggers reminders."""
     logger.info("[ORCHESTRATOR] Auditing active outreach lifecycle...")
-    with db_session() as db:
-        try:
-            now = utcnow_naive()
-            prospect_ids = (
-                db.query(models.DecisionMaker.id)
-                .filter(
-                    models.DecisionMaker.next_action_at <= now,
-                    models.DecisionMaker.state.notin_(
-                        [
-                            models.ProspectState.TERMINATED,
-                            models.ProspectState.MEETING_BOOKED,
-                            models.ProspectState.ON_HOLD,
-                            models.ProspectState.DISCOVERY_EXPIRED,
-                        ]
-                    ),
-                )
-                .all()
-            )
+    
+    lock_key = "orchestrator:master_audit"
+    if not acquire_lock(lock_key, ttl=600):
+        logger.debug("[ORCHESTRATOR] Master audit already in progress. Skipping.")
+        return
 
-            for (candidate_id,) in prospect_ids:
-                _audit_single_prospect(db, candidate_id, now)
-        except Exception as exc:
-            logger.error(f"[ORCHESTRATOR] Master audit failure: {exc}", exc_info=True)
+    try:
+        with db_session() as db:
+            try:
+                now = utcnow_naive()
+                prospect_ids = (
+                    db.query(models.DecisionMaker.id)
+                    .filter(
+                        models.DecisionMaker.next_action_at <= now,
+                        models.DecisionMaker.state.notin_(
+                            [
+                                models.ProspectState.TERMINATED,
+                                models.ProspectState.MEETING_BOOKED,
+                                models.ProspectState.ON_HOLD,
+                                models.ProspectState.DISCOVERY_EXPIRED,
+                            ]
+                        ),
+                    )
+                    .all()
+                )
+
+                for (candidate_id,) in prospect_ids:
+                    _audit_single_prospect(db, candidate_id, now)
+            except Exception as exc:
+                logger.error(f"[ORCHESTRATOR] Master audit failure: {exc}", exc_info=True)
+    finally:
+        release_lock(lock_key)
 
 
 def _apply_nudge_effects(

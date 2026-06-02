@@ -77,6 +77,7 @@ def release_lease(db: Session, campaign_id: str, worker_id: str):
         logger.error(f"[LEASE RELEASE FAILURE] Failed to release lock for campaign {campaign_id}: {e}")
 
 
+import inspect
 from functools import wraps
 
 def with_short_lived_db_session(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -111,6 +112,18 @@ def with_short_lived_db_session(func: Callable[..., Any]) -> Callable[..., Any]:
         finally:
             # Always close the session
             db.close()
+
+    # Expose the post-injection signature (without `db`) so external
+    # introspectors — notably Celery's argument-typing check in apply_async,
+    # which follows @wraps' __wrapped__ pointer back to `func` — validate
+    # against the args we actually call with, not the injected `db` param.
+    try:
+        sig = inspect.signature(func)
+        wrapper.__signature__ = sig.replace(
+            parameters=[p for name, p in sig.parameters.items() if name != "db"]
+        )
+    except (ValueError, TypeError):
+        pass
     return wrapper
 
 

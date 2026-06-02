@@ -143,9 +143,10 @@ celery_app.conf.update(
 
 # --- SSL Security Overlay for Secure Redis (Upstash/rediss) ---
 if redis_url.startswith("rediss"):
+    import ssl
     celery_app.conf.update(
-        broker_use_ssl={"ssl_cert_reqs": "none"},
-        redis_backend_use_ssl={"ssl_cert_reqs": "none"}
+        broker_use_ssl={"ssl_cert_reqs": ssl.CERT_REQUIRED},
+        redis_backend_use_ssl={"ssl_cert_reqs": ssl.CERT_REQUIRED}
     )
 
 # --- Task Routing Architecture ---

@@ -97,7 +97,6 @@ class DecisionMaker(Base):
     time_at_company = Column(String, nullable=True)
     relevance_score = Column(Integer, default=0, index=True) # Operational lead quality score
     relevance_explanation = Column(Text, nullable=True) # Agentic reasoning for coordinate selection
-    hubspot_id = Column(String, nullable=True)
     status = Column(String, default="NEW") # Legacy string status for compatibility
     state = Column(SQLEnum(ProspectState, values_callable=lambda obj: [e.value for e in obj]), default=ProspectState.NEW, index=True)
     termination_reason = Column(SQLEnum(ProspectTerminationReason, values_callable=lambda obj: [e.value for e in obj]), nullable=True, index=True)

@@ -23,21 +23,6 @@ def lock_query(query):
     return query
 
 
-def _hubspot_status_for_draft(db_draft: models.EmailDraft) -> str | None:
-    if not db_draft.dm:
-        return None
-
-    draft_type = getattr(db_draft, "draft_type", "INITIAL")
-    if draft_type == "DISCOVERY":
-        return "Discovery Invitation Sent"
-    if draft_type == "INITIAL":
-        return "Initial Email Sent"
-
-    idx = db_draft.followup_index
-    suffix = "st" if idx == 1 else "nd" if idx == 2 else "rd" if idx == 3 else "th"
-    return f"{idx}{suffix} Follow Up Sent"
-
-
 def _apply_sent_draft_effects(
     db: Session,
     db_draft: models.EmailDraft,
@@ -47,7 +32,7 @@ def _apply_sent_draft_effects(
     sent_at: datetime.datetime,
     dispatch_state: str = "SENT",
     dispatch_error: str | None = None,
-) -> str | None:
+) -> None:
     from app.workers.lifecycle import arm_company_hold_window, transition_prospect
 
     existing_log = db.query(models.CommunicationLog).filter(
@@ -67,7 +52,6 @@ def _apply_sent_draft_effects(
             )
         )
 
-    hs_status = None
     if db_draft.dm:
         dm = db_draft.dm
         dm.last_message_id = message_id
@@ -79,7 +63,6 @@ def _apply_sent_draft_effects(
 
         draft_type = getattr(db_draft, "draft_type", "INITIAL")
         if draft_type == "DISCOVERY":
-            hs_status = "Discovery Invitation Sent"
             transition_prospect(
                 db,
                 dm,
@@ -92,7 +75,6 @@ def _apply_sent_draft_effects(
             dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
             arm_company_hold_window(db, dm, sent_at=sent_at)
         elif draft_type == "INITIAL":
-            hs_status = "Initial Email Sent"
             transition_prospect(
                 db,
                 dm,
@@ -106,7 +88,6 @@ def _apply_sent_draft_effects(
         else:
             idx = db_draft.followup_index
             dm.followup_count = idx
-            hs_status = _hubspot_status_for_draft(db_draft)
             transition_prospect(
                 db,
                 dm,
@@ -124,7 +105,6 @@ def _apply_sent_draft_effects(
     db_draft.dispatch_state = dispatch_state
     db_draft.dispatch_completed_at = sent_at
     db_draft.dispatch_error = dispatch_error
-    return hs_status
 
 
 def _mark_draft_dispatch_failure(draft_id: str, error_message: str) -> None:
@@ -151,19 +131,19 @@ def _recover_sent_draft_persistence(
     thread_id: str | None,
     sent_at: datetime.datetime,
     dispatch_error: str,
-) -> tuple[bool, str | None]:
+) -> bool:
     recovery_db = SessionLocal()
     try:
         draft = lock_query(
             recovery_db.query(models.EmailDraft).filter(models.EmailDraft.id == draft_id)
         ).first()
         if not draft:
-            return False, None
+            return False
 
         if draft.status == "SENT" and draft.message_id == message_id:
-            return True, _hubspot_status_for_draft(draft)
+            return True
 
-        hs_status = _apply_sent_draft_effects(
+        _apply_sent_draft_effects(
             recovery_db,
             draft,
             message_id=message_id,
@@ -174,14 +154,13 @@ def _recover_sent_draft_persistence(
         )
         recovery_db.commit()
         logger.error(
-            f"[DISPATCH] Recovered sent draft {draft_id} after post-send persistence failure. "
-            "CRM synchronization may require follow-up."
+            f"[DISPATCH] Recovered sent draft {draft_id} after post-send persistence failure."
         )
-        return True, hs_status
+        return True
     except Exception as exc:
         recovery_db.rollback()
         logger.error(f"[DISPATCH] Recovery failed for sent draft {draft_id}: {exc}", exc_info=True)
-        return False, None
+        return False
     finally:
         recovery_db.close()
 
@@ -281,7 +260,7 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
         from app.services.observability_service import ObservabilityService
         
         sent_at = datetime.datetime.now(UTC).replace(tzinfo=None)
-        hs_status = _apply_sent_draft_effects(
+        _apply_sent_draft_effects(
             db,
             db_draft,
             message_id=msg_id,
@@ -290,18 +269,13 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
         )
         db.commit()
 
-        if db_draft.dm and hs_status:
-            from app.integrations.hubspot import hubspot_provider
-
-            hubspot_provider.update_lead_status(db_draft.dm.hubspot_id, hs_status)
-
         ObservabilityService.increment_metric("dispatch_success")
         return {"status": "sent", "message": "Engagement protocol mobilized."}
     except Exception as exc:
         db.rollback()
         from app.services.observability_service import ObservabilityService
         if msg_id and sent_at:
-            recovered, recovered_hs_status = _recover_sent_draft_persistence(
+            recovered = _recover_sent_draft_persistence(
                 draft_id,
                 message_id=msg_id,
                 thread_id=thread_id,
@@ -309,18 +283,6 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
                 dispatch_error=f"Recovered after post-send persistence error: {str(exc)}",
             )
             if recovered:
-                if recovered_hs_status:
-                    try:
-                        from app.integrations.hubspot import hubspot_provider
-
-                        dm = db.query(models.DecisionMaker).join(models.EmailDraft).filter(
-                            models.EmailDraft.id == draft_id
-                        ).first()
-                        if dm:
-                            hubspot_provider.update_lead_status(dm.hubspot_id, recovered_hs_status)
-                    except Exception:
-                        logger.warning(f"[DISPATCH] CRM sync still pending after recovery for draft {draft_id}.")
-                
                 ObservabilityService.increment_metric("dispatch_recovered")
                 return {
                     "status": "recovered",

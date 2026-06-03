@@ -18,7 +18,6 @@ from app.db import models
 from app.workers.utils import db_session
 from app.integrations.cal import cal_provider
 from app.integrations.gmail import GmailProvider
-from app.integrations.hubspot import hubspot_provider
 from app.workers.config.celery_app import celery_app
 from app.workers.lifecycle import (
     hold_company_siblings,

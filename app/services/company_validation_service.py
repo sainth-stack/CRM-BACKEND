@@ -31,11 +31,15 @@ class DeepDossier(BaseModel):
 class CompanyValidationService:
     def __init__(self):
         self.tavily = TavilyClient(api_key=settings.TAVILY_API_KEY)
-        # Force deterministic behavior: temperature 0 and fixed seed
+        # Force deterministic behavior: temperature 0 and fixed seed.
+        # Explicit timeout + bounded retries so a hung/slow OpenAI socket cannot
+        # pin a concurrency slot until the 1-hour task_time_limit.
         self.llm = ChatOpenAI(
-            model="gpt-4o-mini", 
+            model="gpt-4o-mini",
             temperature=0,
-            seed=42
+            seed=42,
+            timeout=60,
+            max_retries=2,
         )
 
     async def validate_company_first_pass(self, domain: str, name: str, user_intel: dict, csv_description: str = None):
@@ -150,9 +154,19 @@ class CompanyValidationService:
     async def deep_research_swarm(self, domain: str, name: str, user_intel: dict, existing_description: str = ""):
         """Tier 3 — Deep Intelligence: Advanced wide-angle research in one shot."""
         query = f'"{name}" {domain} company growth expansion layoffs financial news pain points 2024'
-        search_result = await asyncio.to_thread(self.tavily.search, query=query, search_depth="advanced", max_results=15)
-        
-        context = "\n".join([f"Source: {r['url']}\nContent: {r['content']}" for r in search_result.get('results', [])])
+        try:
+            search_result = await asyncio.wait_for(
+                asyncio.to_thread(self.tavily.search, query=query, search_depth="advanced", max_results=15),
+                timeout=25,
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"⏱️ [DEEP-RESEARCH] Tavily search failed/timed out for {domain}: {e}")
+            search_result = {"results": []}
+
+        # Trim each source body at the source. The LLM context is capped at 8000
+        # chars below, so full page bodies only inflate in-flight memory without
+        # adding signal — especially harmful when many companies run concurrently.
+        context = "\n".join([f"Source: {r['url']}\nContent: {r['content'][:1500]}" for r in search_result.get('results', [])])
 
         prompt_template = ChatPromptTemplate.from_template("""
         You are a Senior Investment Analyst and Outreach Strategist.
@@ -210,27 +224,41 @@ class CompanyValidationService:
         # This prevents Search Engine Variance from flipping decisions
         from app.db.database import SessionLocal
         from app.db import models
+        # Read the cached research value, then CLOSE the session BEFORE any network
+        # work — never hold a Neon connection open across the Tavily/LLM call.
         db = SessionLocal()
-        
-        # Look for the most recent research context for this domain in Stage 3
-        existing_research = db.query(models.TargetCompany).filter(
-            models.TargetCompany.domain == domain,
-            models.TargetCompany.icp_research_context != None
-        ).order_by(models.TargetCompany.updated_at.desc()).first()
-        
+        try:
+            existing_research = db.query(models.TargetCompany).filter(
+                models.TargetCompany.domain == domain,
+                models.TargetCompany.icp_research_context != None
+            ).order_by(models.TargetCompany.updated_at.desc()).first()
+            cached_context = (
+                existing_research.icp_research_context
+                if existing_research and existing_research.icp_research_context
+                else None
+            )
+        finally:
+            db.close()
+
         context = ""
-        if existing_research and len(existing_research.icp_research_context.strip()) > 100:
-            context = f"CSV DESCRIPTION: {csv_desc or 'N/A'}\n\nRESEARCH DATA: {existing_research.icp_research_context}"
+        if cached_context and len(cached_context.strip()) > 100:
+            context = f"CSV DESCRIPTION: {csv_desc or 'N/A'}\n\nRESEARCH DATA: {cached_context}"
             logger.info(f"♻️ [GLOBAL-CACHE] Reusing ICP research for {domain} to lock in determinism.")
         else:
-            # MANDATORY RESEARCH: Only if we have NO global record
+            # MANDATORY RESEARCH: Only if we have NO global record.
+            # Hard timeout so a hung Tavily socket can't stall a concurrency slot.
             query = f"{name} {domain} business model industry summary"
-            search_result = await asyncio.to_thread(self.tavily.search, query=query, search_depth="basic")
-            research_context = "\n".join([r['content'] for r in search_result['results']])
+            try:
+                search_result = await asyncio.wait_for(
+                    asyncio.to_thread(self.tavily.search, query=query, search_depth="basic"),
+                    timeout=15,
+                )
+                research_context = "\n".join([r['content'] for r in search_result['results']])
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning(f"⏱️ [RESEARCH] Tavily search failed/timed out for {domain}: {e}")
+                research_context = ""
             context = f"CSV DESCRIPTION: {csv_desc or 'N/A'}\n\nRESEARCH DATA: {research_context}"
             logger.info(f"🔍 [MANDATORY-RESEARCH] New global ICP research generated for {domain}.")
-        
-        db.close()
 
         prompt_template = ChatPromptTemplate.from_template("""
         DETERMINISTIC LEAD FIT GATEKEEPER

@@ -9,7 +9,7 @@ class Settings:
     NEON_DB_URL = os.getenv("NEON_DB_URL")
     
     # 2. AI COST GOVERNANCE & REQUEST CACHING
-    LLM_DAILY_BUDGET_USD = float(os.getenv("LLM_DAILY_BUDGET_USD", "10.00"))
+    LLM_DAILY_BUDGET_USD = float(os.getenv("LLM_DAILY_BUDGET_USD", "50.00"))
     LLM_CACHE_ENABLED = os.getenv("LLM_CACHE_ENABLED", "True").lower() == "true"
     LLM_CACHE_TTL_SECONDS = int(os.getenv("LLM_CACHE_TTL_SECONDS", "86400"))
     

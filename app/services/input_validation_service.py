@@ -108,7 +108,7 @@ class InputValidationService:
                 reason="Input review model unavailable; preserved sanitized user-provided value without assumptions.",
             )
 
-        llm = ChatOpenAI(model=self.model_name, temperature=0)
+        llm = ChatOpenAI(model=self.model_name, temperature=0, request_timeout=120, max_retries=2)
         structured_llm = llm.with_structured_output(InputValidationReview)
         review_prompt = ChatPromptTemplate.from_template(
             """

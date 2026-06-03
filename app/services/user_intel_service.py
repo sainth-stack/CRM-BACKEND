@@ -29,7 +29,7 @@ class UserCompanyDossier(BaseModel):
 class UserIntelService:
     def __init__(self):
         self.tavily = TavilyClient(api_key=settings.TAVILY_API_KEY)
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, request_timeout=120, max_retries=2)
 
     def get_context_from_db(self, db, campaign_id: str):
         """Retrieves and structures user company intelligence for LLM context."""

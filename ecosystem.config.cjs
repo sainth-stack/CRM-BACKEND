@@ -26,7 +26,12 @@
 // =============================================================================
 
 const CELERY_APP = "app.workers.config.celery_app";
-const ALL_QUEUES = "heavy_research,outbound_dispatch,inbox_polling,orchestrator";
+const HEAVY_QUEUE = "heavy_research";
+const LIGHT_QUEUES = "outbound_dispatch,inbox_polling,orchestrator";
+
+// Upstash is billed per command + caps connections, so suppress Celery's
+// mingle/gossip/heartbeat chatter (pure overhead for a single small box).
+const QUIET = "--without-mingle --without-gossip --without-heartbeat";
 
 const common = {
   cwd: __dirname,          // run from backend/
@@ -40,9 +45,23 @@ const common = {
 module.exports = {
   apps: [
     {
+      // Heavy AI pipeline (Stages 3/4/5). Mostly I/O-bound (Tavily + OpenAI),
+      // so a small prefork pool + per-child recycling keeps memory flat and
+      // prevents the langchain memory creep that was triggering the OOM-killer.
+      //   --max-tasks-per-child=8 : restart each child after 8 tasks to reclaim RAM
+      //   --max-memory-per-child   : hard ceiling (KB) — child restarts if exceeded (~600MB)
       ...common,
-      name: "crm-worker",
-      args: `-A ${CELERY_APP} worker --loglevel=info --concurrency=2 -Q ${ALL_QUEUES} --hostname=worker@%h`,
+      name: "crm-worker-heavy",
+      args: `-A ${CELERY_APP} worker --loglevel=info --concurrency=2 -Q ${HEAVY_QUEUE} ` +
+            `--max-tasks-per-child=8 --max-memory-per-child=600000 ${QUIET} --hostname=heavy@%h`,
+    },
+    {
+      // Light/latency-sensitive queues (email dispatch, inbox polling,
+      // orchestration sweeps). Cheap tasks; modest concurrency is fine.
+      ...common,
+      name: "crm-worker-light",
+      args: `-A ${CELERY_APP} worker --loglevel=info --concurrency=2 -Q ${LIGHT_QUEUES} ` +
+            `--max-tasks-per-child=100 ${QUIET} --hostname=light@%h`,
     },
     {
       // CRITICAL: exactly ONE beat instance, ever. Never scale this.

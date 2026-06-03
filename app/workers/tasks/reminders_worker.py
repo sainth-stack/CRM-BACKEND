@@ -19,7 +19,6 @@ from app.workers.config.celery_app import celery_app
 from app.workers.utils import db_session
 from app.integrations.cal import cal_provider
 from app.integrations.gmail import GmailProvider
-from app.integrations.hubspot import hubspot_provider
 from app.workers.config.celery_app import celery_app
 from app.workers.lifecycle import (
     hold_company_siblings,
@@ -44,35 +43,46 @@ def _lock_query(query, *, skip_locked: bool = False):
 
 @celery_app.task
 def check_upcoming_meetings_task():
+    now = datetime.datetime.now(UTC)
+
+    # 1. Short read session: load only booked prospect IDs, then RELEASE the connection.
+    #    The actual reminder send (network email) runs per-prospect with its own
+    #    session, so no single Neon connection is pinned across the whole loop.
     with db_session() as db:
-        now = datetime.datetime.now(UTC)
-        booked_dm_ids = (
-            db.query(models.DecisionMaker.id)
+        booked_dm_ids = [
+            row[0]
+            for row in db.query(models.DecisionMaker.id)
             .filter(models.DecisionMaker.status == "MEETING_BOOKED")
             .all()
-        )
-        for (dm_id,) in booked_dm_ids:
-            dm = (
-                db.query(models.DecisionMaker)
-                .options(joinedload(models.DecisionMaker.campaign).joinedload(models.Campaign.user_intel))
-                .filter(models.DecisionMaker.id == dm_id)
-                .first()
-            )
-            if not dm: continue
-            if not dm.scheduled_time_utc:
-                continue
-            meeting_time = dm.scheduled_time_utc.replace(tzinfo=UTC)
-            time_until = meeting_time - now
-            if datetime.timedelta(hours=settings.REMINDER_24H_MIN_HOURS) < time_until < datetime.timedelta(hours=settings.REMINDER_24H_MAX_HOURS):
-                if not dm.reminder_24h_sent:
-                    _send_reminder(db, dm, "24h")
-                    dm.reminder_24h_sent = True
-                    db.commit()
-            if datetime.timedelta(minutes=settings.REMINDER_1H_MIN_MINUTES) < time_until < datetime.timedelta(minutes=settings.REMINDER_1H_MAX_MINUTES):
-                if not dm.reminder_1h_sent:
-                    _send_reminder(db, dm, "1h")
-                    dm.reminder_1h_sent = True
-                    db.commit()
+        ]
+
+    # 2. Per-prospect short session: held only for one prospect's work, released
+    #    before the next. One prospect's failure is isolated from the rest.
+    for dm_id in booked_dm_ids:
+        try:
+            with db_session() as db:
+                dm = (
+                    db.query(models.DecisionMaker)
+                    .options(joinedload(models.DecisionMaker.campaign).joinedload(models.Campaign.user_intel))
+                    .filter(models.DecisionMaker.id == dm_id)
+                    .first()
+                )
+                if not dm or not dm.scheduled_time_utc:
+                    continue
+                meeting_time = dm.scheduled_time_utc.replace(tzinfo=UTC)
+                time_until = meeting_time - now
+                if datetime.timedelta(hours=settings.REMINDER_24H_MIN_HOURS) < time_until < datetime.timedelta(hours=settings.REMINDER_24H_MAX_HOURS):
+                    if not dm.reminder_24h_sent:
+                        _send_reminder(db, dm, "24h")
+                        dm.reminder_24h_sent = True
+                        db.commit()
+                if datetime.timedelta(minutes=settings.REMINDER_1H_MIN_MINUTES) < time_until < datetime.timedelta(minutes=settings.REMINDER_1H_MAX_MINUTES):
+                    if not dm.reminder_1h_sent:
+                        _send_reminder(db, dm, "1h")
+                        dm.reminder_1h_sent = True
+                        db.commit()
+        except Exception as exc:
+            logger.error(f"[SENTINEL] Meeting reminder failed for prospect {dm_id}: {exc}", exc_info=True)
 
 
 def _send_reminder(db, dm, reminder_type: str):
@@ -83,6 +93,5 @@ def _send_reminder(db, dm, reminder_type: str):
     body += f"Meeting Link: {dm.meeting_link}\n\nLooking forward to it!"
     creds = TokenService.get_google_credentials(db, dm.campaign.user_id)
     email_service.send_email(dm.email, subject, body, creds=creds, thread_id=dm.thread_id)
-    hubspot_provider.update_lead_status(dm.hubspot_id, f"{reminder_type} Reminder Sent")
     logger.info(f"[SENTINEL] {reminder_type} Reminder deployed for stakeholder {dm.name}")
 

@@ -4,7 +4,6 @@ from dateutil import parser as date_parser
 from app.core.logging_config import logger
 from app.db import models
 from app.integrations.cal import cal_provider
-from app.integrations.hubspot import hubspot_provider
 from app.workers.lifecycle import (
     hold_company_siblings,
     terminate_company_siblings,
@@ -125,8 +124,7 @@ def _request_scheduling_clarification(db, dm, *, source: str, alternative_slots:
 
     if dm.target_company:
         dm.target_company.status = "DISCOVERY_CALL"
-        for sibling in hold_company_siblings(db, dm):
-            hubspot_provider.update_lead_status(sibling.hubspot_id, "On Hold (Peer Engaged)")
+        hold_company_siblings(db, dm)
 
     transition_prospect(
         db,
@@ -198,9 +196,7 @@ def _process_booking(db, dm, extract):
         dm.next_action_at = None
         if dm.target_company:
             dm.target_company.status = "MEETING_BOOKED"
-        for sibling in terminate_company_siblings(db, dm, actor="sentinel"):
-            hubspot_provider.update_lead_status(sibling.hubspot_id, "Terminated (Internal Lead Secured)")
-        hubspot_provider.update_lead_status(dm.hubspot_id, "Meeting Booked")
+        terminate_company_siblings(db, dm, actor="sentinel")
     else:
         raw_slots = cal_provider.get_upcoming_available_slots(db, user, limit=5)
         alternative_slots = format_slots_for_prospect(raw_slots, source_tz_str) if raw_slots else None

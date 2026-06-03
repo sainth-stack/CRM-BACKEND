@@ -65,6 +65,15 @@ def sweep_stuck_campaigns_task():
                 campaign.locked_by = None
                 db.commit()
 
+                # CRITICAL: also clear any stranded Redis stage-locks. Resetting the
+                # DB lease alone is not enough — a crashed worker leaves the Redis
+                # lock held for its full TTL, and process_state_machine's re-trigger
+                # would silently no-op on it. Clearing them here lets the campaign
+                # actually advance.
+                from app.core.security import release_lock
+                for stage in ("stage3", "stage4", "stage5"):
+                    release_lock(f"campaign_{stage}:{campaign.id}")
+
                 from app.services.campaign_service import campaign_service
                 campaign_service.process_state_machine(db, campaign.id)
 

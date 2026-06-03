@@ -13,12 +13,18 @@ if not DATABASE_URL:
     logger.critical("FATAL: NEON_DB_URL not detected. Database initialization aborted. Please verify environment variables.")
     raise ValueError("Database configuration missing: NEON_DB_URL must be defined.")
 
-# High-concurrency connection configuration (Sized for distributed worker clusters)
+# Neon-safe connection configuration (managed Postgres + small instance).
+# Sessions in this app are deliberately short-lived (read -> close -> AI work ->
+# reopen), so a large pool is wasteful and dangerous: Neon caps total
+# connections, and 60-per-process across every worker/uvicorn process would
+# blow straight past that ceiling. Keep each process's footprint tiny.
+#   IMPORTANT: point NEON_DB_URL at the *pooled* endpoint (host contains
+#   "-pooler") so PgBouncer absorbs bursts and survives Neon auto-suspend.
 engine_args = {
-    "pool_pre_ping": True, # Connection integrity verification
-    "pool_recycle": 1800,  # Periodic connection recycling for serverless longevity
-    "pool_size": 20,       # Increased capacity for parallel agentic processes
-    "max_overflow": 40,    # Enhanced dynamic overflow for transactional bursts
+    "pool_pre_ping": True, # Verify connection liveness (essential for Neon auto-suspend)
+    "pool_recycle": 300,   # Recycle well before Neon drops idle serverless connections
+    "pool_size": 3,        # Small steady-state pool per process
+    "max_overflow": 2,     # = 5 connections max per process under burst
     "pool_timeout": 30,    # Max wait latency for pool acquisition
 }
 

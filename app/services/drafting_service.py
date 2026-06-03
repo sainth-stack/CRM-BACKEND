@@ -26,7 +26,7 @@ from app.core.resilience import retry_with_backoff
 
 class DraftingService:
     def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=4000) 
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=4000, request_timeout=120, max_retries=2)
 
     def generate_draft_set(self, db, dm_id: str):
         """

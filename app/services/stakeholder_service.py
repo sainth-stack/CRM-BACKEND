@@ -18,7 +18,7 @@ class StakeholderRankingService:
     """
     
     def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, request_timeout=120, max_retries=2)
 
     async def rank_stakeholders_with_ai(self, prospects: List[Dict[str, Any]], user_intel: dict, research_context: str = "") -> List[Dict[str, Any]]:
         """

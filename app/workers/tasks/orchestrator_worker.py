@@ -19,7 +19,6 @@ from app.db import models
 from app.workers.utils import db_session
 from app.integrations.cal import cal_provider
 from app.integrations.gmail import GmailProvider
-from app.integrations.hubspot import hubspot_provider
 from app.workers.config.celery_app import celery_app
 import pytz
 from app.workers.lifecycle import (
@@ -163,7 +162,6 @@ def _audit_single_prospect(db, candidate_id: str, now: datetime.datetime) -> Non
                     models.ProspectTerminationReason.NO_RESPONSE,
                     retryable=True, now=now, actor="orchestrator",
                 )
-                hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (System Timeout)")
         elif state == models.ProspectState.WAITING_FOR_REPLY:
             reminder_number = dm.reminder_count + 1
             logger.info(f"[ORCHESTRATOR] Discovery scheduling timeout for {dm.name}. Deploying reminder #{reminder_number}")
@@ -183,7 +181,6 @@ def _audit_single_prospect(db, candidate_id: str, now: datetime.datetime) -> Non
                     models.ProspectTerminationReason.FOLLOWUP_EXHAUSTED,
                     retryable=True, now=now, actor="orchestrator",
                 )
-                hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (Exhausted Threshold)")
 
         db.commit()
     except Exception as exc:
@@ -202,11 +199,16 @@ def outreach_orchestrator_worker():
         return
 
     try:
-        with db_session() as db:
-            try:
-                now = utcnow_naive()
-                prospect_ids = (
-                    db.query(models.DecisionMaker.id)
+        now = utcnow_naive()
+
+        # 1. Short read session: load only candidate IDs, then RELEASE the connection.
+        #    We never hold a DB connection while iterating — each prospect's audit
+        #    (which sends email / runs the LLM nudge drafter) gets its own session.
+        try:
+            with db_session() as db:
+                prospect_ids = [
+                    row[0]
+                    for row in db.query(models.DecisionMaker.id)
                     .filter(
                         models.DecisionMaker.next_action_at <= now,
                         models.DecisionMaker.state.notin_(
@@ -219,12 +221,21 @@ def outreach_orchestrator_worker():
                         ),
                     )
                     .all()
-                )
+                ]
+        except Exception as exc:
+            logger.error(f"[ORCHESTRATOR] Master audit candidate load failed: {exc}", exc_info=True)
+            return
 
-                for (candidate_id,) in prospect_ids:
+        # 2. Per-prospect short session: a Neon connection is held only for one
+        #    prospect's work and released before the next — so a large batch can
+        #    never pin a single connection across the whole loop. One prospect's
+        #    failure is isolated and does not abort the rest of the audit.
+        for candidate_id in prospect_ids:
+            try:
+                with db_session() as db:
                     _audit_single_prospect(db, candidate_id, now)
             except Exception as exc:
-                logger.error(f"[ORCHESTRATOR] Master audit failure: {exc}", exc_info=True)
+                logger.error(f"[ORCHESTRATOR] Audit failed for prospect {candidate_id}: {exc}", exc_info=True)
     finally:
         release_lock(lock_key)
 
@@ -242,7 +253,7 @@ def _apply_nudge_effects(
     sent_at: datetime.datetime,
     is_discovery: bool,
     expire_after_send: bool,
-) -> list[tuple[str | None, str]]:
+) -> None:
     existing_log = db.query(models.CommunicationLog).filter(
         models.CommunicationLog.message_id == message_id,
         models.CommunicationLog.direction == "SENT",
@@ -267,7 +278,6 @@ def _apply_nudge_effects(
     dm.termination_reason = None
     dm.retry_after = None
 
-    hubspot_updates: list[tuple[str | None, str]] = []
     transition_prospect(
         db,
         dm,
@@ -283,13 +293,11 @@ def _apply_nudge_effects(
     )
 
     if is_discovery:
-        hubspot_updates.append((dm.hubspot_id, "Discovery Reminder Sent"))
         if expire_after_send:
             logger.info(
                 f"[ORCHESTRATOR] Discovery engagement expired for {dm.name}. Restoring held siblings and switching to passive monitoring."
             )
-            for sibling in restore_held_company_siblings(db, dm):
-                hubspot_updates.append((sibling.hubspot_id, "Hold Released"))
+            restore_held_company_siblings(db, dm)
             transition_prospect(
                 db,
                 dm,
@@ -302,14 +310,10 @@ def _apply_nudge_effects(
             dm.next_action_at = None
             if dm.target_company and dm.target_company.status != "MEETING_BOOKED":
                 dm.target_company.status = "ACTIVE"
-            hubspot_updates.append((dm.hubspot_id, "Discovery Expired"))
         else:
             dm.next_action_at = sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
     else:
         dm.next_action_at = sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
-        hubspot_updates.append((dm.hubspot_id, f"{next_state.value} Sent"))
-
-    return hubspot_updates
 
 
 def _recover_nudge_persistence(
@@ -326,7 +330,7 @@ def _recover_nudge_persistence(
     is_discovery: bool,
     expire_after_send: bool,
     dispatch_error: str,
-) -> tuple[bool, list[tuple[str | None, str]]]:
+) -> bool:
     with db_session() as recovery_db:
         try:
             dm = _lock_query(
@@ -337,9 +341,9 @@ def _recover_nudge_persistence(
             ).first()
             if not dm:
                 _mark_outbound_dispatch_state(dispatch_key, "FAILED", error=dispatch_error)
-                return False, []
+                return False
 
-            hubspot_updates = _apply_nudge_effects(
+            _apply_nudge_effects(
                 recovery_db, dm,
                 next_state=next_state, reminder_number=reminder_number,
                 subject=subject, body=body, message_id=message_id,
@@ -353,7 +357,7 @@ def _recover_nudge_persistence(
                 completed_at=sent_at, error=dispatch_error,
             )
             logger.error(f"[DISPATCH] Recovered outbound nudge {dispatch_key} after post-send persistence failure.")
-            return True, hubspot_updates
+            return True
         except Exception as exc:
             recovery_db.rollback()
             _mark_outbound_dispatch_state(
@@ -362,7 +366,7 @@ def _recover_nudge_persistence(
                 error=f"{dispatch_error} | Recovery failure: {exc}",
             )
             logger.error(f"[DISPATCH] Recovery failed for outbound nudge {dispatch_key}: {exc}", exc_info=True)
-            return False, []
+            return False
 
 
 def _deploy_nudge(
@@ -539,7 +543,7 @@ def send_scheduled_nudge_worker(
             sent_at = utcnow_naive()
             next_state = models.ProspectState(next_state_value)
 
-            hubspot_updates = _apply_nudge_effects(
+            _apply_nudge_effects(
                 db, dm,
                 next_state=next_state,
                 reminder_number=reminder_number,
@@ -558,8 +562,6 @@ def send_scheduled_nudge_worker(
                 thread_id=msg_data.get("thread_id"),
                 completed_at=sent_at,
             )
-            for hs_id, status in hubspot_updates:
-                hubspot_provider.update_lead_status(hs_id, status)
             logger.info(f"[OUTBOUND] Scheduled nudge delivered for {dm.name} | key: {dispatch_key}")
 
         except Exception as exc:
@@ -577,7 +579,6 @@ def reactivate_terminated_prospects_task():
             db.commit()
             for dm in prospects:
                 draft_followup_worker(dm.id, db=db)
-                hubspot_provider.update_lead_status(dm.hubspot_id, "Reactivated")
         except Exception as exc:
             db.rollback()
             logger.error(f"[RETRY] Reactivation cycle failed: {exc}", exc_info=True)

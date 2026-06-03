@@ -1,7 +1,6 @@
 from sqlalchemy.orm import Session
 from app.db import models
 from app.core.logging_config import logger
-from app.integrations.hubspot import hubspot_provider
 from app.workers.lifecycle import (
     hold_company_siblings,
     restore_held_company_siblings,
@@ -44,8 +43,7 @@ class OutreachService:
                 if dm.target_company:
                     for sibling in hold_company_siblings(db, dm):
                         logger.debug(f"[OUTREACH] Holding concurrent stakeholder {sibling.name}")
-                        hubspot_provider.update_lead_status(sibling.hubspot_id, "On Hold (Peer Engaged)")
-                
+
                 transition_prospect(
                     db,
                     dm,
@@ -74,15 +72,13 @@ class OutreachService:
             if dm.target_company:
                 for sibling in hold_company_siblings(db, dm):
                     logger.debug(f"[OUTREACH] Holding concurrent stakeholder {sibling.name}")
-                    hubspot_provider.update_lead_status(sibling.hubspot_id, "On Hold (Peer Engaged)")
-            
+
             draft_discovery_worker(dm.id, db=db)
 
         elif intent == "NEGATIVE":
             logger.info(f"[OUTREACH] Rejected: {dm.name} (Terminating)")
-            for sibling in restore_held_company_siblings(db, dm):
-                hubspot_provider.update_lead_status(sibling.hubspot_id, "Hold Released")
-            
+            restore_held_company_siblings(db, dm)
+
             terminate_prospect(
                 db,
                 dm,
@@ -91,7 +87,6 @@ class OutreachService:
                 actor="service",
                 metadata={"intent": intent},
             )
-            hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (Negative Reply)")
 
         elif intent == "NEUTRAL":
             if dm.followup_count < 11:
@@ -110,9 +105,8 @@ class OutreachService:
                 dm.retry_after = None
             else:
                 logger.info(f"[OUTREACH] Neutral: {dm.name} (Threshold Exhausted - Terminating)")
-                for sibling in restore_held_company_siblings(db, dm):
-                    hubspot_provider.update_lead_status(sibling.hubspot_id, "Hold Released")
-                
+                restore_held_company_siblings(db, dm)
+
                 terminate_prospect(
                     db,
                     dm,
@@ -121,6 +115,5 @@ class OutreachService:
                     actor="service",
                     metadata={"intent": intent},
                 )
-                hubspot_provider.update_lead_status(dm.hubspot_id, "Terminated (Exhausted Threshold)")
 
 outreach_service = OutreachService()

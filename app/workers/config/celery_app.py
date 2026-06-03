@@ -138,7 +138,29 @@ celery_app.conf.update(
     task_time_limit=3600,
     task_acks_late=True,          # Acknowledge AFTER task completes (not before)
     task_reject_on_worker_lost=True,  # Re-queue if worker crashes mid-execution
-    broker_connection_retry_on_startup=True
+    broker_connection_retry_on_startup=True,
+
+    # --- Memory guardrails (OOM defense in depth for heavy_research) ---
+    # Heavy research tasks (Stage 3/4 Tavily + LLM swarms) are the main RAM
+    # drivers. These recycle the worker process *between tasks* before the box
+    # OOM-kills it mid-commit, so a clean restart picks up the next chunk/task.
+    worker_prefetch_multiplier=1,     # don't hoard tasks on a heavy worker
+    worker_max_tasks_per_child=20,    # recycle process periodically (defeats fragmentation/leaks)
+    # KB. Restart the child once RSS crosses this, between tasks. Tuned for a
+    # ~512MB instance — leaves headroom for the broker/parent. Override via env.
+    worker_max_memory_per_child=int(os.getenv("WORKER_MAX_MEMORY_KB", "380000")),
+
+    # --- Upstash (managed Redis) connection & cost governance ---
+    # Upstash caps concurrent connections AND bills per command, so keep the
+    # broker connection pool small and disable result storage entirely.
+    broker_pool_limit=3,              # default 10 -> too many conns across processes
+    redis_max_connections=20,         # hard ceiling on the redis client pool
+    result_backend=None,              # we already ignore results; don't open a backend
+    result_expires=600,
+    broker_transport_options={
+        "visibility_timeout": 3700,   # must exceed task_time_limit so tasks aren't redelivered mid-run
+        "socket_keepalive": True,
+    },
 )
 
 # --- SSL Security Overlay for Secure Redis (Upstash/rediss) ---

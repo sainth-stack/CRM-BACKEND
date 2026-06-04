@@ -2,7 +2,7 @@ import uuid
 import datetime
 from datetime import UTC
 import enum
-from sqlalchemy import Column, String, Text, DateTime, ForeignKey, JSON, Enum as SQLEnum
+from sqlalchemy import Column, String, Text, DateTime, ForeignKey, JSON, Integer, Enum as SQLEnum
 from sqlalchemy.orm import relationship
 from .base import Base
 
@@ -52,6 +52,12 @@ class Campaign(Base):
     # Operational Telemetry (Lease & Heartbeat System)
     last_heartbeat = Column(DateTime, nullable=True)
     locked_by = Column(String, nullable=True) # ID of the worker currently holding the lease
+
+    # LangGraph workflow engine (Phase 1). workflow_version pins a running
+    # campaign to a workflow definition (workflow-versioning constraint);
+    # workflow_thread_id is the checkpointer thread key (defaults to id).
+    workflow_version = Column(Integer, nullable=False, default=1)
+    workflow_thread_id = Column(String, nullable=True)
     
     # Relationships
     owner = relationship("User", back_populates="campaigns")

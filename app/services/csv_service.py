@@ -18,6 +18,7 @@ def get_fuzzy_map(cols):
         'contact_full_name': r'contact\s*full\s*name',
         'title': r'^title$',
         'seniority': r'^seniority$',
+        'department': r'^department$',
         'company_name_cleaned': r'company\s*name\s*-\s*cleaned',
         'website': r'^website$',
         'primary_email': r'primary\s*email',
@@ -59,7 +60,7 @@ def get_fuzzy_map(cols):
 
 class CSVProcessingService:
     SELECTED_COLUMNS = [
-        "Contact Full Name", "Title", "Seniority", "Company Name - Cleaned", "Website", 
+        "Contact Full Name", "Title", "Seniority", "Department", "Company Name - Cleaned", "Website",
         "Primary Email", "Contact LI Profile URL", 
         "Email 1", "Email 1 Validation", "Email 2", "Email 2 Validation", 
         "Email 3", "Email 3 Validation", "Email 4", "Email 4 Validation", 

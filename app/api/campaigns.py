@@ -13,6 +13,7 @@ from app.core.security import get_current_user, get_visibility_filter, validate_
 from app.core.limiter import limiter
 from app.core.logging_config import setup_logging
 from app.core.sanitizer import sanitize_text
+from app.core.config import settings
 from app.services.input_validation_service import input_validation_service
 from app.services.csv_service import CSVProcessingService
 from app.workers.tasks.intel_worker import process_csv_worker, validate_input_worker
@@ -79,9 +80,10 @@ def create_campaign(
 
     # 0. High-Fidelity Input Sanitization
     sanitized_name = sanitize_text(name, max_length=100)
-    sanitized_industry = sanitize_text(target_industry, max_length=200)
-    sanitized_location = sanitize_text(target_location, max_length=200)
-    sanitized_emp_count = sanitize_text(target_employee_count, max_length=50) if target_employee_count else None
+    # Lengths accommodate comma-separated multi-values (industry/location/size).
+    sanitized_industry = sanitize_text(target_industry, max_length=300)
+    sanitized_location = sanitize_text(target_location, max_length=300)
+    sanitized_emp_count = sanitize_text(target_employee_count, max_length=120) if target_employee_count else None
     sanitized_prompt = sanitize_text(prompt, max_length=2000) if prompt else None
     
     # 0.1 Mandatory SSoT Verification
@@ -153,9 +155,9 @@ def create_campaign(
 
         content = file.file.read()
         
-        # 2. Surgical Protocol: Enforce 100-row high-fidelity limit and filter columns
+        # 2. Enforce the configurable row cap (MAX_CSV_ROWS) and filter columns.
         csv_svc = CSVProcessingService()
-        trimmed_content = csv_svc.trim_csv_from_bytes(content, max_rows=100)
+        trimmed_content = csv_svc.trim_csv_from_bytes(content, max_rows=settings.MAX_CSV_ROWS)
         
         # 2.1 Persist Trimmed File to Disk (Replace Raw Concept)
         os.makedirs("uploads", exist_ok=True)
@@ -636,11 +638,8 @@ def dispatch_all_drafts(
             slot = calculate_next_send_slot(campaign.user_id, prospect_tz, db)
             draft.scheduled_at = slot
             db.commit()
-
-            send_draft_worker.apply_async(
-                args=[draft_id],
-                eta=slot.replace(tzinfo=pytz.UTC),
-            )
+            # Queued with a DB scheduled_at; the durable dispatch poller sends it
+            # when due. No fragile per-draft Celery eta (see drafts.py /send).
 
             scheduled.append({
                 "draft_id": draft_id,

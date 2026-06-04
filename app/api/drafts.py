@@ -111,31 +111,16 @@ def send_draft(
             detail="Operational Review Required: Previous deployment attempt is still unresolved for this draft."
         )
 
-    # Resolve timezone and calculate the next available slot
+    # Resolve timezone and calculate the next available staggered slot. The draft
+    # is now QUEUED with a scheduled_at in the DB; the durable dispatch poller
+    # (dispatch_due_drafts_task) sends it when due. We deliberately do NOT enqueue
+    # a long-lived Celery eta task here — a lost/expired eta (server down at fire
+    # time) was exactly the failure that silently dropped emails. The DB schedule
+    # survives restarts and the poller reconciles it.
     prospect_tz = resolve_prospect_timezone(db, db_draft.dm)
     slot = calculate_next_send_slot(db_draft.campaign.user_id, prospect_tz, db)
     db_draft.scheduled_at = slot
-
     db.commit()
-    try:
-        send_draft_worker.apply_async(args=[draft_id], eta=slot.replace(tzinfo=pytz.UTC))
-    except Exception as exc:
-        db.rollback()
-        recovery_draft = _lock_query(
-            db.query(models.EmailDraft).join(models.Campaign).filter(
-                models.EmailDraft.id == draft_id,
-                get_visibility_filter(db, current_user)
-            )
-        ).first()
-        if recovery_draft and recovery_draft.status != "SENT":
-            recovery_draft.dispatch_state = "FAILED"
-            recovery_draft.dispatch_error = f"Failed to schedule outbound delivery: {str(exc)}"[:1000]
-            db.commit()
-        logger.error(f"[DISPATCH] Failed to schedule draft {draft_id}: {exc}", exc_info=True)
-        raise HTTPException(
-            status_code=503,
-            detail="Outbound dispatch infrastructure is temporarily unavailable. Please retry shortly.",
-        )
 
     display = format_scheduled_display(slot, prospect_tz)
     logger.info(f"[DISPATCH] Draft {draft_id} scheduled at {slot} UTC (prospect tz: {prospect_tz})")

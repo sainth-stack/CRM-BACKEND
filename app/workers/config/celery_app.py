@@ -213,10 +213,13 @@ celery_app.conf.beat_schedule = {
         "task": "app.workers.tasks.sweeper_worker.sweep_stuck_campaigns_task",
         "schedule": 1800.0,
     },
-    "sweep-stranded-dispatches-every-10-minutes": {
-        "task": "app.workers.tasks.sweeper_worker.sweep_stranded_dispatches_task",
-        "schedule": 600.0,   # every 10 minutes — fast enough to recover within one window
-        "options": {"queue": "orchestrator"},
+    # Durable outbound dispatch poller — the single, restart-proof trigger that
+    # actually sends scheduled emails (replaces the old per-draft Celery eta +
+    # the 10-min stranded sweep, both of which could drop/smear sends).
+    "dispatch-due-drafts": {
+        "task": "app.workers.tasks.outbound_worker.dispatch_due_drafts_task",
+        "schedule": float(os.getenv("DISPATCH_POLL_SECONDS", "60")),
+        "options": {"queue": "outbound_dispatch"},
     },
     "refresh-oauth-tokens-every-6-hours": {
         "task": "app.workers.tasks.token_refresh_worker.refresh_expiring_tokens_task",

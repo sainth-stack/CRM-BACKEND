@@ -153,34 +153,25 @@ class TokenService:
                     return False
                     
             elif provider == "cal.com":
-                # Cal.com tokens don't typically expire, but we can verify they're valid
+                # Proactively REFRESH the Cal.com access token, not just ping it.
+                # get_valid_access_token() is the same path the booking flow uses:
+                # it refreshes synchronously when the access token is expiring (via
+                # the stored refresh token), and only clears credentials when the
+                # refresh token itself is revoked/invalid. So a False return here
+                # now means a GENUINE reconnect is required — not a misleading
+                # liveness failure on a merely-stale access token.
                 user = db.query(models.User).filter(models.User.id == user_id).first()
-                if not user or not user.cal_access_token:
-                    logger.warning(f"[TOKEN-REFRESH] No Cal.com token found for user {user_id}")
+                if not user or not user.cal_refresh_token:
+                    logger.warning(f"[TOKEN-REFRESH] No Cal.com connection for user {user_id}")
                     return False
-                
-                # Decrypt the access token for the API request
-                try:
-                    decrypted_token = decrypt_token(user.cal_access_token)
-                except Exception as e:
-                    logger.error(f"[TOKEN-REFRESH] Failed to decrypt Cal.com access token for user {user_id}: {e}")
-                    return False
-                
-                # Verify token is still valid by making a test call to v2/me endpoint
-                cal_response = requests.get(
-                    "https://api.cal.com/v2/me",
-                    headers={
-                        "Authorization": f"Bearer {decrypted_token}",
-                        "cal-api-version": "2024-08-13"
-                    },
-                    timeout=10
-                )
-                
-                if cal_response.status_code == 200:
-                    logger.info(f"[TOKEN-REFRESH] Cal.com token verified for user {user_id}")
+
+                from app.integrations.cal import cal_provider
+                token = cal_provider.get_valid_access_token(db, user)
+                if token:
+                    logger.info(f"[TOKEN-REFRESH] Cal.com token valid/refreshed for user {user_id}")
                     return True
                 else:
-                    logger.error(f"[TOKEN-REFRESH] Cal.com token invalid for user {user_id}: status={cal_response.status_code}")
+                    logger.error(f"[TOKEN-REFRESH] Cal.com token unrecoverable for user {user_id}; reconnect required")
                     return False
                     
         except Exception as e:

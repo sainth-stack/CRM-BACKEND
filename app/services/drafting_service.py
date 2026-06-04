@@ -69,105 +69,71 @@ class DraftingService:
             pain_hooks = ", ".join(target_co.pain_hooks or [])
             news_hooks = ", ".join(target_co.news_hooks or [])
             opportunity_reason = target_co.opportunity_reason or ""
-            
+            objective = campaign.prompt or "Win a discovery call with the right stakeholder."
+
         finally:
             temp_db.close()
 
-        # 2. Extract structured intelligence (Direct Column Access)
-        prompt = ChatPromptTemplate.from_template("""
-        You are a Strategic Ghostwriter & Business Architect. 
-        Your task is to synthesize a high-fidelity business case into a 3-paragraph outreach set.
-
-        SENDER IDENTITY (Our DNA):
-        - Company: {sender_name}
-        - Services: {sender_services}
-        - Capability Map: {sender_map}
-
-        TARGET RECIPIENT:
-        - Name: {prospect_name}
-        - Title: {prospect_role}
-        - Seniority: {prospect_seniority}
-        - Company: {target_company}
-        
-        STRATEGIC INTELLIGENCE (THE BUSINESS CASE):
-        - Master Research Dossier: {research_summary}
-        - Growth/News Hooks: {growth_hooks}, {news_hooks}
-        - Identified Pains: {pain_hooks}
-        - Why Now: {opportunity_reason}
-        
-        NARRATIVE STRATEGY (STRICT 3-PARAGRAPH FORMAT):
-        0. GREETING: Open with a professional greeting (e.g., "Hi {prospect_first_name}," or "Hello {prospect_first_name},").
-        1. Paragraph 1 (THE HOOK): Lead with a specific insight from the 'Master Research Dossier'. Anchor the email in their current reality (Acquisitions, Expansion, or News).
-        2. Paragraph 2 (THE BRIDGE): Connect that reality to a specific mandate relevant to their Title ({prospect_role}). Explain how {sender_name}'s capabilities solve the 'Identified Pains' found in the research.
-        3. Paragraph 3 (THE ASK): A professional discovery call request that respects their Seniority ({prospect_seniority}).
-        
-        TASK:
-        Write a single, hyper-personalized, and professional business email to {prospect_first_name}. 
-        The email must be exactly 3 paragraphs + a greeting.
-        - Paragraph 1: The 'Hook'. Connect their recent news/growth ({news_hooks}) to a unique strategic observation.
-        - Paragraph 2: The 'Business Case'. Link your service ({sender_services}) to a specific pain hypothesis derived from the research.
-        - Paragraph 3: The 'Direct Ask'. Suggest a low-friction conversation based on their opportunity reason ({opportunity_reason}).
-
-         STRICT CONSTRAINTS:
-        - NO placeholders whatsoever. 
-        - DO NOT include bracketed signature blocks. 
-        - Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
-          "Best regards,
-          
-          {user_name}
-          {sender_name}"
-        - Tone: Senior, direct, insight-driven. Zero marketing fluff.
-        - LENGTH: 100-120 words.
-        """)
-        
-        structured_llm = self.llm.with_structured_output(EmailDraftSet)
-        chain = prompt | structured_llm
-        
+        # 2. Run the Draft -> Critique -> Refine sub-graph (Strategist/Writer/Critic).
+        from app.agents.email_graph import get_email_graph, MAX_ATTEMPTS
+        from app.agents.email_drafter import clean_email_body
         from app.services.observability_service import ObservabilityService
-        
+
         first_name = prospect_name.split(' ')[0] if prospect_name and ' ' in prospect_name else (prospect_name or "there")
+
+        ctx = {
+            "sender_name": sender_name,
+            "sender_services": sender_services,
+            "sender_map": sender_map,
+            "user_name": user_name,
+            "prospect_name": prospect_name,
+            "prospect_first_name": first_name,
+            "target_company": target_company_name,
+            "prospect_role": prospect_role,
+            "prospect_seniority": prospect_seniority,
+            "research_summary": research_summary,
+            "growth_hooks": growth_hooks,
+            "pain_hooks": pain_hooks,
+            "news_hooks": news_hooks,
+            "opportunity_reason": opportunity_reason,
+            "objective": objective,
+        }
 
         try:
             with ObservabilityService.track_latency("gpt_draft_generation"):
-                drafts = await chain.ainvoke({
-                    "sender_name": sender_name,
-                    "sender_services": sender_services,
-                    "sender_map": sender_map,
-                    "prospect_name": prospect_name,
-                    "prospect_first_name": first_name,
-                    "target_company": target_company_name,
-                    "prospect_role": prospect_role,
-                    "prospect_seniority": prospect_seniority,
-                    "research_summary": research_summary,
-                    "growth_hooks": growth_hooks,
-                    "pain_hooks": pain_hooks,
-                    "news_hooks": news_hooks,
-                    "opportunity_reason": opportunity_reason,
-                    "user_name": user_name
-                })
-            
-            # Clean single line breaks to prevent jagged hard-wrapping on UI
-            from app.agents.email_drafter import clean_email_body
-            cleaned_body = clean_email_body(drafts.body)
-            
-            # 3. Post-process into a structured response for workers
-            final_drafts = {
-                "primary": {"subject": drafts.subject, "body": cleaned_body}
-            }
-            
-            # Create a compatibility object that looks like EmailDraftSet to the worker
+                final_state = await get_email_graph().ainvoke(
+                    {"ctx": ctx, "attempts": 0, "max_attempts": MAX_ATTEMPTS}
+                )
+
+            draft = final_state.get("draft")
+            strategy = final_state.get("strategy") or {}
+            if not draft or not draft.get("body"):
+                logger.warning(f"[DRAFT] Sub-graph produced no draft for {target_company_name}.")
+                return None
+
+            critique = final_state.get("critique") or {}
+            logger.info(
+                f"[DRAFT] {target_company_name}/{prospect_name}: "
+                f"attempts={final_state.get('attempts')} verdict={critique.get('verdict')} "
+                f"score={critique.get('score')}"
+            )
+
+            cleaned_body = clean_email_body(draft["body"])
+            final_drafts = {"primary": {"subject": draft["subject"], "body": cleaned_body}}
+
+            # Compatibility object expected by the ghostwriter worker.
             class CompatibilityDraftSet:
                 def __init__(self, variants, strategic, pain, hook):
                     self.variants = variants
                     self.strategic_observation = strategic
                     self.pain_hypothesis = pain
                     self.personalization_hook = hook
-            
+
             return CompatibilityDraftSet(
-                final_drafts, 
-                drafts.strategic_observation, 
-                drafts.pain_hypothesis, 
-                drafts.personalization_hook
+                final_drafts,
+                strategy.get("strategic_observation", ""),
+                strategy.get("pain_hypothesis", ""),
+                strategy.get("hook", ""),
             )
         except Exception as e:
             logger.error(f"Drafting error for {target_company_name}: {e}")

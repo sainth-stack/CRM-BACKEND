@@ -4,6 +4,7 @@ Resolves prospect timezone and calculates the next available send slot
 within the allowed delivery windows, staggered across a user's queued sends.
 """
 import datetime
+import re
 from datetime import time, timedelta, timezone
 
 import pytz
@@ -103,9 +104,9 @@ def resolve_prospect_timezone(db: Session, dm) -> str:
         if row and row[0] and _is_valid_tz(row[0]):
             return _save_and_return(row[0])
 
-    # 4. Geopy geocoding — only reached when the DB has no prior record.
+    # 4. Geocoding (cleaned + laddered) — only reached when the DB has no record.
     if location:
-        tz = _lookup_timezone_from_location(location)
+        tz = geocode_timezone(location)
         if tz:
             return _save_and_return(tz)
 
@@ -173,6 +174,20 @@ def calculate_next_send_slot(user_id: str, prospect_tz: str, db: Session) -> dat
     return _find_next_window_slot(start_utc, tz)
 
 
+def next_window_slot(start_utc: datetime.datetime, prospect_tz: str) -> datetime.datetime:
+    """Public wrapper: next in-window, weekday-aligned slot at/after start_utc,
+    in the prospect's timezone. Returns UTC-naive. Unlike calculate_next_send_slot
+    this does NOT stagger behind other queued sends — it is used by the fire-time /
+    recovery paths, where re-staggering behind the whole queue causes a cascade."""
+    try:
+        tz = pytz.timezone(prospect_tz)
+    except pytz.UnknownTimeZoneError:
+        tz = pytz.UTC
+    if start_utc.tzinfo is None:
+        start_utc = start_utc.replace(tzinfo=UTC)
+    return _find_next_window_slot(start_utc, tz)
+
+
 def is_in_delivery_window(now_utc: datetime.datetime, prospect_tz: str) -> bool:
     """
     Returns True if now_utc falls inside any delivery window in the prospect's
@@ -237,6 +252,9 @@ def _get_timezonefinder():
     return _tf
 
 
+_geocode_fn = None
+
+
 def _get_geocoder():
     global _geocoder
     if _geocoder is None:
@@ -245,17 +263,113 @@ def _get_geocoder():
     return _geocoder
 
 
+def _get_geocode_fn():
+    """Rate-limited geocode callable — enforces Nominatim's ~1 req/sec usage
+    policy so the deployment isn't blocked when geocoding many locations."""
+    global _geocode_fn
+    if _geocode_fn is None:
+        from geopy.extra.rate_limiter import RateLimiter
+        # Wrap a lambda (not the bound method) so the CURRENT _geocoder is resolved
+        # on every call — preserves RateLimiter delay state while keeping the
+        # geocoder swappable (tests, re-init).
+        _geocode_fn = RateLimiter(
+            lambda query, **kw: _get_geocoder().geocode(query, **kw),
+            min_delay_seconds=1.0,
+            max_retries=1,
+            swallow_exceptions=True,
+        )
+    return _geocode_fn
+
+
+# Postcode patterns stripped from location strings before geocoding — Nominatim
+# resolves clean place names far better than jammed "town postcode" fragments.
+_UK_POSTCODE = re.compile(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", re.I)
+_US_ZIP = re.compile(r"\b\d{5}(?:-\d{4})?\b")
+
+
+def _normalize_location(s: str) -> str:
+    s = re.sub(r"\s+", " ", s.strip())
+    # Collapse the redundant "United Kingdom Uk" the source data emits.
+    s = re.sub(r"United Kingdom\s+Uk\b", "United Kingdom", s, flags=re.I)
+    return s
+
+
+def _location_candidates(location: str) -> list[str]:
+    """Build progressively coarser geocode queries from a messy location string.
+
+    e.g. 'England, nuneaton and bedworth cv11 5ab, United Kingdom Uk' ->
+      ['CV11 5AB, United Kingdom', 'England, nuneaton and bedworth, United Kingdom',
+       'nuneaton and bedworth, United Kingdom', 'England, United Kingdom',
+       'United Kingdom']
+    The first candidate that geocodes wins. Country-level still yields the correct
+    timezone for single-tz countries (UK, Italy, ...) and is only a last resort.
+    """
+    s = _normalize_location(location)
+    segs = [seg.strip(" ,") for seg in s.split(",") if seg.strip(" ,")]
+    cleaned: list[str] = []
+    for seg in segs:
+        c = _US_ZIP.sub("", _UK_POSTCODE.sub("", seg))
+        c = re.sub(r"\s+", " ", c).strip(" ,")
+        if c:
+            cleaned.append(c)
+
+    cands: list[str] = []
+
+    def add(c: str) -> None:
+        if not c:
+            return
+        c = re.sub(r"\s+", " ", c).strip(" ,")
+        if c and c.lower() not in [x.lower() for x in cands]:
+            cands.append(c)
+
+    pc = _UK_POSTCODE.search(s)
+    if pc and cleaned:
+        add(f"{pc.group(0)}, {cleaned[-1]}")          # precise: 'CV11 5AB, United Kingdom'
+    add(", ".join(cleaned))                            # full cleaned
+    if len(cleaned) >= 2:
+        add(", ".join(cleaned[-2:]))                   # city/region + country
+        add(f"{cleaned[0]}, {cleaned[-1]}")            # region + country
+    if cleaned:
+        add(cleaned[-1])                               # country (last resort)
+    return cands
+
+
 def _lookup_timezone_from_location(location_str: str) -> str | None:
     try:
-        geo = _get_geocoder().geocode(location_str)
+        geo = _get_geocode_fn()(location_str)
         if not geo:
             return None
-
         tz = _get_timezonefinder().timezone_at(lng=geo.longitude, lat=geo.latitude)
         return tz
     except Exception as exc:
         logger.warning(f"[SCHEDULER] Timezone lookup failed for '{location_str}': {exc}")
         return None
+
+
+def geocode_timezone(location: str | None, cache: dict | None = None) -> str | None:
+    """Resolve an IANA timezone from a free-text location string.
+
+    Tries a ladder of progressively coarser queries (see _location_candidates) so
+    messy 'town postcode, Country' strings still resolve instead of falling back to
+    UTC. An optional per-run cache (keyed by the raw location) ensures each distinct
+    location is geocoded only once. Returns None only when nothing resolves.
+    """
+    if not location or not str(location).strip():
+        return None
+    key = str(location).strip().lower()
+    if cache is not None and key in cache:
+        return cache[key]
+
+    result: str | None = None
+    for candidate in _location_candidates(location):
+        tz = _lookup_timezone_from_location(candidate)
+        if tz and _is_valid_tz(tz):
+            result = tz
+            break
+
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def _find_next_window_slot(

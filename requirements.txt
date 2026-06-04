@@ -1,4 +1,4 @@
-fastapi
+xfastapi
 uvicorn
 sqlalchemy
 psycopg2-binary
@@ -9,6 +9,8 @@ langchain-openai
 langchain-core
 langchain-community
 langgraph
+langgraph-checkpoint-postgres
+psycopg[binary]
 apscheduler
 tavily-python
 python-multipart

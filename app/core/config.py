@@ -10,8 +10,13 @@ class Settings:
     
     # 2. AI COST GOVERNANCE & REQUEST CACHING
     LLM_DAILY_BUDGET_USD = float(os.getenv("LLM_DAILY_BUDGET_USD", "50.00"))
+    LLM_CAMPAIGN_BUDGET_USD = float(os.getenv("LLM_CAMPAIGN_BUDGET_USD", "10.00"))
     LLM_CACHE_ENABLED = os.getenv("LLM_CACHE_ENABLED", "True").lower() == "true"
     LLM_CACHE_TTL_SECONDS = int(os.getenv("LLM_CACHE_TTL_SECONDS", "86400"))
+
+    # CSV ingestion cap. Replaces the old hard 100-row limit. Set high enough to
+    # process realistic uploads while protecting the t2.medium box from OOM.
+    MAX_CSV_ROWS = int(os.getenv("MAX_CSV_ROWS", "2000"))
     
     # 3. PRODUCTION OBSERVABILITY, METRICS & ALERTS
     SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
@@ -73,6 +78,10 @@ class Settings:
     # 9. DISTRIBUTED EXECUTION LAYER (REDIS BROKER)
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     
+    # Dispatch poller — the durable reconciliation loop that actually sends
+    # scheduled emails (DB-driven, survives server restarts / lost Celery tasks).
+    DISPATCH_POLL_SECONDS = int(os.getenv("DISPATCH_POLL_SECONDS", "60"))
+
     # 10. STATE-MACHINE TIMERS & NUDGE TUNING COORDINATES
     REPLY_FALLBACK_WINDOW_DAYS = int(os.getenv("REPLY_FALLBACK_WINDOW_DAYS", "90"))
     NUDGE_DISPATCH_STALE_MINUTES = int(os.getenv("NUDGE_DISPATCH_STALE_MINUTES", "15"))

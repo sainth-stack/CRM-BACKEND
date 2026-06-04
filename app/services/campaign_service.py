@@ -101,14 +101,25 @@ class CampaignService:
         try:
             campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
             ui_record = campaign.user_intel
+            # Full sender Brand DNA so the ICP gate judges against the REAL sender,
+            # not a hardcoded profile.
             user_intel_dict = {
+                "company_name": ui_record.company_name,
                 "services": json.loads(ui_record.offerings) if ui_record.offerings else [],
                 "target_customers": ui_record.target_customers or [],
-                "competitive_advantages": ui_record.competitive_advantages or []
+                "competitive_advantages": ui_record.competitive_advantages or [],
+                "capability_to_pain_map": ui_record.capability_to_pain_map or [],
+                "proof_points": ui_record.proof_points or [],
+                "deep_research": ui_record.deep_research or "",
             }
+            # All of the user's campaign filters reach the gate (target_industry and
+            # the objective prompt were previously dropped — the industry filter was
+            # silently ignored).
             campaign_metadata = {
+                "target_industry": campaign.target_industry,
                 "target_location": campaign.target_location,
-                "target_employee_count": campaign.target_employee_count
+                "target_employee_count": campaign.target_employee_count,
+                "prompt": campaign.prompt,
             }
         finally:
             temp_db.close()
@@ -381,6 +392,8 @@ class CampaignService:
                 "capability_to_pain_map": ui_record.capability_to_pain_map or [],
                 "competitive_advantages": ui_record.competitive_advantages or []
             }
+            # Campaign objective steers persona selection ("achieve the prompt").
+            objective = campaign.prompt or ""
 
             researched_cos_data = [
                 {
@@ -405,6 +418,10 @@ class CampaignService:
         # Resumability: each committed company flips to STAKEHOLDERS_IDENTIFIED, so the
         # read query (status == "RESEARCH_COMPLETE") won't re-select it on a retry.
         ranking_svc = StakeholderRankingService()
+        from app.core.scheduler import geocode_timezone
+        # Per-run cache so each distinct contact location is geocoded only once
+        # (Nominatim is rate-limited). Shared across all chunks in this Stage 5 run.
+        tz_cache: dict = {}
 
         def get_fuzzy(data, targets, default=None):
             for k in data.keys():
@@ -435,28 +452,19 @@ class CampaignService:
                     company_status_updates.append(co["id"])
                     continue
 
-                prospects_to_process = []
-                if len(csv_prospects) <= 4:
-                    logger.info(f"⏭️ [STAGE 5] Low prospect count ({len(csv_prospects)}). Applying Management-Level Auto-Pass.")
-                    mgmt_keywords = r'director|manager|vp|vice president|chief|head|lead|senior|principal|partner|owner'
-                    for p in csv_prospects:
-                        title = ""
-                        for key in p.keys():
-                            if key.lower() in ['title', 'position']:
-                                title = str(p.get(key) or "").lower()
-                                break
-                        if re.search(mgmt_keywords, title):
-                            p['strategic_score'] = 100
-                            p['strategic_reasoning'] = "Auto-passed via Management Gate."
-                            prospects_to_process.append(p)
-                else:
-                    research_context = co["research_summary"] or ""
-                    try:
-                        ranked_prospects = await ranking_svc.rank_stakeholders_with_ai(csv_prospects, user_intel_dict, research_context)
-                        prospects_to_process = ranked_prospects[:4]
-                    except Exception as e:
-                        logger.error(f"Failed to rank stakeholders with AI for {domain_key}: {e}")
-                        prospects_to_process = csv_prospects[:4]
+                # Rank the FULL contact set (reachability + seniority + AI persona-fit
+                # against the sender DNA, deep research, and campaign objective), then
+                # take the top 4. No contact is dropped for small companies, and large
+                # companies are ranked by signal — not arbitrary CSV order.
+                research_context = co["research_summary"] or ""
+                try:
+                    ranked_prospects = await ranking_svc.rank_stakeholders_with_ai(
+                        csv_prospects, user_intel_dict, research_context, objective=objective
+                    )
+                    prospects_to_process = ranked_prospects[:4]
+                except Exception as e:
+                    logger.error(f"Failed to rank stakeholders with AI for {domain_key}: {e}")
+                    prospects_to_process = csv_prospects[:4]
 
                 logger.info(f"   - Processing {len(csv_prospects)} candidates for {co['domain']}...")
                 for p in prospects_to_process:
@@ -475,12 +483,20 @@ class CampaignService:
                         logger.debug(f"   - Skipping {get_fuzzy(p, ['contact full name', 'name'])}: No valid email found.")
                         continue
 
+                    # Eagerly resolve & persist the prospect timezone now (geocoded
+                    # from the contact location, company location as fallback) so it
+                    # is no longer NULL waiting for the first dispatch.
+                    contact_loc = get_fuzzy(p, ["contact location", "location"])
+                    tz_location = contact_loc or get_fuzzy(p, ["company location"])
+                    resolved_tz = geocode_timezone(tz_location, tz_cache)
+
                     dms_to_create.append({
                         "target_company_id": co["id"],
                         "name": get_fuzzy(p, ["contact full name", "name"], "Unknown"),
                         "position": get_fuzzy(p, ["title", "position"], "Stakeholder"),
                         "seniority": get_fuzzy(p, ["seniority"]),
-                        "location": get_fuzzy(p, ["contact location", "location"]),
+                        "location": contact_loc,
+                        "display_timezone": resolved_tz,
                         "email": target_email,
                         "phone": get_fuzzy(p, ["contact phone 1", "phone"]),
                         "company_phone": get_fuzzy(p, ["company phone 1", "company phone"]),
@@ -531,6 +547,10 @@ class CampaignService:
                             existing_dm.position = dm_data["position"]
                             existing_dm.seniority = dm_data["seniority"]
                             existing_dm.location = dm_data["location"]
+                            # Only overwrite a resolved tz; never wipe a known-good
+                            # value with None on an idempotent re-run.
+                            if dm_data.get("display_timezone"):
+                                existing_dm.display_timezone = dm_data["display_timezone"]
                             existing_dm.phone = dm_data["phone"]
                             existing_dm.company_phone = dm_data["company_phone"]
                             existing_dm.linkedin = dm_data["linkedin"]
@@ -548,6 +568,7 @@ class CampaignService:
                                 position=dm_data["position"],
                                 seniority=dm_data["seniority"],
                                 location=dm_data["location"],
+                                display_timezone=dm_data.get("display_timezone"),
                                 email=dm_data["email"],
                                 phone=dm_data["phone"],
                                 company_phone=dm_data["company_phone"],
@@ -581,8 +602,24 @@ class CampaignService:
 
     def process_state_machine(self, db: Session, campaign_id: str, csv_content: str = None):
         """
-        The Indestructible Orchestrator (Sync V3).
+        Campaign stage orchestrator (chokepoint).
+
+        Phase 1: by default this now delegates to the LangGraph workflow engine,
+        which owns explicit, checkpointed stage transitions. Set
+        WORKFLOW_ENGINE=legacy to fall back to the original inline state machine
+        (`_process_state_machine_legacy`) with zero behaviour change.
+        """
+        from app.workflow.runner import advance_workflow, workflow_engine_enabled
+
+        if workflow_engine_enabled():
+            return advance_workflow(campaign_id)
+        return self._process_state_machine_legacy(db, campaign_id, csv_content)
+
+    def _process_state_machine_legacy(self, db: Session, campaign_id: str, csv_content: str = None):
+        """
+        The Indestructible Orchestrator (Sync V3) — legacy inline state machine.
         Checks status and executes the next logical stage based on SSoT presence.
+        Retained as a fallback behind WORKFLOW_ENGINE=legacy.
         """
         campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
         if not campaign: return

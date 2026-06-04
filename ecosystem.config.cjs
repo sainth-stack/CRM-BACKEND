@@ -1,28 +1,39 @@
 // =============================================================================
-// AI-PRIORI Backend — PM2 process manifest for the deployed server.
+// AI-PRIORI Backend — PM2 process manifest for the Celery layer (t2.medium).
 //
 // The FastAPI API does NOT run the campaign pipeline — it only enqueues Celery
-// tasks. The pipeline runs on the Celery worker + beat defined below.
+// tasks. The pipeline + the durable email-dispatch poller run on the Celery
+// workers + beat defined below.
 //
-// CAPACITY-OPTIMIZED LAYOUT (2 processes):
-//   1. crm-worker — ONE worker consuming ALL four queues. A single worker can
-//      serve multiple queues via `-Q a,b,c`; the per-queue routing in
-//      celery_app.py is unchanged. `--concurrency=2` = at most 2 tasks at once
-//      (tune up only if the box has spare RAM/CPU — heavy_research is memory-heavy).
-//   2. crm-beat — the scheduler. Lightweight, but MUST be exactly one instance.
+// WHY TWO WORKERS (not one):
+//   The outbound email dispatcher is a Celery Beat task (dispatch_due_drafts_task,
+//   every 60s on the `outbound_dispatch` queue) that actually SENDS scheduled
+//   drafts. If a SINGLE worker serves both `heavy_research` and
+//   `outbound_dispatch`, the multi-minute, memory-heavy research tasks occupy all
+//   concurrency slots and the dispatch poller never runs. Drafts go overdue, and
+//   when the poller finally runs it can only send 1/user/180s and BUMPS the rest
+//   forward — which looks like "scheduled emails keep getting rescheduled and
+//   never send". Isolating outbound_dispatch on its own lightweight worker fixes
+//   this: the poller fires every 60s regardless of what heavy_research is doing.
 //
-// Run from the `backend/` directory:
-//     pm2 start ecosystem.config.cjs
-//     pm2 save        # persist across reboots
-//     pm2 logs        # tail all processes
+// FITS A t2.medium (2 vCPU / 4 GiB):
+//   heavy: concurrency=1, hard-capped at ~600 MB/child  -> ≤ ~0.6 GB
+//   light: concurrency=2, cheap tasks (dispatch/inbox)  -> ~0.3–0.4 GB
+//   beat : negligible
+//   Plenty of headroom alongside crm-api + crm-frontend.
 //
-// NOTE: `celery` must be resolvable on PATH. If you use a virtualenv and PATH
-// is not inherited, set `script` to the absolute binary, e.g.
-//     script: "/srv/app/backend/venv/bin/celery"
+// DEPLOY (from the `backend/` directory). This REPLACES the old single
+// `crm-celery-worker` and the existing `crm-celery-beat`; it does NOT touch
+// crm-api / crm-frontend:
+//     pm2 delete crm-celery-worker crm-celery-beat   # remove the old combined worker + beat
+//     pm2 start ecosystem.config.cjs                 # start heavy + light + beat
+//     pm2 save                                        # persist across reboots
+//     pm2 logs crm-celery-worker-light               # watch the dispatch poller
 //
-// EVEN LEANER (1 process): delete the crm-beat app below and append `-B` to the
-// worker args to embed the scheduler in the worker. Acceptable for a single
-// small instance; never run more than one such worker.
+// NOTE: `celery` must be resolvable on PATH (your current setup already runs it
+// via pm2, so it is). If you use a virtualenv whose PATH is not inherited, set
+// `script` to the absolute binary, e.g. script: "/srv/app/backend/venv/bin/celery".
+// CRITICAL: never run more than ONE beat instance.
 // =============================================================================
 
 const CELERY_APP = "app.workers.config.celery_app";
@@ -45,28 +56,31 @@ const common = {
 module.exports = {
   apps: [
     {
-      // Heavy AI pipeline (Stages 3/4/5). Mostly I/O-bound (Tavily + OpenAI),
-      // so a small prefork pool + per-child recycling keeps memory flat and
-      // prevents the langchain memory creep that was triggering the OOM-killer.
-      //   --max-tasks-per-child=8 : restart each child after 8 tasks to reclaim RAM
+      // Heavy AI pipeline (Stages 3/4/5). I/O-bound (Tavily + OpenAI) but the
+      // langchain object graphs are RAM-heavy, so keep concurrency low and recycle
+      // children aggressively to keep memory flat and avoid the OOM-killer.
+      //   --concurrency=1          : one heavy task at a time on a small box
+      //   --max-tasks-per-child=8  : restart each child after 8 tasks to reclaim RAM
       //   --max-memory-per-child   : hard ceiling (KB) — child restarts if exceeded (~600MB)
       ...common,
-      name: "crm-worker-heavy",
-      args: `-A ${CELERY_APP} worker --loglevel=info --concurrency=2 -Q ${HEAVY_QUEUE} ` +
+      name: "crm-celery-worker-heavy",
+      args: `-A ${CELERY_APP} worker --loglevel=info --concurrency=1 -Q ${HEAVY_QUEUE} ` +
             `--max-tasks-per-child=8 --max-memory-per-child=600000 ${QUIET} --hostname=heavy@%h`,
     },
     {
-      // Light/latency-sensitive queues (email dispatch, inbox polling,
-      // orchestration sweeps). Cheap tasks; modest concurrency is fine.
+      // Latency-sensitive queues: email dispatch poller + send executor, inbox
+      // polling, orchestration sweeps. Cheap tasks; this worker MUST stay
+      // unblocked so dispatch_due_drafts_task fires on time. Never share it with
+      // heavy_research.
       ...common,
-      name: "crm-worker-light",
+      name: "crm-celery-worker-light",
       args: `-A ${CELERY_APP} worker --loglevel=info --concurrency=2 -Q ${LIGHT_QUEUES} ` +
             `--max-tasks-per-child=100 ${QUIET} --hostname=light@%h`,
     },
     {
       // CRITICAL: exactly ONE beat instance, ever. Never scale this.
       ...common,
-      name: "crm-beat",
+      name: "crm-celery-beat",
       args: `-A ${CELERY_APP} beat --loglevel=info --scheduler celery.beat.PersistentScheduler`,
     },
   ],

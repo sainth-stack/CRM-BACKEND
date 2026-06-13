@@ -4,12 +4,14 @@ Routing is a faithful translation of legacy `process_state_machine`:
 
   Legacy early block (status in PENDING/INPUT_VALIDATED/STAGE_1/STAGE_2/
   RESEARCHING/INTERVENTION):
-    - if not val_done and not val_failed  -> validate_input_worker
+    - input validation runs synchronously in the API (single validator); the
+      persisted review sets val_done before the campaign enters the graph
     - if not csv_done                     -> process_csv_worker
     - if val_done and not intel_done      -> (status=RESEARCHING) research_user_company_worker
     - barrier: wait until val+csv+intel   -> else find_companies_worker (status=STAGE_2)
   Stage transitions:
-    - STAGE_3_ICP_FILTERED       -> deep_research_worker
+    - dispatch_icp (find_companies_worker) merges ICP + deep research and advances
+      straight to STAGE_4_RESEARCH_COMPLETE (no separate deep-research dispatch)
     - STAGE_4_RESEARCH_COMPLETE  -> find_dms_worker
     - STAGE_5_STAKEHOLDERS_RANKED-> draft_emails_worker
   Failure:
@@ -39,10 +41,10 @@ def route(state: CampaignWorkflowState):
         return "input_gate"
 
     if not state.get("icp_done"):
-        # Pre-Stage-3 early block (parallel tracks).
+        # Pre-Stage-3 early block (parallel tracks). Input validation is no longer
+        # a dispatched track — it runs synchronously in the API and its persisted
+        # review already sets val_done before the campaign enters the graph.
         early: list[str] = []
-        if not state.get("val_done") and not state.get("val_failed"):
-            early.append("dispatch_validate")
         if not state.get("csv_done"):
             early.append("dispatch_csv")
         if state.get("val_done") and not state.get("intel_done"):
@@ -55,8 +57,9 @@ def route(state: CampaignWorkflowState):
             return "pause"
         return "dispatch_icp"
 
-    if not state.get("research_done"):
-        return "dispatch_research"
+    # ICP qualification and deep research are merged into dispatch_icp
+    # (find_companies_worker), which advances straight to STAGE_4_RESEARCH_COMPLETE.
+    # There is no separate deep-research dispatch.
     if not state.get("ranking_done"):
         return "dispatch_rank"
     if not state.get("drafting_done"):
@@ -75,14 +78,6 @@ def _set_status(campaign_id: str, status: models.CampaignStatus) -> None:
         if campaign and campaign.status != status:
             campaign.status = status
             db.commit()
-
-
-def _node_validate(state: CampaignWorkflowState):
-    from app.workers.tasks.intel_worker import validate_input_worker
-    cid = state["campaign_id"]
-    validate_input_worker.delay(cid)
-    logger.info(f"[WORKFLOW] -> validate_input_worker dispatched for {cid}")
-    return {"dispatched": ["validate"]}
 
 
 def _node_csv(state: CampaignWorkflowState):
@@ -109,14 +104,6 @@ def _node_icp(state: CampaignWorkflowState):
     find_companies_worker.delay(cid)
     logger.info(f"[WORKFLOW] -> find_companies_worker (ICP) dispatched for {cid}")
     return {"dispatched": ["icp"]}
-
-
-def _node_research(state: CampaignWorkflowState):
-    from app.workers.tasks.discovery_worker import deep_research_worker
-    cid = state["campaign_id"]
-    deep_research_worker.delay(cid)
-    logger.info(f"[WORKFLOW] -> deep_research_worker dispatched for {cid}")
-    return {"dispatched": ["research"]}
 
 
 def _node_rank(state: CampaignWorkflowState):
@@ -156,11 +143,9 @@ def _node_complete(state: CampaignWorkflowState):
 
 
 _NODES = {
-    "dispatch_validate": _node_validate,
     "dispatch_csv": _node_csv,
     "dispatch_intel": _node_intel,
     "dispatch_icp": _node_icp,
-    "dispatch_research": _node_research,
     "dispatch_rank": _node_rank,
     "dispatch_draft": _node_draft,
     "input_gate": _node_input_gate,

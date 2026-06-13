@@ -14,6 +14,7 @@ routed via app.core.llm.
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Literal, TypedDict
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -30,9 +31,12 @@ MAX_ATTEMPTS = int(os.getenv("EMAIL_MAX_DRAFT_ATTEMPTS", "2"))
 # Structured outputs                                                           #
 # --------------------------------------------------------------------------- #
 class StrategyBrief(BaseModel):
-    hook: str = Field(description="The single most specific fact/angle to lead with (from the research).")
-    pain_hypothesis: str = Field(description="The specific business pain this outreach addresses.")
-    capability_bridge: str = Field(description="Which sender capability solves that pain, and how.")
+    hook: str = Field(description="The single most specific, evidenced fact/angle to lead with (from the research) — the entry point for the Identify-Pain.")
+    pain_hypothesis: str = Field(description="The specific business pain (MEDDPICC: Identify Pain) the sender solves for this company, grounded in the evidence.")
+    capability_bridge: str = Field(description="Which exact sender capability/service solves that pain, and the differentiation that fits their likely Decision Criteria.")
+    value_proof: str = Field(description="ONE credible proof of value (MEDDPICC: Metrics) to include — a sender proof point, a quantified outcome, or a cost-of-inaction framed as a general pattern ('teams like yours typically…'). NEVER an invented company-specific number.")
+    recipient_play: str = Field(description="How to pitch GIVEN this recipient's role vs the economic buyer/champion: if they own the decision, sell the business outcome and ask for a working session; if they're a champion/influencer, give them something forwardable and easy to escalate; if adjacent, ask to be pointed to the owner.")
+    ask: str = Field(description="The single, low-friction call-to-action, calibrated to recipient_play (e.g. a 15-min discovery call, or 'who owns this on your side?').")
     strategic_observation: str = Field(description="The core strategic insight powering the email.")
     tone: str = Field(description="Tone guidance appropriate to the prospect's seniority/role.")
 
@@ -64,16 +68,20 @@ class DraftState(TypedDict, total=False):
 # Nodes                                                                        #
 # --------------------------------------------------------------------------- #
 _STRATEGIST_PROMPT = ChatPromptTemplate.from_template(
-    """You are a B2B outreach strategist. Choose the SINGLE strongest angle for one cold email.
+    """You are a B2B outreach strategist who plans cold emails using the MEDDPICC framework. Choose the
+SINGLE strongest, fully-grounded angle for ONE cold email to this specific person.
 
 SENDER:
 - Company: {sender_name}
 - Services: {sender_services}
 - Capability -> pain map: {sender_map}
+- Proof points / outcomes: {sender_proof}
+- Differentiators: {sender_advantages}
 
-PROSPECT:
+PROSPECT (the recipient):
 - Name: {prospect_name} | Title: {prospect_role} | Seniority: {prospect_seniority}
 - Company: {target_company}
+- Their role in the buying decision (our assessment): {recipient_role_signal}
 
 TARGET INTELLIGENCE:
 - Research dossier: {research_summary}
@@ -82,20 +90,41 @@ TARGET INTELLIGENCE:
 - Pain hooks: {pain_hooks}
 - Why now: {opportunity_reason}
 
+MEDDPICC READ (from qualification — hypotheses, NOT confirmed facts):
+- Evidenced need / pain: {need_evidence}
+- Pains we solve here: {matched_pains}
+- Services that map to them: {matched_services}
+- Value / metrics angle: {metrics}
+- Likely economic buyer (role): {economic_buyer}
+- Likely champion (role): {champion}
+- Likely decision criteria: {decision_criteria}
+
 CAMPAIGN OBJECTIVE (the user's goal — the email must serve it): {objective}
 
-Pick the most specific, credible hook (a real fact from the intelligence — never generic),
-the pain it implies, the exact sender capability that bridges to it, the core strategic
-observation, and the tone to use for this seniority. Do not write the email yet."""
+Plan the email with MEDDPICC:
+1. IDENTIFY PAIN -> pick the most specific, credible hook (a REAL fact from the intelligence, never generic)
+   and the pain it implies that THIS sender solves.
+2. CAPABILITY + DECISION CRITERIA -> the exact sender capability that bridges to it, leaning on the
+   differentiator most relevant to their likely decision criteria.
+3. METRICS -> one credible value_proof to include (a sender proof point or a value pattern). If no real
+   number exists, frame it as a general pattern — NEVER invent a company-specific metric.
+4. ECONOMIC BUYER vs CHAMPION -> compare THIS recipient's title/role to the likely economic buyer and
+   champion, and set recipient_play + the ask altitude accordingly (decision-owner: business outcome +
+   working session; champion/influencer: forwardable, easy to escalate; adjacent: ask for the right owner).
+Output the brief only. Do not write the email yet. Everything must be grounded in the data above."""
 )
 
 _WRITER_PROMPT = ChatPromptTemplate.from_template(
-    """You are an elite B2B ghostwriter. Write ONE cold email from this strategy.
+    """You are an elite B2B ghostwriter. Write ONE highly personalized, professional cold email from this
+MEDDPICC-grounded strategy. It must read like a sharp human wrote it for THIS person — never templated.
 
 STRATEGY:
-- Hook: {hook}
-- Pain hypothesis: {pain_hypothesis}
-- Capability bridge: {capability_bridge}
+- Hook (lead with this real fact): {hook}
+- Pain it implies (Identify Pain): {pain_hypothesis}
+- Capability bridge (+ differentiation): {capability_bridge}
+- Value proof to weave in (Metrics): {value_proof}
+- How to pitch this recipient (role play): {recipient_play}
+- The ask (calibrated): {ask}
 - Tone: {tone}
 
 DETAILS:
@@ -106,11 +135,19 @@ DETAILS:
 {refine_block}
 
 RULES:
-- Structure: a greeting line, then exactly 3 short paragraphs — (1) the hook anchored in their reality,
-  (2) the bridge to {sender_name}'s capability solving the pain, (3) a single low-friction discovery-call ask.
-- 100-150 words. Senior, direct, insight-led. Zero marketing fluff.
-- NO placeholders or bracketed tokens of any kind.
-- Each paragraph is one continuous string; double line breaks between sections only.
+- Structure: a greeting line addressing them by first name, then exactly 3 short paragraphs —
+  (1) the hook anchored in their reality and the pain it implies,
+  (2) the bridge to {sender_name}'s capability, reinforced by the value proof,
+  (3) the single ask exactly as framed in 'The ask' / 'role play'.
+- 110-160 words. Senior, direct, insight-led. Zero marketing fluff, zero clichés ("hope this finds you well").
+- GROUNDING: state only facts present in the strategy. Do NOT invent metrics, momentum, or superlatives.
+  If the value proof is a general pattern, phrase it as one ("teams like yours typically…") — never as a
+  claim about THIS company's numbers.
+- ABSOLUTELY NO PLACEHOLDERS or bracketed/curly tokens of ANY kind (no [Name], [Company], {{metric}}, <X>).
+  Every value must be a real, spelled-out fact. If you don't have a specific detail, omit it — never bracket it.
+- LINE BREAKS: write each paragraph as ONE continuous line with NO hard line breaks inside it (do not wrap
+  lines at a fixed width — let the email client wrap). Separate the greeting and the 3 paragraphs with a
+  single blank line (double line break) ONLY.
 - Sign off EXACTLY, with a blank line after 'Best regards,' and a single line break between name and company:
   "Best regards,
 
@@ -125,6 +162,7 @@ _CRITIC_PROMPT = ChatPromptTemplate.from_template(
 CAMPAIGN OBJECTIVE: {objective}
 TARGET RESEARCH (to confirm personalization is REAL, not invented): {research_summary}
 PROSPECT: {prospect_role}, seniority {prospect_seniority}, at {target_company}
+RECIPIENT'S ROLE IN THE DECISION: {recipient_role_signal}
 
 EMAIL SUBJECT: {subject}
 EMAIL BODY:
@@ -132,21 +170,30 @@ EMAIL BODY:
 
 Fail (verdict=revise) if ANY of these are violated:
 1. Personalization is generic or not grounded in the research (no specific fact tied to the prospect's company).
-2. Contains placeholders/bracketed tokens, or "Hope this finds you well"-type filler.
+2. Contains ANY placeholder or bracketed/curly token ([..], {{..}}, <..>), an unfilled detail, or
+   "Hope this finds you well"-type filler.
 3. Does not serve the campaign objective.
-4. Wrong sign-off format, or more than one ask, or clearly over/under length (target ~100-150 words).
-5. Tone mismatched to seniority.
+4. Wrong sign-off format, more than one ask, or clearly over/under length (target ~110-160 words).
+5. Tone or ask mismatched to the recipient's role (e.g. asking a non-owner to "buy", or pitching ROI to
+   someone who should be asked to forward/point to the owner).
+6. States a MEDDPICC hypothesis as a fact (asserts who the buyer is, their decision/paper process, or an
+   invented company-specific metric). Value must be a sender proof point or a clearly general pattern.
+7. Has hard line breaks INSIDE a paragraph (a paragraph must be one continuous line; only blank lines
+   separate sections), or exposes any internal framework jargon (MEDDPICC, "economic buyer", "champion").
 List concrete issues to fix. Give an overall score 0-100. verdict=pass only if it is genuinely send-ready."""
 )
 
 
 def _reasoning_llm():
-    return get_chat_llm("reasoning", timeout=90)
+    # Background drafting: cap tail latency (60s x 1 retry) so a slow provider can't
+    # stall a draft (3-5 calls) for minutes — matters now that prospects draft concurrently.
+    return get_chat_llm("reasoning", timeout=60, max_retries=1)
 
 
 def _writer_llm():
-    # Slight temperature for natural prose variety; the Critic gates quality.
-    return get_chat_llm("writer", timeout=90, temperature=0.6)
+    # Deterministic prose (temperature is forced to 0 by get_chat_llm for
+    # reproducibility — same draft inputs always yield the same email).
+    return get_chat_llm("writer", timeout=60, max_retries=1)
 
 
 def _node_strategist(state: DraftState):
@@ -156,15 +203,25 @@ def _node_strategist(state: DraftState):
         "sender_name": ctx["sender_name"],
         "sender_services": ctx["sender_services"],
         "sender_map": ctx["sender_map"],
+        "sender_proof": ctx.get("sender_proof", "N/A"),
+        "sender_advantages": ctx.get("sender_advantages", "N/A"),
         "prospect_name": ctx["prospect_name"],
         "prospect_role": ctx["prospect_role"],
         "prospect_seniority": ctx["prospect_seniority"],
         "target_company": ctx["target_company"],
+        "recipient_role_signal": ctx.get("recipient_role_signal", "N/A"),
         "research_summary": ctx["research_summary"],
         "growth_hooks": ctx["growth_hooks"],
         "news_hooks": ctx["news_hooks"],
         "pain_hooks": ctx["pain_hooks"],
         "opportunity_reason": ctx["opportunity_reason"],
+        "need_evidence": ctx.get("need_evidence", "N/A"),
+        "matched_pains": ctx.get("matched_pains", "N/A"),
+        "matched_services": ctx.get("matched_services", "N/A"),
+        "metrics": ctx.get("metrics", "N/A"),
+        "economic_buyer": ctx.get("economic_buyer", "N/A"),
+        "champion": ctx.get("champion", "N/A"),
+        "decision_criteria": ctx.get("decision_criteria", "N/A"),
         "objective": ctx["objective"],
     })
     return {"strategy": brief.model_dump()}
@@ -189,6 +246,9 @@ def _node_writer(state: DraftState):
         "hook": strat["hook"],
         "pain_hypothesis": strat["pain_hypothesis"],
         "capability_bridge": strat["capability_bridge"],
+        "value_proof": strat.get("value_proof", "N/A"),
+        "recipient_play": strat.get("recipient_play", ""),
+        "ask": strat.get("ask", "Ask for a short discovery call."),
         "tone": strat["tone"],
         "sender_name": ctx["sender_name"],
         "user_name": ctx["user_name"],
@@ -211,10 +271,25 @@ def _node_critic(state: DraftState):
         "prospect_role": ctx["prospect_role"],
         "prospect_seniority": ctx["prospect_seniority"],
         "target_company": ctx["target_company"],
+        "recipient_role_signal": ctx.get("recipient_role_signal", "N/A"),
         "subject": draft["subject"],
         "body": draft["body"],
     })
-    return {"critique": critique.model_dump()}
+    crit = critique.model_dump()
+
+    # Deterministic guard for the two recurring failure modes — runs regardless of
+    # what the LLM critic said, so neither can slip through to a sent email:
+    #   (1) placeholder/bracketed tokens ([Name], {metric}, <X>),
+    #   (2) the subject line carrying a placeholder too.
+    blob = f"{draft.get('subject','')}\n{draft.get('body','')}"
+    ph = re.search(r"\[[^\]\n]+\]|\{[^}\n]+\}|<[A-Za-z][A-Za-z0-9 _/-]*>", blob)
+    if ph:
+        crit["verdict"] = "revise"
+        crit["issues"] = (crit.get("issues") or []) + [
+            f"Remove the placeholder token '{ph.group(0)}' — fill it with a real value or omit it entirely."
+        ]
+        crit["score"] = min(crit.get("score", 0) or 0, 40)
+    return {"critique": crit}
 
 
 def _route_after_critic(state: DraftState):

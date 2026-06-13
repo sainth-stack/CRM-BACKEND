@@ -28,27 +28,38 @@ def acquire_lease(db: Session, campaign_id: str, worker_id: str) -> bool:
     """
     Acquires a distributed lease for a specific campaign.
     Prevents concurrent execution and sets the initial heartbeat.
+
+    Atomic compare-and-set: the claim succeeds only if the lease is free (no
+    owner), already ours, or stale (no/old heartbeat). This is a single
+    `UPDATE ... WHERE` so two workers racing through the Redis-lock TTL gap can
+    never both win — Postgres row-locking serialises the predicate. (The previous
+    read-then-write version had a TOCTOU window where both could claim.)
     """
+    from sqlalchemy import or_
+
     now = datetime.datetime.now(UTC).replace(tzinfo=None)
     threshold = now - datetime.timedelta(minutes=10)
-    
-    campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-    if not campaign:
-        return False
-        
-    last_hb = campaign.last_heartbeat
-    if last_hb and last_hb.tzinfo is not None:
-        last_hb = last_hb.replace(tzinfo=None)
 
-    if campaign.locked_by and last_hb and last_hb > threshold:
-        if campaign.locked_by != worker_id:
-            logger.warning(f"[LEASE BLOCKED] Campaign {campaign_id} currently locked by {campaign.locked_by}. Worker {worker_id} aborting.")
-            return False
-            
-    campaign.locked_by = worker_id
-    campaign.last_heartbeat = now
+    updated = (
+        db.query(models.Campaign)
+        .filter(
+            models.Campaign.id == campaign_id,
+            or_(
+                models.Campaign.locked_by.is_(None),
+                models.Campaign.locked_by == worker_id,
+                models.Campaign.last_heartbeat.is_(None),
+                models.Campaign.last_heartbeat < threshold,
+            ),
+        )
+        .update(
+            {"locked_by": worker_id, "last_heartbeat": now},
+            synchronize_session=False,
+        )
+    )
     db.commit()
-    return True
+    if not updated:
+        logger.warning(f"[LEASE BLOCKED] Campaign {campaign_id} held by a live worker. {worker_id} aborting.")
+    return bool(updated)
 
 def heartbeat_lease(db: Session, campaign_id: str, worker_id: str):
     """

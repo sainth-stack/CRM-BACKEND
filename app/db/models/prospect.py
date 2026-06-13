@@ -39,7 +39,7 @@ class TargetCompany(Base):
     campaign_id = Column(String, ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
     name = Column(String, nullable=False)
     website = Column(String)
-    domain = Column(String, nullable=True)
+    domain = Column(String, nullable=True, index=True)
     identity_key = Column(String, nullable=True, index=True)
     linkedin = Column(String)
     linkedin_id = Column(String, nullable=True)

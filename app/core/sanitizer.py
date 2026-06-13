@@ -25,6 +25,25 @@ def sanitize_text(text: str, max_length: int = 500) -> str:
     
     return text
 
+def strip_null_bytes(value):
+    """Recursively remove NUL (0x00) bytes from strings (incl. inside lists/dicts).
+
+    PostgreSQL TEXT/VARCHAR cannot store a NUL byte and rejects the ENTIRE insert
+    with 'A string literal cannot contain NUL (0x00) characters', silently dropping
+    an otherwise-valid row. Scraped website text and messy CSV cells occasionally
+    contain stray NULs, so we scrub them at the DB-write boundary. NUL is the only
+    byte Postgres text columns forbid; other control chars are left untouched."""
+    if isinstance(value, str):
+        return value.replace("\x00", "") if "\x00" in value else value
+    if isinstance(value, list):
+        return [strip_null_bytes(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(strip_null_bytes(v) for v in value)
+    if isinstance(value, dict):
+        return {k: strip_null_bytes(v) for k, v in value.items()}
+    return value
+
+
 def sanitize_html(html_content: str) -> str:
     """
     Tactical HTML Decommissioning.

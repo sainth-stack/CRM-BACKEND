@@ -19,46 +19,6 @@ llm = ChatOpenAI(
     request_timeout=120
 )
 
-EMAIL_DRAFTER_PROMPT = """You are a World-Class Ghostwriter for high-stakes cold outreach.
-Your task is to draft a hyper-personalized email for the decision maker below.
-
-User Company Context (The Sender):
-- Brand Name: {user_company_name}
-- Mission/Motto: {user_company_moto}
-- Core Offerings: {user_company_offerings}
-- Specialized Capability Map: {user_company_research}
-
-Target Decision Maker:
-- Name: {dm_name}
-- Position: {dm_position}
-- Company: {dm_company}
-
-Strategic Intelligence (THE WHY NOW):
-- Master Research Summary: {research_summary}
-- Growth Hooks: {growth_hooks}
-- Pain Hooks: {pain_hooks}
-- News Hooks: {news_hooks}
-- Business Opportunity Reasoning: {opportunity_reason}
-
-NARRATIVE STRATEGY:
-1. THE HOOK: Lead immediately with a specific fact from the 'Strategic Intelligence'. Anchor the email in their current reality (Expansion, Pain, or News).
-2. THE BRIDGE: Connect the hook to one of the {user_company_name}'s 'Core Offerings'. 
-3. THE PROOF: Briefly mention how {user_company_name} specifically solves the problem or supports the growth mentioned in the hook.
-4. THE ASK: A low-friction "Discovery Call" request.
-
-STRICT CONSTRAINTS:
-1. NO PLACEHOLDERS. (No [Name], [Company Name], etc.). 
-2. NO generic openers like "Hope this finds you well" or "I was doing research".
-3. Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
-   "Best regards,
-   
-   {user_name}
-   {user_company_name}"
-4. Tone: Senior, direct, and insight-driven. Avoid "marketing-speak".
-5. Paragraph Formatting: Each paragraph must be a single continuous string. Use double line breaks (\\n\\n) between sections.
-6. Length: Under 150 words.
-"""
-
 FOLLOW_UP_PROMPT = """You are an elite B2B sales ghostwriter specializing in high-stakes follow-up sequences.
 
 MODE: {outreach_mode}
@@ -160,42 +120,6 @@ from pydantic import BaseModel, Field
 class EmailDraftResponse(BaseModel):
     subject: str = Field(description="The personalized email subject line")
     body: str = Field(description="The full, hyper-personalized email body")
-
-def draft_personalized_email(user_intel: dict, dm_info: dict, target_company_name: str, intel_hooks: dict, user_name: str = "Account Manager"):
-    """Generates a hyper-personalized outreach draft for a stakeholder using V2 hooks."""
-    structured_llm = llm.with_structured_output(EmailDraftResponse)
-    prompt = ChatPromptTemplate.from_template(EMAIL_DRAFTER_PROMPT)
-    chain = prompt | structured_llm
-    
-    try:
-        logger.info(f"[GHOSTWRITER] Drafting high-fidelity outreach for {dm_info.get('name')} at {target_company_name}...")
-        data = run_openai_guarded(
-            "email_draft_generation",
-            lambda: chain.invoke({
-                "user_company_name": user_intel.get("company_name", ""),
-                "user_company_moto": user_intel.get("moto", ""),
-                "user_company_offerings": ", ".join(user_intel.get("offerings", [])),
-                "user_company_research": user_intel.get("deep_research", ""),
-                "dm_name": dm_info.get("name", ""),
-                "dm_position": dm_info.get("position", ""),
-                "dm_company": target_company_name,
-                "research_summary": intel_hooks.get("research_summary", ""),
-                "growth_hooks": ", ".join(intel_hooks.get("growth_hooks", [])),
-                "pain_hooks": ", ".join(intel_hooks.get("pain_hooks", [])),
-                "news_hooks": ", ".join(intel_hooks.get("news_hooks", [])),
-                "opportunity_reason": intel_hooks.get("opportunity_reason", ""),
-                "user_name": user_name
-            }),
-            fallback=None,
-        )
-        if data:
-            dumped = data.model_dump()
-            dumped["body"] = clean_email_body(dumped["body"])
-            return dumped
-        return None
-    except Exception as e:
-        logger.error(f"[GHOSTWRITER] Outreach drafting critical failure: {e}", exc_info=True)
-        return None
 
 def _followup_escalation_level(n: int) -> str:
     if n <= 3:

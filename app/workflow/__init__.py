@@ -1,12 +1,12 @@
 """
 Outreach v4 — LangGraph Workflow Engine (Phase 1 spine).
 
-This package introduces an explicit, checkpointed LangGraph StateGraph as the
-single source of truth for campaign stage transitions. In Phase 1 it is a
-*routing brain only*: every node is a thin dispatcher that enqueues the existing
-Celery worker for a stage and updates campaign status exactly as the legacy
-`CampaignService.process_state_machine` did. No agent/LLM behaviour changes here.
+This package is the explicit, checkpointed LangGraph StateGraph that is the single
+source of truth for campaign stage transitions. It is a *routing brain only*:
+every node is a thin dispatcher that enqueues the existing Celery worker for a
+stage and updates campaign status. No agent/LLM behaviour lives here.
 
-Activation is controlled by the WORKFLOW_ENGINE env var ("langgraph" default,
-"legacy" to fall back to the original inline state machine).
+`CampaignService.process_state_machine` delegates to this engine
+(`runner.advance_workflow`); if the checkpointer is unavailable the runner falls
+back to an ephemeral graph so routing always proceeds.
 """

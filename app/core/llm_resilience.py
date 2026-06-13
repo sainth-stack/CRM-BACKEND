@@ -52,12 +52,72 @@ def is_openai_provider_failure(exc: Exception) -> bool:
     return any(marker in message for marker in _OPENAI_PROVIDER_MARKERS)
 
 
+# Bump this (or set env LLM_CACHE_KEY_VERSION) to force-invalidate ALL cached LLM
+# responses — e.g. after a change to the cache-keying logic itself. v2 = cache keys
+# now incorporate the prompt-template text (see _extract_prompt_text below), so a
+# prompt edit no longer silently serves a stale, pre-edit response.
+CACHE_KEY_VERSION = os.getenv("LLM_CACHE_KEY_VERSION", "v2")
+
+
+def _extract_prompt_text(val, _depth: int = 0) -> str:
+    """Pull the literal prompt-template text out of a LangChain chain/prompt object.
+
+    The action lambda's closure captures `chain = prompt | llm`. The INPUT variables
+    are already hashed, but the prompt TEMPLATE was not — so editing a prompt left the
+    cache key unchanged and old responses kept being served. We walk the runnable to
+    collect every template string (and the model name), and hash that too. We extract
+    ONLY template strings + model id — never the LLM client object — so the key stays
+    deterministic across processes.
+    """
+    if val is None or _depth > 5:
+        return ""
+    texts: list[str] = []
+
+    # RunnableSequence (prompt | llm | ...) exposes its parts via `.steps`.
+    steps = getattr(val, "steps", None)
+    if isinstance(steps, (list, tuple)):
+        for s in steps:
+            texts.append(_extract_prompt_text(s, _depth + 1))
+
+    # ChatPromptTemplate: each message wraps a prompt with `.template`.
+    messages = getattr(val, "messages", None)
+    if isinstance(messages, (list, tuple)):
+        for m in messages:
+            inner = getattr(getattr(m, "prompt", None), "template", None)
+            if isinstance(inner, str):
+                texts.append(inner)
+            direct = getattr(m, "template", None)
+            if isinstance(direct, str):
+                texts.append(direct)
+
+    # PromptTemplate / single-message prompt: `.template`.
+    tmpl = getattr(val, "template", None)
+    if isinstance(tmpl, str):
+        texts.append(tmpl)
+
+    # Pin the model id too, so swapping models also busts the cache.
+    for attr in ("model_name", "model"):
+        m = getattr(val, attr, None)
+        if isinstance(m, str):
+            texts.append(f"__model__:{m}")
+
+    # RunnableBinding (e.g. with_structured_output / .bind) wraps a `.bound` runnable.
+    bound = getattr(val, "bound", None)
+    if bound is not None and bound is not val:
+        texts.append(_extract_prompt_text(bound, _depth + 1))
+
+    return "\n".join(t for t in texts if t)
+
+
 def _generate_cache_key(operation_name: str, action) -> str:
     """
-    Generates a secure SHA-256 cache key based on the operation name 
-    and the closure variables/context inside the action lambda.
+    Generates a secure SHA-256 cache key based on the operation name, a key-format
+    version salt, the closure variables (input data) AND the prompt-template text
+    captured inside the action lambda. Including the template means a prompt edit
+    yields a NEW key instead of serving a stale cached response.
     """
     hash_obj = hashlib.sha256(operation_name.encode('utf-8'))
+    hash_obj.update(CACHE_KEY_VERSION.encode('utf-8'))
     if hasattr(action, '__closure__') and action.__closure__:
         for cell in action.__closure__:
             try:
@@ -69,6 +129,13 @@ def _generate_cache_key(operation_name: str, action) -> str:
                 else:
                     serialized = str(val)
                 hash_obj.update(serialized.encode('utf-8'))
+            except Exception:
+                pass
+            # Always also fold in any prompt-template text reachable from this value.
+            try:
+                prompt_text = _extract_prompt_text(val)
+                if prompt_text:
+                    hash_obj.update(prompt_text.encode('utf-8'))
             except Exception:
                 pass
     return f"llm_cache:{hash_obj.hexdigest()}"

@@ -1,13 +1,14 @@
 from app.db import models
-from app.agents.email_drafter import draft_personalized_email, draft_followup_email, draft_discovery_request
+from app.agents.email_drafter import draft_followup_email, draft_discovery_request
 from app.services.drafting_service import DraftingService
 from app.workers.config.celery_app import celery_app
 from app.core.logging_config import logger
 from sqlalchemy.exc import IntegrityError
 import json
 import datetime
-import gc
+import asyncio
 from datetime import UTC
+from app.core.config import settings
 from app.workers.lifecycle import transition_prospect
 from app.workers.utils import heartbeat_lease, db_session
 
@@ -39,14 +40,19 @@ def _save_drafts_batch(campaign_id: str, drafts_batch: list):
     """
     with db_session() as db:
         try:
+            # Idempotency Gate (batched): one query for all DMs in this batch that
+            # already have an initial draft, instead of one query per draft.
+            batch_dm_ids = [dm_id for dm_id, _ in drafts_batch]
+            existing_initial = {
+                row[0]
+                for row in db.query(models.EmailDraft.decision_maker_id).filter(
+                    models.EmailDraft.decision_maker_id.in_(batch_dm_ids),
+                    models.EmailDraft.followup_index == 0,
+                ).all()
+            }
+
             for dm_id, draft_set in drafts_batch:
-                # Idempotency Gate: Prevent duplicate initial drafts inside the write block
-                exists = db.query(models.EmailDraft.id).filter(
-                    models.EmailDraft.decision_maker_id == dm_id,
-                    models.EmailDraft.followup_index == 0
-                ).first() is not None
-                
-                if exists:
+                if dm_id in existing_initial:
                     logger.info(f"[BATCH IDEMPOTENCY] Initial email draft already exists for DM {dm_id}. Skipping insertion.")
                     continue
 
@@ -99,6 +105,16 @@ def _get_pending_prospects(db, campaign_id: str, lock_key: str) -> list[dict]:
             release_lock(lock_key)
             return []
 
+    # Batch the "already has a draft?" check into ONE query instead of one per DM
+    # (the previous per-DM existence query was an N+1 across the whole campaign).
+    drafted_dm_ids = {
+        row[0]
+        for row in db.query(models.EmailDraft.decision_maker_id)
+        .filter(models.EmailDraft.campaign_id == campaign_id)
+        .distinct()
+        .all()
+    }
+
     # Issue 5: Paginate dataset queries to keep memory utilization flat
     PAGE_SIZE = 500
     offset = 0
@@ -112,11 +128,10 @@ def _get_pending_prospects(db, campaign_id: str, lock_key: str) -> list[dict]:
                     .all())
         if not dms_page:
             break
-        
+
         for dm in dms_page:
             # Issue 5: Filter out pre-drafted items early to avoid massive object overhead
-            exists = db.query(models.EmailDraft.id).filter(models.EmailDraft.decision_maker_id == dm.id).first() is not None
-            if not exists:
+            if dm.id not in drafted_dm_ids:
                 dm_data_list.append({
                     "id": dm.id,
                     "name": dm.name,
@@ -164,64 +179,84 @@ def draft_emails_worker(self, campaign_id: str):
     Generates personalized outreach content for all stakeholders identified in previous phases.
     """
     worker_id = self.request.id
-    from app.core.security import acquire_lock
-    
+    from app.core.security import acquire_lock, release_lock
+    from app.workers.utils import acquire_lease, release_lease
+
     lock_key = f"campaign_stage6:{campaign_id}"
     if not acquire_lock(lock_key, ttl=3600): return
 
-    logger.info(f"[CAMPAIGN] Initiating draft generation for campaign {campaign_id}")
-    
-    # 1. Fetch active target list in a paginated, short read session
-    dm_data_list = []
-    with db_session() as db:
-        dm_data_list = _get_pending_prospects(db, campaign_id, lock_key)
+    try:
+        # Claim the DB lease so the heartbeat pulses below actually persist
+        # (heartbeat_lease only updates rows where locked_by == worker_id) and the
+        # stuck-campaign sweeper won't resurrect this drafting run mid-flight.
+        with db_session() as db_lease:
+            if not acquire_lease(db_lease, campaign_id, worker_id):
+                release_lock(lock_key)
+                return
 
-    if not dm_data_list:
-        return
-
-    logger.info(f"[GHOSTWRITER] Generating content for {len(dm_data_list)} prospects.")
-    drafter = DraftingService()
-    processed_count = 0
-    BATCH_SIZE = 10
-    pending_drafts = []
-
-    for item in dm_data_list:
-        processed_count += 1
-        dm_id = item["id"]
-        dm_name = item["name"]
-
-        # Heartbeat Pulse inside the loop (session-safe)
-        if processed_count % 5 == 0:
-            with db_session() as db_heartbeat:
-                try:
-                    heartbeat_lease(db_heartbeat, campaign_id, worker_id)
-                except Exception:
-                    pass
-
-        # V2 Strategic Drafting Cluster runs with ZERO database sessions held
         try:
-            draft_set = drafter.generate_draft_set(None, dm_id)
+            logger.info(f"[CAMPAIGN] Initiating draft generation for campaign {campaign_id}")
             
-            if draft_set and draft_set.variants:
-                pending_drafts.append((dm_id, draft_set))
-                
-                # Check if we should commit the accumulated batch
-                if len(pending_drafts) >= BATCH_SIZE:
+            # 1. Fetch active target list in a paginated, short read session
+            dm_data_list = []
+            with db_session() as db:
+                dm_data_list = _get_pending_prospects(db, campaign_id, lock_key)
+
+            if not dm_data_list:
+                return
+
+            logger.info(f"[GHOSTWRITER] Generating content for {len(dm_data_list)} prospects.")
+            drafter = DraftingService()
+            BATCH_SIZE = 10
+            DRAFT_CONCURRENCY = settings.STAGE6_CONCURRENCY
+
+            async def _draft_batch(batch_items):
+                """Draft one batch of prospects CONCURRENTLY (bounded). Each draft is a
+                3-5 LLM-call sub-graph; fanning prospects out cuts Stage-6 wall-clock ~Nx
+                while memory stays flat (only one batch of results is ever held). Each
+                draft still runs with ZERO database sessions held during the LLM work."""
+                sem = asyncio.Semaphore(DRAFT_CONCURRENCY)
+
+                async def _one(item):
+                    async with sem:
+                        try:
+                            ds = await drafter.agenerate_draft_set(None, item["id"])
+                            return item["id"], ds
+                        except Exception as draft_e:
+                            logger.error(f"Drafting Failure for {item['name']}: {draft_e}")
+                            return item["id"], None
+
+                return await asyncio.gather(*[_one(it) for it in batch_items])
+
+            # Process in commit-batches: draft each batch concurrently, persist, heartbeat.
+            for start in range(0, len(dm_data_list), BATCH_SIZE):
+                batch_items = dm_data_list[start:start + BATCH_SIZE]
+                results = asyncio.run(_draft_batch(batch_items))
+
+                pending_drafts = [
+                    (dm_id, ds) for dm_id, ds in results
+                    if ds and getattr(ds, "variants", None)
+                ]
+                if pending_drafts:
                     _save_drafts_batch(campaign_id, pending_drafts)
-                    pending_drafts.clear()
-            else:
-                logger.warning(f"[GHOSTWRITER] Null Draft Set for {dm_name}")
-        except Exception as draft_e:
-            logger.error(f"Drafting Failure for {dm_name}: {draft_e}")
-            continue
 
-    # Commit any remaining drafts in the final batch
-    if pending_drafts:
-        _save_drafts_batch(campaign_id, pending_drafts)
+                # Heartbeat once per batch (session-safe)
+                with db_session() as db_heartbeat:
+                    try:
+                        heartbeat_lease(db_heartbeat, campaign_id, worker_id)
+                    except Exception:
+                        pass
 
-    # Final Campaign Status Update in a short write session
-    with db_session() as db:
-        _update_campaign_draft_status(db, campaign_id, lock_key)
+            # Final Campaign Status Update in a short write session
+            with db_session() as db:
+                _update_campaign_draft_status(db, campaign_id, lock_key)
+        finally:
+            # Release the DB lease
+            with db_session() as db_rel:
+                release_lease(db_rel, campaign_id, worker_id)
+    finally:
+        # Ensure lock is released (idempotent, protects against early exits)
+        release_lock(lock_key)
 
 
 def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, alternative_slots: list = None):

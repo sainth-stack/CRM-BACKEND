@@ -169,6 +169,21 @@ def release_lock(lock_key: str):
     if r:
         r.delete(f"lock:{lock_key}")
 
+def lock_exists(lock_key: str) -> bool:
+    """Non-destructive liveness probe: is this distributed lock currently held?
+
+    Used by the stuck-campaign sweeper to avoid resurrecting a campaign whose
+    stage worker is still alive (holding the lock). Fail-safe: on any Redis error
+    we return False (treat as not-held) so recovery is never blocked by a probe.
+    """
+    r = _get_redis()
+    if not r:
+        return False
+    try:
+        return bool(r.exists(f"lock:{lock_key}"))
+    except Exception:
+        return False
+
 def _get_revocation_time(user_id: str) -> float:
     """Retrieves the last recorded high-precision revocation timestamp for a user identity."""
     r = _get_redis()

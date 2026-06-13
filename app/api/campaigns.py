@@ -5,7 +5,6 @@ from pydantic import BaseModel
 import uuid
 import datetime
 from datetime import UTC
-import os
 
 from app.db.database import get_db
 from app.db import models
@@ -16,7 +15,7 @@ from app.core.sanitizer import sanitize_text
 from app.core.config import settings
 from app.services.input_validation_service import input_validation_service
 from app.services.csv_service import CSVProcessingService
-from app.workers.tasks.intel_worker import process_csv_worker, validate_input_worker
+from app.workers.tasks.intel_worker import process_csv_worker
 
 logger = setup_logging()
 router = APIRouter()
@@ -26,7 +25,8 @@ class CampaignCreate(BaseModel):
     user_url: str
     target_industry: str
     target_location: str
-    target_employee_count: str | None = None
+    target_employee_count: str
+    prompt: str
     class Config:
         from_attributes = True
 
@@ -62,8 +62,8 @@ def create_campaign(
     user_url: str = Form(...),
     target_industry: str = Form(...),
     target_location: str = Form(...),
-    target_employee_count: str = Form(None),
-    prompt: str = Form(None),
+    target_employee_count: str = Form(...),
+    prompt: str = Form(...),
     file: UploadFile = File(None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
@@ -83,8 +83,8 @@ def create_campaign(
     # Lengths accommodate comma-separated multi-values (industry/location/size).
     sanitized_industry = sanitize_text(target_industry, max_length=300)
     sanitized_location = sanitize_text(target_location, max_length=300)
-    sanitized_emp_count = sanitize_text(target_employee_count, max_length=120) if target_employee_count else None
-    sanitized_prompt = sanitize_text(prompt, max_length=2000) if prompt else None
+    sanitized_emp_count = sanitize_text(target_employee_count, max_length=120)
+    sanitized_prompt = sanitize_text(prompt, max_length=2000)
     
     # 0.1 Mandatory SSoT Verification
     if not sanitized_name:
@@ -101,6 +101,10 @@ def create_campaign(
         raise HTTPException(status_code=400, detail="Target industry must be at least 2 characters.")
     if len(sanitized_location) < 2:
         raise HTTPException(status_code=400, detail="Target location must be at least 2 characters.")
+    if not sanitized_emp_count:
+        raise HTTPException(status_code=400, detail="Target employee count is required.")
+    if not sanitized_prompt:
+        raise HTTPException(status_code=400, detail="Campaign prompt is required.")
 
     if not file.filename.lower().endswith('.csv'):
         raise HTTPException(status_code=400, detail="Tactical Restriction: Only CSV files are authorized for lead injection.")
@@ -116,7 +120,28 @@ def create_campaign(
         target_industry=sanitized_industry,
         target_location=sanitized_location,
         prompt=sanitized_prompt,
+        sender_website=safe_url,
     )
+
+    # Safety net: user_url is mandatory and the offering is sourced from the website
+    # by Track B (brand research) — so any clarification question asking "what do you
+    # offer / what product / what service" is redundant. Filter those out; if nothing
+    # remains, treat the review as success (the LLM over-triggered on offering).
+    _OFFERING_KEYWORDS = ("offer", "product", "service", "solution", "deliverable", "what do you sell")
+    if input_review.overall.requires_user_clarification:
+        real_qs = [
+            q for q in (input_review.overall.clarification_questions or [])
+            if not any(k in q.lower() for k in _OFFERING_KEYWORDS)
+        ]
+        if not real_qs:
+            input_review.overall.status = "success"
+            input_review.overall.requires_user_clarification = False
+            input_review.overall.clarification_questions = []
+            # Also clear the per-field flag if it was only about prompt-offering.
+            input_review.prompt.clarification_needed = False
+        else:
+            input_review.overall.clarification_questions = real_qs
+
     if input_review.overall.status == "needs_clarification" or input_review.overall.requires_user_clarification:
         return {
             "stage": "input_validation",
@@ -136,40 +161,39 @@ def create_campaign(
 
     reviewed_industry = sanitize_text(input_review.target_industry.corrected, max_length=200) or sanitized_industry
     reviewed_location = sanitize_text(input_review.target_location.corrected, max_length=200) or sanitized_location
-    reviewed_prompt = sanitize_text(input_review.prompt.enhanced, max_length=2000) if input_review.prompt.enhanced else None
+    # F5: prompt is mandatory — never persist a blank. If the reviewer returns an
+    # empty enhanced prompt, fall back to the user's sanitized original.
+    reviewed_prompt = sanitize_text(input_review.prompt.enhanced, max_length=2000) if input_review.prompt.enhanced else sanitized_prompt
 
     # 1. Create campaign in DB tied to user
     campaign_id = str(uuid.uuid4())
     
-    # 2. In-Memory Artifact Ingestion: Trimming to 100-row SSoT Batch
+    # 2. Streaming Artifact Ingestion: trim to the MAX_CSV_ROWS SSoT batch.
     MAX_FILE_SIZE = 200 * 1024 * 1024 # 200MB Limit
-    
+
     try:
-        # Check size before reading
+        # Check size before reading (cheap seek/tell, no data loaded).
         file.file.seek(0, 2)
         file_size = file.file.tell()
         file.file.seek(0)
-        
+
         if file_size > MAX_FILE_SIZE:
             raise HTTPException(status_code=413, detail="Artifact Oversized: Lead CSV must be under 200MB.")
 
-        content = file.file.read()
-        
-        # 2. Enforce the configurable row cap (MAX_CSV_ROWS) and filter columns.
+        # F2: stream-trim straight from the upload handle. pandas reads only
+        # MAX_CSV_ROWS and stops — the whole file is never pulled into RAM (no
+        # file.file.read(), no BytesIO copy). Bounds ingestion memory + latency.
         csv_svc = CSVProcessingService()
-        trimmed_content = csv_svc.trim_csv_from_bytes(content, max_rows=settings.MAX_CSV_ROWS)
-        
-        # 2.1 Persist Trimmed File to Disk (Replace Raw Concept)
-        os.makedirs("uploads", exist_ok=True)
-        trimmed_file_path = f"uploads/trimmed_{campaign_id}.csv"
-        with open(trimmed_file_path, "w", encoding="utf-8") as f:
-            f.write(trimmed_content)
+        trimmed_content = csv_svc.trim_csv_from_filelike(file.file, max_rows=settings.MAX_CSV_ROWS)
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Ingestion Failure: Could not process CSV for campaign {campaign_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal Ingestion Failure: Mission artifact could not be secured.")
 
+    # F1: the trimmed CSV is persisted ONLY to the DB (single SSoT). No local
+    # uploads/ file is written — removes the orphan-file disk leak and the
+    # local-storage dependency. csv_file_url stays NULL.
     new_campaign = models.Campaign(
         id=campaign_id,
         user_id=current_user.id,
@@ -179,8 +203,7 @@ def create_campaign(
         target_industry=reviewed_industry,
         target_location=reviewed_location,
         target_employee_count=sanitized_emp_count,
-        trimmed_csv_data=trimmed_content, # DB SSoT
-        csv_file_url=trimmed_file_path,   # Physical SSoT
+        trimmed_csv_data=trimmed_content, # DB SSoT (only copy)
         status=models.CampaignStatus.INPUT_VALIDATED
     )
     db.add(new_campaign)
@@ -213,9 +236,11 @@ def create_campaign(
     db.add(new_intel)
     db.commit()
 
-    # 3. Mobilize Gated Background Pipeline (Track A & B)
+    # 3. Mobilize Gated Background Pipeline.
+    # Input validation already ran synchronously above (single validator) and its
+    # review is persisted, so only the CSV + brand-intel tracks need dispatching;
+    # the persisted review already satisfies the pipeline's val_done gate.
     process_csv_worker.delay(campaign_id)
-    validate_input_worker.delay(campaign_id)
 
     return {
         "id": campaign_id,
@@ -495,6 +520,10 @@ def get_campaign(
         "created_at": db_campaign.created_at,
         "target_industry": db_campaign.target_industry,
         "target_location": db_campaign.target_location,
+        "target_employee_count": db_campaign.target_employee_count,
+        # Stage-1 input-validation agent output (corrected industry/location + enhanced
+        # prompt). The Briefing view renders these validated values, not the raw input.
+        "input_validation_review": db_campaign.input_validation_review,
         "user_intel": {k: v for k, v in db_campaign.user_intel.__dict__.items() if k != "_sa_instance_state"} if db_campaign.user_intel else None,
         "target_companies_count": len([c for c in db_campaign.target_companies if getattr(c, 'status', 'NEW') != "REJECTED"]),
         "target_companies": target_companies,
@@ -537,21 +566,52 @@ def update_campaign(
         db_campaign.name = sanitize_text(update.name, max_length=100)
     if update.prompt:
         db_campaign.prompt = sanitize_text(update.prompt, max_length=2000)
-        # Reset validation state if prompt changed
-        db_campaign.input_validation_review = None
-        if db_campaign.status == "INTERVENTION_NEEDED":
-             db_campaign.status = models.CampaignStatus.INPUT_VALIDATED
-        
     if update.target_industry:
         db_campaign.target_industry = sanitize_text(update.target_industry, max_length=200)
     if update.target_location:
         db_campaign.target_location = sanitize_text(update.target_location, max_length=200)
 
-    db.commit()
+    # Single input validator: when any reviewed field changes, re-run the same
+    # synchronous review used at creation and persist its corrections. This
+    # replaces the old async Track C re-trigger and keeps the val_done gate
+    # consistent (the persisted review is the single source of truth).
+    if any([update.prompt, update.target_industry, update.target_location]):
+        review = input_validation_service.review_inputs(
+            target_industry=db_campaign.target_industry or "",
+            target_location=db_campaign.target_location or "",
+            prompt=db_campaign.prompt,
+            sender_website=db_campaign.website,
+        )
 
-    # Re-trigger validation if prompt was updated
-    if update.prompt:
-        validate_input_worker.delay(campaign_id)
+        # Same offering-question safety net as create_campaign: user_url is mandatory
+        # and the offering is sourced from the website by Track B, so an offering-only
+        # clarification is redundant and must not block the user.
+        _OFFERING_KW = ("offer", "product", "service", "solution", "deliverable", "what do you sell")
+        if review.overall.requires_user_clarification:
+            real_qs = [
+                q for q in (review.overall.clarification_questions or [])
+                if not any(k in q.lower() for k in _OFFERING_KW)
+            ]
+            if not real_qs:
+                review.overall.status = "success"
+                review.overall.requires_user_clarification = False
+                review.overall.clarification_questions = []
+                review.prompt.clarification_needed = False
+            else:
+                review.overall.clarification_questions = real_qs
+
+        db_campaign.input_validation_review = review.model_dump()
+        if review.overall.status == "needs_clarification" or review.overall.requires_user_clarification:
+            db_campaign.status = models.CampaignStatus.INTERVENTION_NEEDED
+        else:
+            db_campaign.target_industry = sanitize_text(review.target_industry.corrected, max_length=200) or db_campaign.target_industry
+            db_campaign.target_location = sanitize_text(review.target_location.corrected, max_length=200) or db_campaign.target_location
+            if review.prompt.enhanced:
+                db_campaign.prompt = sanitize_text(review.prompt.enhanced, max_length=2000)
+            if db_campaign.status == "INTERVENTION_NEEDED":
+                db_campaign.status = models.CampaignStatus.INPUT_VALIDATED
+
+    db.commit()
 
     return {"message": "Campaign updated successfully"}
 

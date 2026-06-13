@@ -135,7 +135,7 @@ class CallingAgent:
         self.cluster = DistributedCluster()
         self.validator = RequestValidator(self.auth_token)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=50) # High-scale scaling
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, top_p=1, seed=42)
 
     def _validate_coordinate(self, phone: str) -> Optional[str]:
         """Hard Phone-Native Validation & Normalization."""

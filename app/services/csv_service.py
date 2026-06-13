@@ -38,11 +38,10 @@ def get_fuzzy_map(cols):
         'company_phone_1': r'company\s*phone\s*1'
     }
 
-    # Dynamic Clustered Patterns (Email 1-10, Mobile 1-10)
+    # Dynamic Clustered Patterns (Mobile 1-10). Email-validation slots
+    # (Email 1-10 + their Validation columns) are intentionally NOT mapped:
+    # reachability is now decided solely by whether a Primary Email exists.
     for i in range(1, 11):
-        patterns[f'email_{i}'] = fr'^email\s*{i}$'
-        patterns[f'email_{i}_validation'] = fr'^email\s*{i}\s*validation$'
-        
         # Special case: The first mobile phone often has no number '1' in the base header
         if i == 1:
             patterns[f'contact_mobile_phone_{i}'] = fr'contact\s*mobile\s*phone$'
@@ -61,15 +60,10 @@ def get_fuzzy_map(cols):
 class CSVProcessingService:
     SELECTED_COLUMNS = [
         "Contact Full Name", "Title", "Seniority", "Department", "Company Name - Cleaned", "Website",
-        "Primary Email", "Contact LI Profile URL", 
-        "Email 1", "Email 1 Validation", "Email 2", "Email 2 Validation", 
-        "Email 3", "Email 3 Validation", "Email 4", "Email 4 Validation", 
-        "Email 5", "Email 5 Validation", "Email 6", "Email 6 Validation", 
-        "Email 7", "Email 7 Validation", "Email 8", "Email 8 Validation", 
-        "Email 9", "Email 9 Validation", "Email 10", "Email 10 Validation", 
-        "Contact Phone 1", "Company Phone 1", "Contact Location", "Company Location", 
-        "Company Description", "Company Website Domain", "Company Industry", 
-        "Company LI Profile Url", "Company LinkedIn ID", "Company Revenue Range", 
+        "Primary Email", "Contact LI Profile URL",
+        "Contact Phone 1", "Company Phone 1", "Contact Location", "Company Location",
+        "Company Description", "Company Website Domain", "Company Industry",
+        "Company LI Profile Url", "Company LinkedIn ID", "Company Revenue Range",
         "Company Staff Count Range", "Time in Role", "Time at Company"
     ]
 
@@ -158,70 +152,50 @@ class CSVProcessingService:
                     # Clean up: remove NaNs and keep only relevant fields
                     prospect = {k: v for k, v in prospect.items() if pd.notna(v)}
                     
-                    # Ensure email exists for basic identification
-                    if not prospect.get('primary_email') and not any(prospect.get(f'email_{i}') for i in range(1, 11)):
+                    # Ensure a primary email exists for basic identification.
+                    if not prospect.get('primary_email'):
                         continue
 
                     contacts_map[domain].append(prospect)
         except Exception as chunk_e:
             logger.error(f"Failed to process CSV chunk: {chunk_e}")
 
-        logger.info(f"📊 SSoT Chunked Ingestion Complete: {len(unique_cos)} unique companies identified.")
+        logger.info(f"SSoT Chunked Ingestion Complete: {len(unique_cos)} unique companies identified.")
         return contacts_map, unique_cos
 
-    def trim_csv(self, file_path: str, max_rows: int = 100) -> str:
+    def trim_csv_from_filelike(self, fh, max_rows: int = 100) -> str:
         """
-        Surgical Protocol: Trims the mission artifact to the high-fidelity batch limit.
-        Loads ONLY max_rows using 'nrows' to protect memory footprint entirely.
-        """
-        try:
-            # Detect Encoding
-            encodings = ['utf-8', 'latin-1', 'utf-8-sig', 'cp1252']
-            df = None
-            for enc in encodings:
-                try:
-                    df = pd.read_csv(file_path, on_bad_lines='skip', nrows=max_rows, encoding=enc)
-                    break
-                except: continue
+        Streaming trim: read ONLY max_rows directly from an upload file handle.
 
-            if df is None:
-                raise ValueError("Could not read CSV for trimming.")
-
-            # Filter Columns
-            existing_cols = [c for c in self.SELECTED_COLUMNS if c in df.columns]
-            df = df[existing_cols]
-
-            # Save back to disk (Replaces raw file)
-            df.to_csv(file_path, index=False)
-            return file_path
-        except Exception as e:
-            logger.error(f"Trimming Failure: {e}")
-            return file_path
-
-    def trim_csv_from_bytes(self, content: bytes, max_rows: int = 100) -> str:
-        """
-        Surgical Protocol: Trims the mission artifact in-memory.
-        Loads ONLY max_rows using 'nrows' to protect memory footprint entirely.
+        Never pulls the whole upload into a bytes object (and never makes an extra
+        in-memory copy). pandas reads incrementally from the handle and stops after
+        `nrows`, so peak memory is bounded by the trimmed batch (~max_rows)
+        regardless of the original file size — the big ingestion RAM/latency win.
         Returns the trimmed content as a UTF-8 string.
         """
-        try:
-            # Detect Encoding
-            encodings = ['utf-8', 'latin-1', 'utf-8-sig', 'cp1252']
-            df = None
-            for enc in encodings:
-                try:
-                    df = pd.read_csv(io.BytesIO(content), on_bad_lines='skip', nrows=max_rows, encoding=enc)
-                    break
-                except: continue
+        encodings = ['utf-8', 'latin-1', 'utf-8-sig', 'cp1252']
+        df = None
+        for enc in encodings:
+            try:
+                fh.seek(0)
+                df = pd.read_csv(fh, on_bad_lines='skip', nrows=max_rows, encoding=enc)
+                break
+            except Exception:
+                continue
 
-            if df is None:
-                raise ValueError("Could not read CSV bytes for trimming.")
+        # Last resort: decode with replacement (only the head is materialized here
+        # because nrows still caps the parse).
+        if df is None:
+            try:
+                fh.seek(0)
+                raw = fh.read()
+                if isinstance(raw, bytes):
+                    raw = raw.decode('utf-8', errors='replace')
+                df = pd.read_csv(io.StringIO(raw), on_bad_lines='skip', nrows=max_rows)
+            except Exception as e:
+                logger.error(f"Streaming Trim Failure: {e}")
+                raise ValueError("Could not read CSV upload for trimming.")
 
-            # Filter Columns
-            existing_cols = [c for c in self.SELECTED_COLUMNS if c in df.columns]
-            df = df[existing_cols]
-            
-            return df.to_csv(index=False)
-        except Exception as e:
-            logger.error(f"In-Memory Trimming Failure: {e}")
-            return content.decode('utf-8', errors='ignore')
+        existing_cols = [c for c in self.SELECTED_COLUMNS if c in df.columns]
+        df = df[existing_cols]
+        return df.to_csv(index=False)

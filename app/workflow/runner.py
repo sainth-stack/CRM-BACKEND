@@ -20,7 +20,6 @@ stall on infrastructure problems.
 """
 from __future__ import annotations
 
-import os
 import threading
 import time
 
@@ -32,6 +31,13 @@ from app.workflow.graph import build_graph
 
 # Compiled-graph singletons (per process).
 _checkpointed_graph = None
+# The saver the cached checkpointed graph was built against. A compiled graph binds
+# its checkpointer (and therefore its psycopg connection) at build time, so when
+# get_checkpointer() heals a Neon idle-drop and hands back a *new* saver, the cached
+# graph is still bound to the old, closed connection. Tracking the saver identity
+# lets us rebuild the graph on reconnect instead of invoking against a dead socket
+# (the root cause of "the connection is closed" after long stages).
+_checkpointed_graph_saver = None
 _plain_graph = None
 
 # Serialises checkpointed-graph invocations within a process. The PostgresSaver
@@ -43,12 +49,15 @@ _invoke_lock = threading.Lock()
 
 
 def _get_checkpointed_graph():
-    global _checkpointed_graph
+    global _checkpointed_graph, _checkpointed_graph_saver
     cp = get_checkpointer()
     if cp is None:
         return None
-    if _checkpointed_graph is None:
+    # Rebuild when the graph is missing OR the saver was swapped out by a reconnect.
+    # `is not` compares object identity: a healed connection yields a fresh saver.
+    if _checkpointed_graph is None or _checkpointed_graph_saver is not cp:
         _checkpointed_graph = build_graph(checkpointer=cp)
+        _checkpointed_graph_saver = cp
     return _checkpointed_graph
 
 
@@ -96,16 +105,12 @@ def advance_workflow(campaign_id: str) -> None:
                     exc_info=True,
                 )
                 reset_checkpointer()
-                global _checkpointed_graph
+                global _checkpointed_graph, _checkpointed_graph_saver
                 _checkpointed_graph = None
+                _checkpointed_graph_saver = None
 
         # Fallback: routing still works without a checkpointer.
         _get_plain_graph().invoke(state_input)
     finally:
         if locked:
             release_lock(f"workflow_route:{campaign_id}")
-
-
-def workflow_engine_enabled() -> bool:
-    """True unless explicitly switched to the legacy inline state machine."""
-    return os.getenv("WORKFLOW_ENGINE", "langgraph").strip().lower() != "legacy"

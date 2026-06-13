@@ -9,6 +9,10 @@ from sqlalchemy.dialects.postgresql import insert
 from app.db import models
 from app.core.logging_config import logger
 from app.workers.utils import heartbeat_lease
+from app.core.config import settings
+from app.core.sanitizer import strip_null_bytes
+from app.core.circuit_breaker import circuit_is_open, record_circuit_failure, CircuitOpenError
+from app.core.llm_resilience import OPENAI_CIRCUIT
 from app.services.company_validation_service import CompanyValidationService
 from app.services.stakeholder_service import StakeholderRankingService
 from app.services.user_intel_service import UserIntelService
@@ -17,7 +21,6 @@ from app.db.database import SessionLocal
 # Bounded DNS Executor for Vitality Audits
 dns_executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
-from app.services.csv_service import CSVProcessingService
 
 class CampaignService:
     """
@@ -64,37 +67,57 @@ class CampaignService:
 
 
 
-    def stage_1_csv_trimming(self, db: Session, campaign_id: str, csv_content: str):
-        """
-        STAGE 1: CSV Trimming & High-Fidelity Mapping
-        Saves a trimmed version of the CSV and updates campaign status.
-        """
-        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-        csv_svc = CSVProcessingService()
-        
-        # 1. Process and Trim
-        contacts_map, unique_cos = csv_svc.process_csv_content(
-            csv_content.encode('utf-8'), 
-            campaign.target_location, 
-            campaign.target_industry, 
-            campaign.target_employee_count, 
-            campaign_id, 
-            db
-        )
-        
-        # 2. Persist the Trimmed State (For now, we store unique_cos in metadata or a file)
-        # We also need to save the "Trimmed CSV" back to disk
-        # (Assuming CSVProcessingService handles the internal mapping)
-        
-        campaign.status = models.CampaignStatus.STAGE_1_CSV_TRIMMED
-        db.commit()
-        logger.info(f"✅ [STAGE 1] CSV Trimmed & Status Updated for {campaign_id}")
-        return unique_cos
+    def _pulse_heartbeat(self, campaign_id: str, worker_id: str | None) -> None:
+        """Refresh the campaign lease heartbeat from inside a long stage loop.
 
-    async def stage_3_icp_filtering(self, db: Session, campaign_id: str, unique_cos: dict):
+        Long stages (3/4/5) can run for many minutes. Without a heartbeat the
+        stuck-campaign sweeper treats them as dead (last_heartbeat is NULL/stale),
+        force-releases their stage lock, and re-dispatches the stage — the ICP
+        resurrection loop. Pulsing after each chunk keeps the lease fresh so the
+        sweeper only resurrects genuinely dead campaigns. Best-effort: a failed
+        pulse must never crash the stage.
         """
-        STAGE 3: ICP Filtering (AI Gatekeeper)
-        Runs soft-signal checks and saves TargetCompany records.
+        if not worker_id:
+            return
+        hb = SessionLocal()
+        try:
+            heartbeat_lease(hb, campaign_id, worker_id)
+        except Exception:
+            pass
+        finally:
+            hb.close()
+
+    def _fetch_judged_icp_domains(self, campaign_id: str) -> set:
+        """Domains already given a terminal ICP verdict for this campaign (any
+        status except ERROR). Used by Stage 3 for resume-awareness so a restart
+        skips already-decided companies. Best-effort: on error, return empty so
+        the stage simply reprocesses (correct, just not optimised)."""
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(models.TargetCompany.domain)
+                .filter(
+                    models.TargetCompany.campaign_id == campaign_id,
+                    models.TargetCompany.status != "ERROR",
+                )
+                .all()
+            )
+            return {r[0] for r in rows if r[0]}
+        except Exception:
+            return set()
+        finally:
+            db.close()
+
+    async def stage_3_icp_filtering(self, db: Session, campaign_id: str, unique_cos: dict, worker_id: str = None):
+        """
+        STAGE 3+4 (MERGED): ICP Qualification + Deep Research in one pass.
+
+        Each company gets a single combined agent call (Tavily company-intel +
+        real-time news searches feeding one LLM) that returns the accept/reject
+        verdict AND the full research dossier. The dossier is persisted for EVERY
+        company (accepted or rejected) — only the verdict differs — so there is
+        no separate deep-research stage. This halves the per-company round-trips and
+        removes an entire Celery stage (the t2.medium latency/CPU win).
         """
         # 1. Fetch Brand DNA (Short Read Session)
         temp_db = SessionLocal()
@@ -129,42 +152,100 @@ class CampaignService:
         import asyncio
 
         STAGE3_CHUNK_SIZE = 10   # companies committed per transaction
-        # Bounded fan-out: on a small instance, 10 concurrent (Tavily + LLM)
-        # pipelines spike memory enough to trigger the OOM-killer and burst past
-        # OpenAI/Tavily rate limits. 4 keeps memory flat and rate steady.
-        semaphore = asyncio.Semaphore(4)
+        # Bounded fan-out via the merged stage's own dedicated setting. Each pipeline
+        # is a website crawl + one LLM call (I/O-bound), so this can run wide without
+        # CPU/memory pressure. Tune via ICP_CONCURRENCY.
+        semaphore = asyncio.Semaphore(settings.ICP_CONCURRENCY)
 
-        async def validate_one(domain, co_data):
+        async def validate_one(domain, co_data, research_cache):
             async with semaphore:
                 try:
-                    res = await validator.validate_company(co_data, user_intel_dict, campaign_metadata)
+                    res = await validator.qualify_and_enrich(co_data, user_intel_dict, campaign_metadata, research_cache=research_cache)
                     return domain, res
                 except Exception as e:
-                    logger.error(f"Validation failed for {domain}: {e}")
-                    return domain, {"status": "ERROR", "reasoning": str(e)}
+                    logger.error(f"Qualify+enrich failed for {domain}: {e}")
+                    return domain, {"status": "ERROR", "reasoning": str(e), "_llm_error": True}
 
         # 3. Process in chunks: validate a chunk, commit it (upsert), release memory.
         items = list(unique_cos.items())
+
+        # Resume-awareness: skip companies already given a terminal ICP verdict for
+        # THIS campaign (any status except ERROR) so a restart/retry/resurrection
+        # does not re-pay LLM + Tavily for work already done. ERROR rows are kept so
+        # transient failures are re-judged. This changes only *what is recomputed*,
+        # never the qualification result for any company.
+        judged = self._fetch_judged_icp_domains(campaign_id)
+        if judged:
+            before = len(items)
+            items = [(d, data) for d, data in items if d not in judged]
+            logger.info(
+                f"♻️ [STAGE 3] Resume for {campaign_id}: {before - len(items)} already judged, "
+                f"{len(items)} remaining."
+            )
+
         total = len(items)
         logger.info(f"🚦 [STAGE 3] Filtering {total} companies for {campaign_id} in chunks of {STAGE3_CHUNK_SIZE}.")
 
         for start in range(0, total, STAGE3_CHUNK_SIZE):
+            # Fail fast on a provider outage: if the OpenAI circuit is open, stop
+            # grinding through every company (each call would just burn its retry
+            # backoff). Raising lets find_companies_worker reschedule; the
+            # resume-aware filter above means the retry skips work already done.
+            if circuit_is_open(OPENAI_CIRCUIT)[0]:
+                raise CircuitOpenError("OpenAI circuit open during Stage 3 ICP filtering")
+
             chunk = items[start:start + STAGE3_CHUNK_SIZE]
-            results = await asyncio.gather(*[validate_one(domain, data) for domain, data in chunk])
+            # One batched cache read per chunk (replaces the per-company N+1 lookup).
+            chunk_cache = validator.prefetch_icp_research([d for d, _ in chunk])
+            results = await asyncio.gather(*[validate_one(domain, data, chunk_cache) for domain, data in chunk])
             self._persist_stage3_chunk(campaign_id, results, unique_cos)
             logger.info(f"   ↳ [STAGE 3] Committed {min(start + STAGE3_CHUNK_SIZE, total)}/{total} for {campaign_id}.")
+            self._pulse_heartbeat(campaign_id, worker_id)
+
+            # Outage detection: a chunk where every company hit an LLM/transport
+            # error trips the breaker so the next iteration fails fast. Keyed off the
+            # non-persisted `_llm_error` flag — NOT the persisted status — so a chunk
+            # of legitimate REJECTED verdicts never trips it.
+            if results and all(r.get("_llm_error") for _, r in results):
+                record_circuit_failure(OPENAI_CIRCUIT, "Stage 3 chunk fully errored")
+                if circuit_is_open(OPENAI_CIRCUIT)[0]:
+                    raise CircuitOpenError("OpenAI circuit opened after repeated Stage 3 failures")
             del results
 
-        # 4. Mark stage complete once every chunk has landed.
+        # 4. Mark stage complete once every chunk has landed. Because qualification
+        # AND research happened together, accepted companies are already
+        # RESEARCH_COMPLETE — advance the campaign straight to STAGE_4 so the state
+        # machine routes to stakeholder ranking (the separate deep-research stage is
+        # now a no-op).
         temp_db = SessionLocal()
         try:
             campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
             if campaign:
-                campaign.status = models.CampaignStatus.STAGE_3_ICP_FILTERED
+                campaign.status = models.CampaignStatus.STAGE_4_RESEARCH_COMPLETE
                 temp_db.commit()
         finally:
             temp_db.close()
-        logger.info(f"✅ [STAGE 3] ICP Filtering Complete for {campaign_id}")
+        logger.info(f"✅ [STAGE 3+4] Combined ICP Qualification + Research Complete for {campaign_id}")
+
+    @staticmethod
+    def _apply_enrichment(co, res: dict) -> None:
+        """Write the combined-agent research dossier onto a TargetCompany row.
+
+        Applied to EVERY company regardless of verdict (accepted or rejected):
+        the merged ICP+research agent grounds this dossier in the same web evidence
+        for all of them, so every row is displayable. The fields default to empty
+        only when the agent hard-failed or had no evidence to work from. The verdict
+        status (ACCEPTED / REJECTED) gates *pipeline progression*, not whether
+        research is stored."""
+        co.relevance_score = res.get('relevance_score', co.relevance_score)
+        co.opportunity_reason = res.get('business_opportunity_reason', '') or ''
+        co.matched_pains = res.get('matched_pains', []) or []
+        co.matched_services = res.get('matched_services', []) or []
+        co.growth_hooks = res.get('growth_hooks', []) or []
+        co.pain_hooks = res.get('pain_hooks', []) or []
+        co.news_hooks = res.get('news_hooks', []) or []
+        co.research_summary = res.get('research_summary', '') or ''
+        co.v2_intel = res.get('hooks', {}) or {}
 
     def _persist_stage3_chunk(self, campaign_id: str, results: list, unique_cos: dict):
         """Upsert one chunk of ICP-filter results in a single short transaction.
@@ -178,8 +259,11 @@ class CampaignService:
             for domain, res in results:
                 try:
                     with temp_db.begin_nested():  # SAVEPOINT per company
+                        # Scrub NUL bytes (0x00) from scraped/CSV text — Postgres TEXT
+                        # rejects them and would drop the whole row otherwise.
+                        res = strip_null_bytes(res)
                         status = res.get('status', 'REJECTED')
-                        co_extra = unique_cos.get(domain, {})
+                        co_extra = strip_null_bytes(unique_cos.get(domain, {}))
 
                         existing_co = temp_db.query(models.TargetCompany).filter(
                             models.TargetCompany.campaign_id == campaign_id,
@@ -201,8 +285,12 @@ class CampaignService:
                             existing_co.description = co_extra.get('description')
                             existing_co.website = co_extra.get('website')
 
-                            if status == "RESEARCH_COMPLETE":
-                                existing_co.v2_intel = res.get('hooks', {})
+                            # Persist the research dossier for EVERY verdict (accepted
+                            # or rejected). The combined agent produces it for all
+                            # companies; only a hard LLM failure or a web-scrape miss
+                            # leaves it empty. Keeping it for rejects lets the UI show
+                            # why a lead was filtered, not just that it was.
+                            self._apply_enrichment(existing_co, res)
                             logger.info(f"[IDEMPOTENCY] Updated existing company: {domain}")
                         else:
                             new_co = models.TargetCompany(
@@ -222,9 +310,9 @@ class CampaignService:
                                 linkedin_id=co_extra.get('linkedin_id'),
                                 description=co_extra.get('description'),
                                 website=co_extra.get('website'),
-
-                                v2_intel=res.get('hooks', {}) if status == "RESEARCH_COMPLETE" else {}
                             )
+                            # Research dossier persisted for every verdict (see above).
+                            self._apply_enrichment(new_co, res)
                             temp_db.add(new_co)
                 except Exception as row_err:
                     logger.error(f"❌ [STAGE 3] Skipped company {domain}: {row_err}")
@@ -236,152 +324,15 @@ class CampaignService:
         finally:
             temp_db.close()
 
-    async def stage_4_deep_research(self, db: Session, campaign_id: str, target_domains: list = None):
-        """
-        STAGE 4: Deep Research Swarm
-        Mobilizes research agents for ACCEPTED companies.
-
-        Scaling design (OOM-safe): companies are researched and committed in
-        bounded CHUNKS rather than fanning out all rows and holding every
-        result in memory until a single final commit. Peak memory is therefore
-        capped at one chunk regardless of campaign size. Because the read query
-        only selects status == "ACCEPTED", any company committed as
-        RESEARCH_COMPLETE is auto-excluded from a later retry — so an OOM-kill
-        or crash mid-run resumes from the last committed chunk instead of
-        redoing the whole campaign.
-        """
-        import asyncio
-
-        STAGE4_CHUNK_SIZE = 10   # companies committed per transaction
-        STAGE4_CONCURRENCY = 3   # in-flight Tavily + LLM pipelines (heaviest stage)
-
-        # 1. Fetch Brand DNA & Target Companies (Short Read Session)
-        temp_db = SessionLocal()
-        try:
-            campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-            ui_record = campaign.user_intel
-            user_intel_dict = {
-                "capability_to_pain_map": ui_record.capability_to_pain_map or [],
-                "proof_points": ui_record.proof_points or [],
-                "competitive_advantages": ui_record.competitive_advantages or []
-            }
-
-            query = temp_db.query(models.TargetCompany).filter(
-                models.TargetCompany.campaign_id == campaign_id,
-                models.TargetCompany.status == "ACCEPTED"
-            )
-            if target_domains:
-                query = query.filter(models.TargetCompany.domain.in_(target_domains))
-
-            accepted_cos_data = [
-                {
-                    "id": co.id,
-                    "name": co.name,
-                    "domain": co.domain,
-                    "description": co.description
-                }
-                for co in query.all()
-            ]
-        finally:
-            temp_db.close()
-
-        if not accepted_cos_data:
-            logger.warning(f"No ACCEPTED companies for {campaign_id}. Skipping Stage 4.")
-            self._mark_stage4_complete(campaign_id)
-            return
-
-        # 2. Run long LLM research holding ZERO DB connections, throttled by semaphore.
-        validator = CompanyValidationService()
-        semaphore = asyncio.Semaphore(STAGE4_CONCURRENCY)
-
-        async def research_one(co):
-            async with semaphore:
-                try:
-                    # raw Tavily results are intentionally discarded: they are
-                    # never read downstream and are the single biggest memory hog.
-                    swarm_data, _raw = await validator.deep_research_swarm(
-                        co["domain"],
-                        co["name"],
-                        user_intel_dict,
-                        existing_description=co["description"]
-                    )
-                    return co["id"], swarm_data
-                except Exception as e:
-                    logger.error(f"Research failed for {co['domain']}: {e}")
-                    return co["id"], None
-
-        total = len(accepted_cos_data)
-        logger.info(f"🔬 [STAGE 4] Researching {total} companies for {campaign_id} in chunks of {STAGE4_CHUNK_SIZE}.")
-
-        # 3. Process in chunks: gather a chunk, commit it, release its memory, repeat.
-        for start in range(0, total, STAGE4_CHUNK_SIZE):
-            chunk = accepted_cos_data[start:start + STAGE4_CHUNK_SIZE]
-            results = await asyncio.gather(*[research_one(co) for co in chunk])
-            self._persist_stage4_chunk(campaign_id, results)
-            logger.info(f"   ↳ [STAGE 4] Committed {min(start + STAGE4_CHUNK_SIZE, total)}/{total} for {campaign_id}.")
-            del results  # free the chunk before scheduling the next one
-
-        # 4. Mark campaign complete once every chunk has landed.
-        self._mark_stage4_complete(campaign_id)
-        logger.info(f"✅ [STAGE 4] Deep Research Complete for {campaign_id}")
-
-    def _persist_stage4_chunk(self, campaign_id: str, results: list):
-        """Persist one chunk of deep-research results in a single short transaction.
-
-        Each row update is isolated via SAVEPOINT so a single malformed dossier
-        is skipped rather than rolling back the whole chunk.
-        """
-        temp_db = SessionLocal()
-        try:
-            for co_id, swarm_data in results:
-                if not swarm_data:
-                    continue
-                try:
-                    with temp_db.begin_nested():  # SAVEPOINT per company
-                        co = temp_db.query(models.TargetCompany).filter(models.TargetCompany.id == co_id).first()
-                        if not co:
-                            continue
-                        # High-Fidelity Separate Field Persistence
-                        co.relevance_score = swarm_data.get('relevance_score', co.relevance_score)
-                        co.relevance_explanation = swarm_data.get('reasoning', co.relevance_explanation)
-                        co.opportunity_reason = swarm_data.get('business_opportunity_reason', '')
-                        co.matched_pains = swarm_data.get('matched_pains', [])
-                        co.matched_services = swarm_data.get('matched_services', [])
-                        co.growth_hooks = swarm_data.get('growth_hooks', [])
-                        co.pain_hooks = swarm_data.get('pain_hooks', [])
-                        co.news_hooks = swarm_data.get('news_hooks', [])
-                        co.research_summary = swarm_data.get('executive_summary', '')
-
-                        # Lean blob: only the structured LLM dossier (small).
-                        # raw_swarm_results is dropped — it was never read anywhere.
-                        co.v2_intel = swarm_data
-                        co.status = "RESEARCH_COMPLETE"
-                except Exception as row_err:
-                    logger.error(f"❌ [STAGE 4] Skipped company {co_id}: {row_err}")
-            temp_db.commit()
-        except Exception as e:
-            temp_db.rollback()
-            logger.error(f"❌ [STAGE 4] Error committing chunk: {e}")
-            raise e
-        finally:
-            temp_db.close()
-
-    def _mark_stage4_complete(self, campaign_id: str):
-        """Flip campaign status to STAGE_4_RESEARCH_COMPLETE in a short session."""
-        temp_db = SessionLocal()
-        try:
-            campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-            if campaign:
-                campaign.status = models.CampaignStatus.STAGE_4_RESEARCH_COMPLETE
-                temp_db.commit()
-        finally:
-            temp_db.close()
-
-    async def stage_5_stakeholder_ranking(self, db: Session, campaign_id: str, contacts_map: dict):
+    async def stage_5_stakeholder_ranking(self, db: Session, campaign_id: str, worker_id: str = None):
         """
         STAGE 5: Strategic Stakeholder Ranking
         Selects Top 4 and applies Primary-First email logic using AI.
+
+        Contacts are read per-chunk from campaign_leads (not held as one big
+        contacts_map), so memory stays flat regardless of batch size.
         """
+        from app.services import lead_repository
         # 1. Fetch Researched Companies & Brand DNA (Short Read Session)
         temp_db = SessionLocal()
         try:
@@ -400,11 +351,12 @@ class CampaignService:
                     "id": co.id,
                     "domain": co.domain,
                     "name": co.name,
-                    "research_summary": co.research_summary
+                    "research_summary": co.research_summary,
+                    "industry": co.company_type,   # drives the dynamic buying-committee in ranking
                 }
                 for co in temp_db.query(models.TargetCompany).filter(
                     models.TargetCompany.campaign_id == campaign_id,
-                    models.TargetCompany.status == "RESEARCH_COMPLETE"
+                    models.TargetCompany.status == "ACCEPTED"
                 ).all()
             ]
         finally:
@@ -416,8 +368,9 @@ class CampaignService:
 
         # 2. Process companies in chunks; rank (sequential, ZERO DB held), then commit each chunk.
         # Resumability: each committed company flips to STAKEHOLDERS_IDENTIFIED, so the
-        # read query (status == "RESEARCH_COMPLETE") won't re-select it on a retry.
+        # read query (status == "ACCEPTED") won't re-select it on a retry.
         ranking_svc = StakeholderRankingService()
+        import asyncio
         from app.core.scheduler import geocode_timezone
         # Per-run cache so each distinct contact location is geocoded only once
         # (Nominatim is rate-limited). Shared across all chunks in this Stage 5 run.
@@ -437,50 +390,50 @@ class CampaignService:
             dms_to_create = []
             company_status_updates = []
 
-            for co in chunk:
+            # Load this chunk's contacts in ONE short session, then release the
+            # connection before the (slow) AI ranking calls. domains in campaign_leads
+            # and TargetCompany.domain are both normalized (lowercased), so an exact
+            # match reproduces the old case-insensitive lookup.
+            cdb = SessionLocal()
+            try:
+                chunk_contacts = lead_repository.load_contacts_for_domains(
+                    cdb, campaign_id, [co["domain"] for co in chunk]
+                )
+            finally:
+                cdb.close()
+
+            # Rank every company in the chunk CONCURRENTLY (bounded). The per-company
+            # AI persona-fit call is the slow step; fanning the chunk out cuts Stage-5
+            # wall-clock ~Nx while keeping memory flat (only this chunk is in flight).
+            rank_sem = asyncio.Semaphore(settings.STAGE5_CONCURRENCY)
+
+            async def _rank_company(co):
                 domain_key = (co["domain"] or "").strip().lower()
-                csv_prospects = contacts_map.get(domain_key, [])
-                if not csv_prospects:
-                    for k in contacts_map.keys():
-                        if k.strip().lower() == domain_key:
-                            csv_prospects = contacts_map[k]
-                            break
-
-                if not csv_prospects:
-                    logger.debug(f"⏭️ [STAGE 5] No prospects found in CSV for {domain_key}. Skipping.")
-                    # Still mark processed so a retry doesn't re-rank an empty company.
-                    company_status_updates.append(co["id"])
-                    continue
-
-                # Rank the FULL contact set (reachability + seniority + AI persona-fit
-                # against the sender DNA, deep research, and campaign objective), then
-                # take the top 4. No contact is dropped for small companies, and large
-                # companies are ranked by signal — not arbitrary CSV order.
+                prospects = chunk_contacts.get(domain_key, [])
+                if not prospects:
+                    return co, []
                 research_context = co["research_summary"] or ""
-                try:
-                    ranked_prospects = await ranking_svc.rank_stakeholders_with_ai(
-                        csv_prospects, user_intel_dict, research_context, objective=objective
-                    )
-                    prospects_to_process = ranked_prospects[:4]
-                except Exception as e:
-                    logger.error(f"Failed to rank stakeholders with AI for {domain_key}: {e}")
-                    prospects_to_process = csv_prospects[:4]
+                async with rank_sem:
+                    try:
+                        ranked = await ranking_svc.rank_stakeholders_with_ai(
+                            prospects, user_intel_dict, research_context,
+                            objective=objective, industry=co.get("industry") or "",
+                        )
+                        return co, ranked[:4]
+                    except Exception as e:
+                        logger.error(f"Failed to rank stakeholders with AI for {domain_key}: {e}")
+                        return co, prospects[:4]
 
-                logger.info(f"   - Processing {len(csv_prospects)} candidates for {co['domain']}...")
+            ranked_chunk = await asyncio.gather(*[_rank_company(co) for co in chunk])
+
+            # Build DM rows sequentially (cheap; geocode is Nominatim-rate-limited + cached).
+            for co, prospects_to_process in ranked_chunk:
                 for p in prospects_to_process:
+                    # Reachability is decided solely by the Primary Email now; the
+                    # per-slot email-validation columns were removed.
                     target_email = get_fuzzy(p, ["primary email", "email"])
-                    is_verified = True if target_email else False
-
+                    is_verified = bool(target_email)
                     if not target_email:
-                        for i in range(1, 11):
-                            val_status = str(get_fuzzy(p, [f"email {i} validation", f"email_{i}_validation"]) or "").lower()
-                            if val_status in ['valid', 'accept all', 'deliverable']:
-                                target_email = get_fuzzy(p, [f"email {i}", f"email_{i}"])
-                                is_verified = True
-                                break
-
-                    if not target_email:
-                        logger.debug(f"   - Skipping {get_fuzzy(p, ['contact full name', 'name'])}: No valid email found.")
                         continue
 
                     # Eagerly resolve & persist the prospect timezone now (geocoded
@@ -498,7 +451,7 @@ class CampaignService:
                         "location": contact_loc,
                         "display_timezone": resolved_tz,
                         "email": target_email,
-                        "phone": get_fuzzy(p, ["contact phone 1", "phone"]),
+                        "phone": get_fuzzy(p, ["contact mobile phone", "contact phone 1", "phone"]),
                         "company_phone": get_fuzzy(p, ["company phone 1", "company phone"]),
                         "linkedin": get_fuzzy(p, ["contact li profile url", "linkedin"]),
                         "time_in_role": get_fuzzy(p, ["time in role"]),
@@ -512,7 +465,8 @@ class CampaignService:
 
             self._persist_stage5_chunk(campaign_id, dms_to_create, company_status_updates)
             logger.info(f"   ↳ [STAGE 5] Committed {min(start + STAGE5_CHUNK_SIZE, total)}/{total} for {campaign_id}.")
-            del dms_to_create, company_status_updates
+            self._pulse_heartbeat(campaign_id, worker_id)
+            del dms_to_create, company_status_updates, chunk_contacts
 
         # 3. Mark stage complete once every chunk has landed.
         temp_db = SessionLocal()
@@ -537,6 +491,8 @@ class CampaignService:
             for dm_data in dms_to_create:
                 try:
                     with temp_db.begin_nested():  # SAVEPOINT per decision maker
+                        # Scrub NUL bytes from CSV-derived contact fields (Postgres-safe).
+                        dm_data = strip_null_bytes(dm_data)
                         existing_dm = temp_db.query(models.DecisionMaker).filter(
                             models.DecisionMaker.campaign_id == campaign_id,
                             models.DecisionMaker.email == dm_data["email"]
@@ -600,122 +556,17 @@ class CampaignService:
         finally:
             temp_db.close()
 
-    def process_state_machine(self, db: Session, campaign_id: str, csv_content: str = None):
+    def process_state_machine(self, db: Session, campaign_id: str):
         """
         Campaign stage orchestrator (chokepoint).
 
-        Phase 1: by default this now delegates to the LangGraph workflow engine,
-        which owns explicit, checkpointed stage transitions. Set
-        WORKFLOW_ENGINE=legacy to fall back to the original inline state machine
-        (`_process_state_machine_legacy`) with zero behaviour change.
+        Delegates to the LangGraph workflow engine, which owns explicit,
+        checkpointed stage transitions. The runner already falls back to an
+        ephemeral graph if the checkpointer is unavailable, so routing always
+        proceeds.
         """
-        from app.workflow.runner import advance_workflow, workflow_engine_enabled
-
-        if workflow_engine_enabled():
-            return advance_workflow(campaign_id)
-        return self._process_state_machine_legacy(db, campaign_id, csv_content)
-
-    def _process_state_machine_legacy(self, db: Session, campaign_id: str, csv_content: str = None):
-        """
-        The Indestructible Orchestrator (Sync V3) — legacy inline state machine.
-        Checks status and executes the next logical stage based on SSoT presence.
-        Retained as a fallback behind WORKFLOW_ENGINE=legacy.
-        """
-        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-        if not campaign: return
-
-        logger.info(f"🔄 [State-Machine] Resuming Campaign {campaign_id} at Status: {campaign.status}")
-
-        # New Gated Architecture (Phase 1):
-        # A: Input Validation
-        # B: CSV Trimming
-        # C: User Intel
-        # D: ICP Filtering (Wait for B & C)
-        
-        val_review = campaign.input_validation_review
-        # Support both schemas: Agent B (is_valid) and Stage 1 Review (overall.status)
-        if val_review:
-            is_valid_flag = val_review.get('is_valid')
-            status_val = val_review.get('overall', {}).get('status')
-            
-            val_done = (is_valid_flag is True) or (status_val == "success")
-            val_failed = (is_valid_flag is False) or (status_val == "needs_clarification")
-        else:
-            val_done = False
-            val_failed = False
-        
-        csv_done = (campaign.trimmed_csv_data is not None) or (campaign.csv_file_url is not None)
-        intel_done = campaign.user_intel is not None and campaign.user_intel.v2_intel is not None
-        
-        logger.info(f"📊 [State-Machine] Snapshot for {campaign_id}:")
-        logger.info(f"   - Validation: {val_done} (Failed: {val_failed}) | Data: {val_review is not None}")
-        logger.info(f"   - CSV SSoT: {csv_done}")
-        logger.info(f"   - User Intel: {intel_done}")
-
-        # Intervention Logic: If Validation failed, stop and notify
-        if val_failed and campaign.status != "INTERVENTION_NEEDED":
-            logger.warning(f"🛑 [State-Machine] Validation Failed for {campaign_id}. Halting workflow.")
-            campaign.status = "INTERVENTION_NEEDED"
-            db.commit()
-            return
-
-        if campaign.status in [models.CampaignStatus.PENDING, models.CampaignStatus.INPUT_VALIDATED, models.CampaignStatus.STAGE_1_CSV_TRIMMED, models.CampaignStatus.STAGE_2_USER_INTEL_COMPLETE, models.CampaignStatus.RESEARCHING_USER_COMPANY, "INTERVENTION_NEEDED"]:
-            from app.workers.tasks.intel_worker import validate_input_worker, research_user_company_worker, process_csv_worker
-            
-            # 1. Track A & B start immediately
-            if not val_done and not val_failed:
-                validate_input_worker.delay(campaign_id)
-            if not csv_done and not val_failed:
-                process_csv_worker.delay(campaign_id)
-            
-            # 2. Track C (User Intel) waits for A (Validation)
-            # Gate: Only trigger if A is done AND C hasn't started/finished yet
-            # Track C: User Intel (Brand Research)
-            if val_done and not intel_done:
-                # If not currently locked, or in a different status, trigger research
-                if not campaign.locked_by or campaign.status != models.CampaignStatus.RESEARCHING_USER_COMPANY:
-                    logger.info(f"🟢 [State-Machine] A is done. Triggering/Resuming Track C (User Intel) for {campaign_id}")
-                    campaign.status = models.CampaignStatus.RESEARCHING_USER_COMPANY
-                    db.commit()
-                    research_user_company_worker.delay(campaign_id)
-                else:
-                    logger.debug(f"⏳ [State-Machine] Track C already active for {campaign_id} (Locked by: {campaign.locked_by})")
-            
-            # Barrier: Wait for B & C to be complete before starting Stage 3
-            if not (csv_done and intel_done):
-                logger.info(f"[State-Machine] Progress Tracking -> A(Val): {val_done}, B(CSV): {csv_done}, C(Intel): {intel_done}. Waiting for B & C sync.")
-                return
-
-            if csv_done and intel_done and campaign.status in [models.CampaignStatus.RESEARCHING_USER_COMPANY, models.CampaignStatus.STAGE_1_CSV_TRIMMED, models.CampaignStatus.STAGE_2_USER_INTEL_COMPLETE]:
-                logger.info(f"🚀 [State-Machine] Track B & C complete. Advancing to Stage 3: ICP Filtering.")
-                campaign.status = models.CampaignStatus.STAGE_2_USER_INTEL_COMPLETE
-                db.commit()
-                
-                from app.workers.tasks.discovery_worker import find_companies_worker
-                find_companies_worker.delay(campaign_id)
-                return
-
-        # STAGE 3 -> STAGE 4 Transition
-        if campaign.status == models.CampaignStatus.STAGE_3_ICP_FILTERED:
-             logger.info(f"🚀 [State-Machine] Stage 3 (ICP) Complete. Triggering Stage 4: Deep Research.")
-             # We move status to a transition state or trigger worker directly if worker handles status
-             from app.workers.tasks.discovery_worker import deep_research_worker
-             deep_research_worker.delay(campaign_id)
-             return
-
-        # STAGE 4 -> STAGE 5 Transition
-        if campaign.status == models.CampaignStatus.STAGE_4_RESEARCH_COMPLETE:
-             logger.info(f"🚀 [State-Machine] Stage 4 (Research) Complete. Triggering Stage 5: Stakeholder Ranking.")
-             from app.workers.tasks.discovery_worker import find_dms_worker
-             find_dms_worker.delay(campaign_id)
-             return
-
-        # STAGE 5 -> STAGE 6 Transition
-        if campaign.status == models.CampaignStatus.STAGE_5_STAKEHOLDERS_RANKED:
-            logger.info(f"🏁 [State-Machine] Stage 5 (Ranking) Complete. Triggering Final Stage: Email Drafting.")
-            from app.workers.tasks.ghostwriter_worker import draft_emails_worker
-            draft_emails_worker.delay(campaign_id)
-            return
+        from app.workflow.runner import advance_workflow
+        return advance_workflow(campaign_id)
 
 
 campaign_service = CampaignService()

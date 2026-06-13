@@ -17,6 +17,23 @@ class Settings:
     # CSV ingestion cap. Replaces the old hard 100-row limit. Set high enough to
     # process realistic uploads while protecting the t2.medium box from OOM.
     MAX_CSV_ROWS = int(os.getenv("MAX_CSV_ROWS", "2000"))
+
+    # Pipeline in-stage concurrency (latency vs memory tradeoff). Defaults match
+    # the previous hardcoded values so behaviour is unchanged out of the box; raise
+    # these on a larger instance to cut wall-clock time for big campaigns.
+    # Merged ICP-qualify + research stage. This is I/O-bound (per-company website
+    # crawl + one LLM call), NOT CPU-bound, so it can safely run much wider than the
+    # old min(stage3, stage4)=3 cap that throttled it. Raise for faster big runs;
+    # lower only if the box shows network/socket pressure.
+    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "10"))        # merged ICP gate (extractor + LLM)
+    STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "10"))   # stakeholder ranking (per-company LLM)
+    STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "10"))   # email drafting sub-graph (per-prospect)
+
+    # ICP acceptance threshold (0-100). A company is accepted when its graded
+    # strategic_fit_score >= this value AND it does not hard-fail an explicit
+    # firmographic requirement. Score-driven (no pass/fail/unknown cliff). Lower to
+    # accept more, raise to be stricter. Calibrated on the labeled ICP eval set.
+    ICP_ACCEPT_THRESHOLD = int(os.getenv("ICP_ACCEPT_THRESHOLD", "45"))
     
     # 3. PRODUCTION OBSERVABILITY, METRICS & ALERTS
     SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
@@ -72,8 +89,6 @@ class Settings:
     EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
     EMAIL_FROM = os.getenv("EMAIL_FROM")
     
-    # 8. DISCOVERY SWARM & AI RESEARCH ENGINE
-    TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
     
     # 9. DISTRIBUTED EXECUTION LAYER (REDIS BROKER)
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")

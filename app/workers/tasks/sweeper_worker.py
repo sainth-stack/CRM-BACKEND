@@ -60,6 +60,28 @@ def sweep_stuck_campaigns_task():
                         logger.info(f"[RECOVERY] Skipping Campaign {campaign.id} due to expired trial.")
                         continue
 
+                # Lock-aware guard: if any stage worker is still alive (its Redis
+                # lock is held), a live task is making progress. Resurrecting it
+                # would force-release that lock and spawn a duplicate stage run —
+                # the exact ICP-loop pathology. Skip; the heartbeat + lock will
+                # clear naturally when the task finishes or genuinely dies.
+                from app.core.security import lock_exists
+                held = [
+                    k for k in (
+                        f"campaign_val:{campaign.id}",
+                        f"campaign_csv:{campaign.id}",
+                        f"campaign_intel:{campaign.id}",
+                        f"campaign_stage3:{campaign.id}",
+                        f"campaign_stage4:{campaign.id}",
+                        f"campaign_stage5:{campaign.id}",
+                        f"campaign_stage6:{campaign.id}",
+                    )
+                    if lock_exists(k)
+                ]
+                if held:
+                    logger.info(f"[RECOVERY] Skipping Campaign {campaign.id}: live stage lock(s) held: {held}.")
+                    continue
+
                 logger.info(f"[RECOVERY] Resurrecting Campaign {campaign.id} from Stage: {campaign.status.name}")
                 campaign.last_heartbeat = None
                 campaign.locked_by = None

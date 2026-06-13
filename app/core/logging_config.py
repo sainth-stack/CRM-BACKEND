@@ -22,7 +22,16 @@ def setup_logging():
     Configures the root logger for production-ready output to stdout/stderr with trace correlation.
     """
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    
+
+    # Make the log stream UTF-8-safe so emoji/non-ASCII in log messages never raise
+    # a UnicodeEncodeError on a non-UTF-8 console (e.g. Windows cp1252). No-op where
+    # stdout is already UTF-8 (Linux/containers). backslashreplace guarantees output.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
     # timestamp | level | [Campaign: ID] [module:line] | message
     log_format = "%(asctime)s | %(levelname)-8s | %(campaign_id)s[%(name)s:%(lineno)d] | %(message)s"
     

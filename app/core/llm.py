@@ -4,14 +4,16 @@ Single place that decides which model each agent role uses, so model choice,
 timeouts, and provider are swappable without touching agent code (Provider
 Abstraction + Prompt/model-as-config constraints).
 
-Role -> model routing (mini models only; all env-overridable):
-  * "reasoning" -> gpt-5.4-mini  (ICP judgment, deep-research synthesis, email
-                                  Strategist + Critic — quality + tool-use heavy)
-  * "writer"    -> gpt-4.1-mini  (email prose generation — fast, high-volume)
+Role -> model routing (all roles consolidated onto gpt-4o-mini for cost; all
+env-overridable):
+  * "reasoning" -> gpt-4o-mini   (ICP judgment, deep-research synthesis, email
+                                  Strategist + Critic)
+  * "writer"    -> gpt-4o-mini   (email prose generation)
   * "cheap"     -> gpt-4o-mini   (bulk stakeholder role-scoring, simple agents)
 
-Override any of them with REASONING_MODEL / WRITER_MODEL / CHEAP_MODEL — e.g. set
-all three to gpt-4o-mini to run the cheapest config, with zero code change.
+All three default to gpt-4o-mini to minimise spend. Override any role via
+REASONING_MODEL / WRITER_MODEL / CHEAP_MODEL env vars (e.g. point "reasoning"
+back at a stronger model) with zero code change.
 
 Reasoning-family models (gpt-5*, o1/o3/o4*) reject custom temperature/top_p/seed
 (only default sampling is allowed), so we apply deterministic sampling knobs only
@@ -25,15 +27,24 @@ import os
 from langchain_openai import ChatOpenAI
 
 _MODEL_BY_ROLE = {
-    "reasoning": os.getenv("REASONING_MODEL", "gpt-5.4-mini"),
-    "writer": os.getenv("WRITER_MODEL", "gpt-4.1-mini"),
+    "reasoning": os.getenv("REASONING_MODEL", "gpt-4o-mini"),
+    "writer": os.getenv("WRITER_MODEL", "gpt-4o-mini"),
     "cheap": os.getenv("CHEAP_MODEL", "gpt-4o-mini"),
+    # Web-content -> structured-research enrichment (ICP Call 1). Reads the large raw
+    # crawl once and distils it; the raw text is then dropped. ICP validation (Call 2)
+    # uses the "reasoning" model. Both default to gpt-4o-mini (the nano enrichment was
+    # ~2x slower/costlier for no measured ICP-verdict accuracy gain on the test set).
+    "enrichment": os.getenv("ENRICHMENT_MODEL", "gpt-4o-mini"),
 }
 
 # Back-compat aliases (still referenced in a couple of places / tests).
 REASONING_MODEL = _MODEL_BY_ROLE["reasoning"]
 CHEAP_MODEL = _MODEL_BY_ROLE["cheap"]
 WRITER_MODEL = _MODEL_BY_ROLE["writer"]
+
+# Fixed seed for deterministic generation (same input -> same output). Override
+# via LLM_SEED if you ever need a different reproducible stream.
+LLM_SEED = int(os.getenv("LLM_SEED", "42"))
 
 # Prefixes whose models reject custom temperature/top_p/seed.
 _RESTRICTED_PREFIXES = ("gpt-5", "o1", "o3", "o4")
@@ -58,19 +69,24 @@ def get_chat_llm(role: str = "cheap", *, timeout: int = 90, max_retries: int = 2
         effort = os.getenv("REASONING_EFFORT")
         if effort:
             params["model_kwargs"] = {"reasoning_effort": effort}
-    else:
-        params.update({"temperature": 0, "top_p": 1, "seed": 42})
 
     params.update(overrides)
 
-    # Reasoning models (gpt-5*, o1/o3/o4*) accept ONLY default sampling. LangChain
-    # would otherwise send its built-in temperature=0.7 and the API would 400, so
-    # pin temperature=1 (the allowed value) and drop top_p/seed entirely. This also
-    # protects against an override pointing a role at a reasoning model.
     if restricted:
+        # Reasoning models (gpt-5*, o1/o3/o4*) accept ONLY default sampling. Pin
+        # temperature=1 (the allowed value) and drop top_p/seed; also protects
+        # against an override pointing a role at a reasoning model.
         params["temperature"] = 1
         params.pop("top_p", None)
         params.pop("seed", None)
+    else:
+        # DETERMINISM GUARANTEE: force deterministic sampling AFTER overrides so a
+        # caller-supplied temperature (e.g. the email writer's old 0.6) can never
+        # reintroduce randomness. Same input -> same output, best-effort within
+        # OpenAI's system_fingerprint. SEED is env-overridable via LLM_SEED.
+        params["temperature"] = 0
+        params["top_p"] = 1
+        params["seed"] = LLM_SEED
 
     # Attach cost tracking + budget enforcement to every agentic LLM call so the
     # new Phase 2-4 agents are metered and governed (the legacy run_openai_guarded

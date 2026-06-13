@@ -12,7 +12,6 @@ langgraph
 langgraph-checkpoint-postgres
 psycopg[binary]
 apscheduler
-tavily-python
 python-multipart
 python-dotenv
 alembic
@@ -20,7 +19,6 @@ pydantic[email]
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
-ddgs
 requests
 pytz
 PyJWT
@@ -37,3 +35,5 @@ psutil
 geopy
 timezonefinder
 httpx
+langchain-groq
+trafilatura

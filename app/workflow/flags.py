@@ -19,6 +19,8 @@ _ICP_DONE = {
     models.CampaignStatus.STAGE_6_DRAFTING_COMPLETE,
     models.CampaignStatus.COMPLETED,
     models.CampaignStatus.PARTIAL_SUCCESS,
+    models.CampaignStatus.FAILED,
+    models.CampaignStatus.INACTIVE,
 }
 _RESEARCH_DONE = {
     models.CampaignStatus.STAGE_4_RESEARCH_COMPLETE,
@@ -26,18 +28,23 @@ _RESEARCH_DONE = {
     models.CampaignStatus.STAGE_6_DRAFTING_COMPLETE,
     models.CampaignStatus.COMPLETED,
     models.CampaignStatus.PARTIAL_SUCCESS,
+    models.CampaignStatus.FAILED,
+    models.CampaignStatus.INACTIVE,
 }
 _RANKING_DONE = {
     models.CampaignStatus.STAGE_5_STAKEHOLDERS_RANKED,
     models.CampaignStatus.STAGE_6_DRAFTING_COMPLETE,
     models.CampaignStatus.COMPLETED,
     models.CampaignStatus.PARTIAL_SUCCESS,
+    models.CampaignStatus.FAILED,
+    models.CampaignStatus.INACTIVE,
 }
 _DRAFTING_DONE = {
     models.CampaignStatus.STAGE_6_DRAFTING_COMPLETE,
     models.CampaignStatus.COMPLETED,
     models.CampaignStatus.PARTIAL_SUCCESS,
     models.CampaignStatus.FAILED,
+    models.CampaignStatus.INACTIVE,
 }
 
 
@@ -62,7 +69,16 @@ def read_flags(campaign_id: str) -> Optional[dict]:
             val_done = False
             val_failed = False
 
-        csv_done = (campaign.trimmed_csv_data is not None) or (campaign.csv_file_url is not None)
+        # CSV is "done" once it is normalized into campaign_leads rows. The legacy
+        # blob / csv_file_url are kept as fallbacks for campaigns created before the
+        # normalization existed (so a half-migrated campaign still routes forward).
+        leads_present = (
+            db.query(models.CampaignLead.id)
+            .filter(models.CampaignLead.campaign_id == campaign_id)
+            .first()
+            is not None
+        )
+        csv_done = leads_present or (campaign.trimmed_csv_data is not None) or (campaign.csv_file_url is not None)
         intel_done = (
             campaign.user_intel is not None and campaign.user_intel.v2_intel is not None
         )

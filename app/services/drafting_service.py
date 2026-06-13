@@ -1,40 +1,13 @@
-import asyncio
-import os
 import json
 import logging
-import re
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field
-from typing import Dict, List, Optional
 from app.db import models
+from app.core.resilience import retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
-class EmailVariant(BaseModel):
-    subject: str
-    body: str
-
-class EmailDraftSet(BaseModel):
-    subject: str = Field(description="High-impact, professional subject line")
-    body: str = Field(description="The full 3-paragraph business email body")
-    strategic_observation: str = Field(description="The core insight used for personalization")
-    pain_hypothesis: str = Field(description="The specific business pain being addressed")
-    personalization_hook: str = Field(description="The specific news or growth hook used")
-
-from app.core.resilience import retry_with_backoff
-
 class DraftingService:
-    def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, max_tokens=4000, request_timeout=120, max_retries=2)
-
-    def generate_draft_set(self, db, dm_id: str):
-        """
-        Stage 6 — Narrative Messaging Agent (V2 Core)
-        Contextual synthesis of Sender Context + Target Context.
-        Synchronous wrapper for Celery workers.
-        """
-        return asyncio.run(self.agenerate_draft_set(db, dm_id))
+    # Stateless: the actual LLMs live in the email sub-graph (app.agents.email_graph),
+    # routed via app.core.llm. No per-instance client is needed.
 
     @retry_with_backoff(max_attempts=3, base_delay_sec=2.0, max_delay_sec=15.0)
     async def agenerate_draft_set(self, db, dm_id: str):
@@ -71,6 +44,28 @@ class DraftingService:
             opportunity_reason = target_co.opportunity_reason or ""
             objective = campaign.prompt or "Win a discovery call with the right stakeholder."
 
+            # MEDDPICC scorecard (computed at ICP, stored on the company) + the
+            # recipient's stakeholder verdict (buyer / champion / influencer) + the
+            # sender's proof points & differentiators. These drive a MEDDPICC-grounded
+            # draft strategy instead of a generic hook email. All per-company/recipient
+            # — nothing hardcoded.
+            def _join(v):
+                if isinstance(v, (list, tuple)):
+                    return "; ".join(str(x) for x in v if str(x).strip()) or "N/A"
+                return str(v) if v else "N/A"
+
+            meddpicc = (target_co.v2_intel or {}).get("meddpicc", {}) if target_co.v2_intel else {}
+            metrics = _join(meddpicc.get("metrics"))
+            economic_buyer = _join(meddpicc.get("economic_buyer"))
+            champion = _join(meddpicc.get("champion"))
+            decision_criteria = _join(meddpicc.get("decision_criteria"))
+            need_evidence = _join(meddpicc.get("need_evidence"))
+            matched_pains = _join(target_co.matched_pains or meddpicc.get("matched_pains"))
+            matched_services = _join(target_co.matched_services or meddpicc.get("matched_services"))
+            recipient_role_signal = dm.relevance_explanation or "Role/influence not yet assessed."
+            sender_proof = _join(user_intel.proof_points)
+            sender_advantages = _join(user_intel.competitive_advantages)
+
         finally:
             temp_db.close()
 
@@ -97,6 +92,17 @@ class DraftingService:
             "news_hooks": news_hooks,
             "opportunity_reason": opportunity_reason,
             "objective": objective,
+            # MEDDPICC strategy inputs
+            "metrics": metrics,
+            "economic_buyer": economic_buyer,
+            "champion": champion,
+            "decision_criteria": decision_criteria,
+            "need_evidence": need_evidence,
+            "matched_pains": matched_pains,
+            "matched_services": matched_services,
+            "recipient_role_signal": recipient_role_signal,
+            "sender_proof": sender_proof,
+            "sender_advantages": sender_advantages,
         }
 
         try:

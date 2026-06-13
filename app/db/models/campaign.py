@@ -3,7 +3,7 @@ import datetime
 from datetime import UTC
 import enum
 from sqlalchemy import Column, String, Text, DateTime, ForeignKey, JSON, Integer, Enum as SQLEnum
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, deferred
 from .base import Base
 
 class CampaignStatus(enum.Enum):
@@ -45,9 +45,15 @@ class Campaign(Base):
     # Target company parameters
     target_industry = Column(String, nullable=True)
     target_location = Column(String, nullable=True)
-    trimmed_csv_data = Column(Text, nullable=True) # SSoT: Trimmed 100-row batch stored as string
+    # SSoT: trimmed batch CSV stored as text. deferred() so it is loaded ONLY when
+    # explicitly accessed (the CSV workers) — routine Campaign queries (list, detail,
+    # state machine) no longer drag this multi-row blob into memory.
+    trimmed_csv_data = deferred(Column(Text, nullable=True))
     target_employee_count = Column(String, nullable=True)
-    csv_file_url = Column(String, nullable=True) # Persistent SSoT artifact path
+    # Retained (nullable) for backward compatibility / existing rows. No longer
+    # written: the trimmed CSV lives only in trimmed_csv_data (DB SSoT), never on
+    # local disk.
+    csv_file_url = Column(String, nullable=True)
     
     # Operational Telemetry (Lease & Heartbeat System)
     last_heartbeat = Column(DateTime, nullable=True)
@@ -62,6 +68,7 @@ class Campaign(Base):
     # Relationships
     owner = relationship("User", back_populates="campaigns")
     user_intel = relationship("UserCompanyIntel", back_populates="campaign", uselist=False, cascade="all, delete-orphan")
+    leads = relationship("CampaignLead", back_populates="campaign", cascade="all, delete-orphan")
     target_companies = relationship("TargetCompany", back_populates="campaign", cascade="all, delete-orphan")
     dms = relationship("DecisionMaker", back_populates="campaign", cascade="all, delete-orphan")
     drafts = relationship("EmailDraft", back_populates="campaign", cascade="all, delete-orphan")

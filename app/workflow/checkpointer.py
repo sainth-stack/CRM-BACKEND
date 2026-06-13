@@ -31,11 +31,36 @@ def _db_url() -> str:
     return url.strip("'").strip('"')
 
 
+def _is_alive(saver) -> bool:
+    """Cheap pre-ping against the checkpointer's psycopg connection. Detects a
+    Neon-idle-suspended / pgbouncer-recycled connection BEFORE the graph invoke
+    fails, so we reconnect cleanly instead of wasting an attempt + logging an
+    error. Adds ~1 round-trip per workflow advance (negligible on Neon pooled)."""
+    try:
+        with saver.conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
 def get_checkpointer():
-    """Return a process-wide PostgresSaver, or None if it cannot be created."""
+    """Return a process-wide PostgresSaver, or None if it cannot be created.
+
+    Self-healing: if the cached connection is dead (Neon idle-suspend), it is
+    transparently discarded and recreated on the next call — no error reaches
+    the workflow runner."""
     global _saver
     if _saver is not None:
-        return _saver
+        if _is_alive(_saver):
+            return _saver
+        # Dead connection — drop and reconnect under the lock below.
+        logger.warning("[WORKFLOW] Checkpointer connection stale (Neon idle); reconnecting.")
+        try:
+            _saver.conn.close()
+        except Exception:
+            pass
+        _saver = None
     with _lock:
         if _saver is not None:
             return _saver
@@ -47,6 +72,15 @@ def get_checkpointer():
                 _db_url(),
                 autocommit=True,
                 prepare_threshold=None,
+                # TCP keepalives — same settings as the SQLAlchemy engine in
+                # app/db/database.py. Prevents Neon serverless / pgbouncer from
+                # killing the idle checkpointer connection between workflow stages,
+                # which was the root cause of the "server closed the connection
+                # unexpectedly" errors after long Stage-5 runs.
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
             )
             saver = PostgresSaver(conn)
             saver.setup()  # idempotent: CREATE TABLE IF NOT EXISTS ...

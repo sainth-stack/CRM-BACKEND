@@ -1,4 +1,3 @@
-import re
 import logging
 from typing import List, Dict, Any
 
@@ -9,31 +8,26 @@ from app.core.llm import get_chat_llm
 
 logger = logging.getLogger("StakeholderRanking")
 
-# How many contacts (best-by-deterministic-prescore) get the AI persona-fit pass.
-# The prescore ranks the FULL contact set first, so this is a cost cap on the
-# LLM call — never an arbitrary "first N rows" truncation like the old code.
-SHORTLIST_SIZE = 15
-
-# Email-validation tokens that mean "deliverable".
-_VALID_TOKENS = {"valid", "accept all", "accept_all", "deliverable", "ok", "safe"}
-# Tokens that mean "do not use this address".
-_INVALID_TOKENS = {"invalid", "undeliverable", "bad", "do_not_mail", "do not mail", "bounced"}
-
-# Seniority signal from the `seniority` column and/or title keywords.
-_SENIORITY_WEIGHTS = [
-    (r"\b(c-?level|chief|cxo|ceo|cfo|coo|cto|cmo|ciso|founder|owner|president|partner)\b", 100),
-    (r"\b(vp|vice\s*president|svp|evp)\b", 90),
-    (r"\b(head|director)\b", 80),
-    (r"\b(principal|lead|senior\s*manager)\b", 65),
-    (r"\b(manager|management)\b", 55),
-    (r"\b(senior|specialist|architect)\b", 45),
-]
+# Safety cap on how many contacts go into a single batched scoring call (guards the
+# prompt size for a pathologically large contact list). Effectively "all" for normal
+# companies. NOT a quality shortlist — every contact within this cap is AI-scored.
+MAX_CONTACTS_PER_CALL = 60
 
 
 class RankedContact(BaseModel):
     index: int = Field(description="The contact's index number from the provided list.")
     role_fit: int = Field(description="0-100: likelihood this person is a decision-maker/economic buyer/champion for the sender's solution.")
-    reasoning: str = Field(description="One sentence on why this role fits (or doesn't).")
+    reasoning: str = Field(
+        description=(
+            "ONE professional, customer-facing sentence on the engagement decision for THIS person — "
+            "grounded in their actual title/function and the deal context. Speak about the PERSON and the "
+            "decision (whether/how to engage them, what influence they have, who would be a better entry "
+            "point if any), NEVER recite the rubric, the buying-committee functions, the seniority bands, "
+            "or any internal scoring framework. Do NOT use phrases like 'irrelevant function', 'aligns with "
+            "key functions', 'does not align with', 'matched to committee', or quoted department names like "
+            "'Other'. Write as if explaining to a sales rep, in natural business language."
+        )
+    )
 
 
 class StakeholderRanking(BaseModel):
@@ -44,59 +38,33 @@ class StakeholderRankingService:
     """Selects the strongest stakeholders per company.
 
     Phase 3: ranks the FULL contact set (not the first 15 by CSV order), scores
-    real reachability from the email-validation columns, and judges role/persona
-    fit against the sender DNA + deep research + campaign objective in a single
-    batched LLM call (cheap model). Returns the full list sorted best-first; the
-    caller takes the top N.
+    reachability by whether a Primary Email exists, and judges role/persona fit
+    against the sender DNA + deep research + campaign objective in a single batched
+    LLM call (cheap model). Returns the full list sorted best-first; the caller
+    takes the top N.
     """
 
     def __init__(self):
-        self.llm = get_chat_llm("cheap")
+        # Cap tail latency (60s x 1 retry): one batched call per company, run
+        # concurrently across the chunk — a slow provider must not stall the stage.
+        self.llm = get_chat_llm("cheap", timeout=60, max_retries=1)
 
     # ------------------------------------------------------------------ #
     # Deterministic signals                                              #
     # ------------------------------------------------------------------ #
     @staticmethod
     def _best_email(p: Dict[str, Any]) -> tuple[str | None, bool]:
-        """Return (best_email, is_verified) using primary + the 10 validated slots."""
+        """Return (primary_email, exists). Reachability is decided solely by the
+        presence of a Primary Email — the per-slot validation columns were removed."""
         primary = p.get("primary_email")
         if primary:
-            return str(primary), True  # primary is the curated/known-good address
-        for i in range(1, 11):
-            email = p.get(f"email_{i}")
-            if not email:
-                continue
-            status = str(p.get(f"email_{i}_validation") or "").strip().lower()
-            if status in _VALID_TOKENS:
-                return str(email), True
-        # Fall back to any present email that is NOT explicitly invalid (unknown
-        # validation is acceptable; a known-bad address is not).
-        for i in range(1, 11):
-            email = p.get(f"email_{i}")
-            if not email:
-                continue
-            status = str(p.get(f"email_{i}_validation") or "").strip().lower()
-            if status in _INVALID_TOKENS:
-                continue
-            return str(email), False
+            return str(primary), True
         return None, False
 
     @staticmethod
     def _reachability(p: Dict[str, Any]) -> int:
-        email, verified = StakeholderRankingService._best_email(p)
-        if not email:
-            return 0
-        return 100 if verified else 50
-
-    @staticmethod
-    def _seniority_score(p: Dict[str, Any]) -> int:
-        text = " ".join(
-            str(p.get(k) or "") for k in ("seniority", "title", "department")
-        ).lower()
-        for pattern, weight in _SENIORITY_WEIGHTS:
-            if re.search(pattern, text):
-                return weight
-        return 30
+        email, _ = StakeholderRankingService._best_email(p)
+        return 100 if email else 0
 
     # ------------------------------------------------------------------ #
     # Main entry                                                          #
@@ -107,52 +75,53 @@ class StakeholderRankingService:
         user_intel: dict,
         research_context: str = "",
         objective: str = "",
+        industry: str = "",
     ) -> List[Dict[str, Any]]:
-        """Rank ALL prospects for a company, best-first. Each returned dict gains
-        `strategic_score`, `strategic_reasoning`, `reachability`."""
+        """Rank ALL reachable prospects for a company, best-first. Each returned dict
+        gains `strategic_score` (0-100) and `strategic_reasoning`.
+
+        Two stages:
+          STAGE 1 (deterministic) — drop anyone without a Primary Email.
+          STAGE 2 (fully dynamic, agent-decided) — the LLM scores EVERY remaining
+            prospect 0-100 from the campaign objective + the target industry + that
+            prospect's own title/seniority/department/tenure. No hardcoded seniority
+            table, no shortlist, no reachability blend; the agent's score IS the
+            strategic score, so it varies per prompt + industry + person."""
         if not prospects:
             return []
 
-        # 1. Drop the unreachable, attach deterministic signals to the rest.
-        candidates: List[Dict[str, Any]] = []
-        for p in prospects:
-            reach = self._reachability(p)
-            if reach == 0:
-                continue  # no usable email — cannot be contacted
-            p["reachability"] = reach
-            p["_seniority_score"] = self._seniority_score(p)
-            candidates.append(p)
-
+        # STAGE 1 — reachability filter (the ONLY deterministic step).
+        candidates = [p for p in prospects if self._reachability(p) == 100]
+        for p in candidates:
+            p["reachability"] = 100
         if not candidates:
             return []
 
-        # 2. Prescore over the FULL set, then shortlist the strongest for AI.
-        candidates.sort(
-            key=lambda c: 0.5 * c["reachability"] + 0.5 * c["_seniority_score"],
-            reverse=True,
-        )
-        shortlist = candidates[:SHORTLIST_SIZE]
+        # STAGE 2 — dynamic AI scoring of every reachable prospect (one batched call).
+        scored = candidates[:MAX_CONTACTS_PER_CALL]
+        role_fits = await self._score_role_fit(scored, user_intel, research_context, objective, industry)
 
-        # 3. One batched persona-fit call for the whole shortlist.
-        role_fits = await self._score_role_fit(shortlist, user_intel, research_context, objective)
+        for idx, p in enumerate(scored):
+            fit = role_fits.get(idx)
+            if fit:
+                p["strategic_score"] = fit["role_fit"]
+                p["strategic_reasoning"] = fit["reasoning"]
+            else:
+                # AI-unavailable fallback: neutral score so the prospect stays
+                # selectable — never a hardcoded seniority ranking.
+                p["strategic_score"] = 50
+                p["strategic_reasoning"] = "Scored neutrally — automated assessment was unavailable."
 
-        for idx, p in enumerate(shortlist):
-            fit = role_fits.get(idx, {})
-            role_fit = fit.get("role_fit", p["_seniority_score"])  # fall back to seniority
-            p["strategic_score"] = round(0.7 * role_fit + 0.3 * p["reachability"], 2)
-            p["strategic_reasoning"] = fit.get("reasoning") or "Ranked by reachability and seniority."
-
-        # Contacts beyond the shortlist keep a deterministic-only score so they
-        # remain selectable if a company has fewer verified leads than expected.
-        for p in candidates[SHORTLIST_SIZE:]:
-            p["strategic_score"] = round(0.5 * p["reachability"] + 0.5 * p["_seniority_score"], 2)
-            p["strategic_reasoning"] = "Ranked by reachability and seniority (outside AI shortlist)."
+        # Any overflow beyond the per-call cap (rare) also gets the neutral fallback.
+        for p in candidates[MAX_CONTACTS_PER_CALL:]:
+            p["strategic_score"] = 50
+            p["strategic_reasoning"] = "Scored neutrally — beyond the per-company scoring batch."
 
         candidates.sort(key=lambda c: c["strategic_score"], reverse=True)
         return candidates
 
     async def _score_role_fit(
-        self, shortlist, user_intel, research_context, objective
+        self, shortlist, user_intel, research_context, objective, industry=""
     ) -> Dict[int, dict]:
         target_profiles = user_intel.get("target_customers", [])
         pains_solved = user_intel.get("capability_to_pain_map", [])
@@ -170,21 +139,68 @@ class StakeholderRankingService:
         contacts_block = "\n".join(contact_lines)
 
         prompt = ChatPromptTemplate.from_template(
-            """You are a B2B sales strategist selecting which people to contact at a target account.
+            """You are a B2B sales strategist deciding WHO to contact at a target account. Produce a
+SPREAD of scores that reflects how decisive each person is FOR THIS SPECIFIC deal — never a generic
+seniority ranking, and never the same number for everyone.
 
 SENDER'S IDEAL BUYER PROFILES: {target_profiles}
 PAINS THE SENDER SOLVES: {pains_solved}
-CAMPAIGN OBJECTIVE (the user's goal — prioritise people who match it): {objective}
+CAMPAIGN OBJECTIVE (the user's goal): {objective}
+TARGET COMPANY INDUSTRY: {industry}
 TARGET COMPANY RESEARCH: {research_context}
+
+STEP 1 — Define the BUYING COMMITTEE for THIS deal. From the CAMPAIGN OBJECTIVE and the TARGET COMPANY
+INDUSTRY, work out which functions/departments own the budget, the decision, and the internal-champion
+role for THIS specific solution in THIS specific industry. The right functions CHANGE with the objective
+and the industry — derive them, do not assume a fixed list. Examples (illustrative, not exhaustive):
+  • predictive-maintenance / industrial-data offering to a MANUFACTURER -> Operations, Plant,
+    Maintenance, Engineering, Production lead the committee; Marketing/HR are irrelevant.
+  • marketing-analytics offering to a RETAILER -> Marketing, Growth, E-commerce, Merchandising lead;
+    Plant/Maintenance are irrelevant.
+  • compliance/security offering to a BANK -> Risk, Compliance, CISO/Security, IT lead.
+
+STEP 2 — Score EVERY contact's role_fit (0-100). The score is a DYNAMIC judgement from THREE inputs, and
+it must change with the objective, the industry, AND the individual person:
+  (a) FUNCTION match — does their TITLE + DEPARTMENT sit in the committee you derived for THIS
+      objective+industry? This is the primary driver.
+  (b) SENIORITY — within the right function, more authority (Director/VP/Head/C-level) scores higher than
+      a manager or individual contributor; a senior person in an IRRELEVANT function still scores LOW
+      (seniority never rescues a wrong function).
+  (c) TENURE — within the same function and seniority, longer time-in-role / time-at-company indicates
+      deeper authority and influence and scores higher; a brand-new hire scores lower.
+Bands (apply after weighing a+b+c):
+  • 85-100 : right function AND senior decision-owner for this exact solution (the primary buyer here).
+  • 60-84  : right function, strong influence/champion (senior but not the owner, or owner-adjacent).
+  • 30-59  : adjacent/influencer function, or junior within the right function — loop in, does not own it.
+  • 0-29   : clearly irrelevant function for THIS objective+industry.
+SPREAD the scores — do NOT cluster everyone near one number; two people with different functions,
+seniority, or tenure should get visibly different scores.
+
+`reasoning` field — STRICT (this is shown to a salesperson in the UI):
+  • Write ONE professional, customer-facing sentence about THIS PERSON and the engagement decision —
+    speak to their actual title/function and what to do with them (engage them directly as the buyer,
+    use as champion/influencer, consider as budget-approver only, look for a better entry point in
+    function X instead, etc.).
+  • Use NATURAL business language a sales rep would use. NEVER recite the rubric or framework you used.
+  • BANNED phrasing (do NOT use these or anything similar — they expose internal logic):
+       "irrelevant function", "aligns with the key functions", "does not align with", "matched to
+       committee function", "the committee", "buying committee", "key functions of X, Y, or Z",
+       department/value quotes like 'Other'/'Marketing'/'Operations' in scare-quotes, "role_fit",
+       "scoring rubric", any mention of band names (e.g. "primary buyer band").
+  • GOOD examples (cross-industry, illustrative tone — do not copy verbatim):
+       "Operations Director — primary buyer for maintenance and uptime decisions; lead with the
+        downtime-reduction angle."
+       "Managing Director with broad oversight; can sponsor a pilot but typically delegates the
+        technical evaluation to the operations or engineering lead."
+       "Marketing leadership; not the buyer for this kind of operational tooling — better entry point
+        would be the head of operations or plant management."
+       "Junior maintenance engineer — useful internal champion to validate technical fit, but not the
+        decision-maker."
 
 CONTACTS (score EVERY index):
 {contacts_block}
 
-For each contact, return role_fit (0-100) = how likely this person is the
-decision-maker, economic buyer, or internal champion for the sender's solution
-given their title/seniority/department and the campaign objective. Favour people
-with authority over the relevant function; down-rank clearly irrelevant roles.
-Return a ranking entry for every index above."""
+Return a ranking entry for EVERY index above."""
         )
 
         structured = self.llm.with_structured_output(StakeholderRanking)
@@ -194,6 +210,7 @@ Return a ranking entry for every index above."""
                 "target_profiles": str(target_profiles)[:1500],
                 "pains_solved": str(pains_solved)[:1500],
                 "objective": (objective or "(general outreach)")[:1000],
+                "industry": (industry or "(unspecified)")[:300],
                 "research_context": (research_context or "N/A")[:2000],
                 "contacts_block": contacts_block,
             })

@@ -12,7 +12,6 @@ import datetime
 from datetime import UTC
 import asyncio
 from app.core.security import acquire_lock, release_lock
-from app.agents.campaign_validator import CampaignValidator
 
 
 @celery_app.task(name="app.workers.tasks.intel_worker.process_csv_worker", bind=True, max_retries=3, default_retry_delay=60)
@@ -31,20 +30,36 @@ def process_csv_worker(self, db: Session, campaign_id: str):
          logger.warning(f"⚠️  [Track A] Could not acquire lock for {campaign_id}. Already locked?")
          return
 
-    campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-    if not campaign:
-        logger.error(f"❌ [Track A] Campaign {campaign_id} not found in DB.")
+    try:
+        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        if not campaign:
+            logger.error(f"❌ [Track A] Campaign {campaign_id} not found in DB.")
+            return
+
+        logger.info(f"🚀 [Track A] Mobilizing SSoT Ingestion from DB for {campaign_id} (Status: {campaign.status})")
+
+        # Normalize the trimmed CSV ONCE into campaign_leads rows (typed columns),
+        # then drop the blob: the structured rows are now the SSoT and downstream
+        # stages read them in chunks instead of re-parsing the CSV. Idempotent —
+        # a retry that finds leads already present skips re-parsing.
+        from app.services import lead_repository
+        csv_content = campaign.trimmed_csv_data
+        try:
+            if csv_content and not lead_repository.has_leads(db, campaign_id):
+                lead_repository.normalize_csv_to_leads(db, campaign_id, csv_content)
+            # Free the blob once the rows exist (csv_done now derives from leads).
+            if lead_repository.has_leads(db, campaign_id) and campaign.trimmed_csv_data is not None:
+                campaign.trimmed_csv_data = None
+            db.commit()
+        except Exception as norm_err:
+            db.rollback()
+            logger.error(f"❌ [Track A] Lead normalization failed for {campaign_id}: {norm_err}. "
+                         f"Keeping blob as fallback.")
+
+        # Execute the Indestructible State-Machine Orchestrator
+        campaign_service.process_state_machine(db, campaign_id)
+    finally:
         release_lock(lock_key)
-        return
-
-    logger.info(f"🚀 [Track A] Mobilizing SSoT Ingestion from DB for {campaign_id} (Status: {campaign.status})")
-
-    csv_content = campaign.trimmed_csv_data
-
-    # Execute the Indestructible State-Machine Orchestrator
-    campaign_service.process_state_machine(db, campaign_id, csv_content if csv_content else None)
-
-    release_lock(lock_key)
 
 @celery_app.task(name="app.workers.tasks.intel_worker.research_user_company_worker", bind=True, max_retries=3, default_retry_delay=120)
 @with_short_lived_db_session
@@ -115,50 +130,8 @@ def research_user_company_worker(self, db: Session, campaign_id: str):
             release_lock(lock_key)
             self.retry(exc=e)
 
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-def validate_input_worker(self, campaign_id: str):
-    """
-    Track C: Input Validation Agent (Agent B)
-    Validates the campaign prompt for clarity and actionability.
-    """
-    from app.services.campaign_service import campaign_service
-    from app.core.security import acquire_lock, release_lock
-    
-    lock_key = f"campaign_val:{campaign_id}"
-    if not acquire_lock(lock_key, ttl=600):
-        logger.warning(f"⚠️  [Track C] Validation already in progress for {campaign_id}. Skipping.")
-        return
-
-    # 1. Short read transaction to fetch input variables
-    with db_session() as db:
-        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-        if not campaign:
-            release_lock(lock_key)
-            return
-        prompt = campaign.prompt
-
-    logger.info(f"🔍 [Track C] Validating Input for Campaign: {campaign_id}")
-    
-    # 2. Heavy LLM call runs with ZERO database sessions held
-    try:
-        validation_data = asyncio.run(CampaignValidator.validate_prompt(prompt))
-    except Exception as e:
-        logger.error(f"Track C External Validation Failure: {e}")
-        release_lock(lock_key)
-        self.retry(exc=e)
-        return
-
-    # 3. Short write transaction to save validation review
-    with db_session() as db:
-        try:
-            campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
-            if validation_data and campaign:
-                campaign.input_validation_review = validation_data
-                db.commit()
-                logger.info(f"✅ [Track C] Input Validation Complete for {campaign_id}. Advancing State Machine.")
-                campaign_service.process_state_machine(db, campaign_id)
-            release_lock(lock_key)
-        except Exception as e:
-            logger.error(f"Track C DB Write Failure: {e}")
-            release_lock(lock_key)
-            self.retry(exc=e)
+# NOTE: Input validation is no longer a background track. It runs synchronously
+# in the API (POST /campaigns and PATCH /campaigns/{id}) via the single
+# InputValidationService, which persists corrections and writes the review that
+# satisfies the pipeline's val_done gate. The former Track C worker
+# (validate_input_worker -> CampaignValidator) has been removed.

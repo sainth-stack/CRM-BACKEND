@@ -20,21 +20,25 @@ if not DATABASE_URL:
 # blow straight past that ceiling. Keep each process's footprint tiny.
 #   IMPORTANT: point NEON_DB_URL at the *pooled* endpoint (host contains
 #   "-pooler") so PgBouncer absorbs bursts and survives Neon auto-suspend.
-engine_args = {
-    "pool_pre_ping": True, # Verify connection liveness (essential for Neon auto-suspend)
-    "pool_recycle": 300,   # Recycle well before Neon drops idle serverless connections
-    "pool_size": 3,        # Small steady-state pool per process
-    "max_overflow": 2,     # = 5 connections max per process under burst
-    "pool_timeout": 30,    # Max wait latency for pool acquisition
-}
-
-# Persistence Keepalive configuration for Neon/Serverless PostgreSQL
-engine_args["connect_args"] = {
-    "keepalives": 1,
-    "keepalives_idle": 30,
-    "keepalives_interval": 10,
-    "keepalives_count": 5
-}
+# Database-specific engine and connection tuning
+if DATABASE_URL.startswith("sqlite"):
+    engine_args = {}
+    engine_args["connect_args"] = {"check_same_thread": False}
+else:
+    engine_args = {
+        "pool_pre_ping": True, # Verify connection liveness (essential for Neon auto-suspend)
+        "pool_recycle": 300,   # Recycle well before Neon drops idle serverless connections
+        "pool_size": 3,        # Small steady-state pool per process
+        "max_overflow": 2,     # = 5 connections max per process under burst
+        "pool_timeout": 30,    # Max wait latency for pool acquisition
+    }
+    # Persistence Keepalive configuration for Neon/Serverless PostgreSQL
+    engine_args["connect_args"] = {
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5
+    }
 
 engine = create_engine(
     DATABASE_URL,

@@ -76,19 +76,68 @@ def _redis():
         return None
 
 
+# --------------------------------------------------------------------------- #
+# Process-local fallback accounting.                                           #
+# When Redis is unavailable (e.g. broker over quota / outage) the previous     #
+# implementation failed fully OPEN — every budget check was skipped, so a      #
+# runaway loop could burn unbounded spend. This in-memory accumulator keeps    #
+# enforcement alive per-process (degraded but not disabled). It is also kept   #
+# warm while Redis works, so enforcement is seamless if Redis drops mid-run.   #
+# --------------------------------------------------------------------------- #
+import threading
+
+_local_lock = threading.Lock()
+_local_state: dict = {"day": None, "daily_usd": 0.0, "campaign_usd": {}}
+
+
+def _local_roll_day(today: str) -> None:
+    if _local_state["day"] != today:
+        _local_state["day"] = today
+        _local_state["daily_usd"] = 0.0
+        _local_state["campaign_usd"] = {}
+
+
+def _local_check(today: str, cid: str | None) -> None:
+    """Raise CostBudgetExceeded if the process-local counters are over budget."""
+    with _local_lock:
+        _local_roll_day(today)
+        if _local_state["daily_usd"] >= settings.LLM_DAILY_BUDGET_USD:
+            raise CostBudgetExceeded(
+                f"[local] Daily LLM budget exceeded "
+                f"(${_local_state['daily_usd']:.2f} / ${settings.LLM_DAILY_BUDGET_USD:.2f})."
+            )
+        if cid and _local_state["campaign_usd"].get(cid, 0.0) >= settings.LLM_CAMPAIGN_BUDGET_USD:
+            raise CostBudgetExceeded(
+                f"[local] Campaign {cid} LLM budget exceeded "
+                f"(${_local_state['campaign_usd'][cid]:.2f} / ${settings.LLM_CAMPAIGN_BUDGET_USD:.2f})."
+            )
+
+
+def _local_add(today: str, cid: str | None, cost: float) -> None:
+    with _local_lock:
+        _local_roll_day(today)
+        _local_state["daily_usd"] += cost
+        if cid:
+            _local_state["campaign_usd"][cid] = _local_state["campaign_usd"].get(cid, 0.0) + cost
+
+
 class CostGuard(BaseCallbackHandler):
     def on_llm_start(self, serialized, prompts, **kwargs):
+        today = datetime.date.today().isoformat()
+        cid = campaign_id_var.get()
         r = _redis()
         if not r:
+            # Redis down → enforce against the process-local fallback instead of
+            # failing open. This is what stops a loop from burning unbounded spend
+            # during a broker outage.
+            _local_check(today, cid)
             return
-        today = datetime.date.today().isoformat()
         try:
             daily = float(r.get(f"llm_cost:{today}") or 0.0)
             if daily >= settings.LLM_DAILY_BUDGET_USD:
                 raise CostBudgetExceeded(
                     f"Daily LLM budget exceeded (${daily:.2f} / ${settings.LLM_DAILY_BUDGET_USD:.2f})."
                 )
-            cid = campaign_id_var.get()
             if cid:
                 camp = float(r.get(f"llm_cost_campaign:{cid}") or 0.0)
                 if camp >= settings.LLM_CAMPAIGN_BUDGET_USD:
@@ -100,7 +149,9 @@ class CostGuard(BaseCallbackHandler):
             logger.error("🚨 [COST GOVERNANCE] %s", kwargs.get("run_id", ""))
             raise
         except Exception as e:
-            logger.warning(f"[COST] budget check skipped: {e}")
+            # Redis errored mid-check → fall back to local enforcement, don't open up.
+            logger.warning(f"[COST] Redis budget check failed ({e}); using local fallback.")
+            _local_check(today, cid)
 
     def on_llm_end(self, response, **kwargs):
         try:
@@ -115,19 +166,25 @@ class CostGuard(BaseCallbackHandler):
             p_in, p_out = _model_price(model)
             cost = (prompt_tokens / 1_000_000) * p_in + (completion_tokens / 1_000_000) * p_out
 
-            r = _redis()
-            if not r:
-                return
             today = datetime.date.today().isoformat()
-            r.incrbyfloat(f"llm_cost:{today}", cost)
-            r.expire(f"llm_cost:{today}", 172800)
-            r.incrbyfloat("llm_cost_total", cost)
-            r.incrby("llm_tokens_total", prompt_tokens + completion_tokens)
-
             cid = campaign_id_var.get()
-            if cid:
-                r.incrbyfloat(f"llm_cost_campaign:{cid}", cost)
-                r.expire(f"llm_cost_campaign:{cid}", 604800)  # 7 days
+
+            # Always keep the process-local accumulator warm so enforcement survives
+            # a Redis outage that starts mid-run.
+            _local_add(today, cid, cost)
+
+            r = _redis()
+            if r:
+                try:
+                    r.incrbyfloat(f"llm_cost:{today}", cost)
+                    r.expire(f"llm_cost:{today}", 172800)
+                    r.incrbyfloat("llm_cost_total", cost)
+                    r.incrby("llm_tokens_total", prompt_tokens + completion_tokens)
+                    if cid:
+                        r.incrbyfloat(f"llm_cost_campaign:{cid}", cost)
+                        r.expire(f"llm_cost_campaign:{cid}", 604800)  # 7 days
+                except Exception as e:
+                    logger.warning(f"[COST] Redis cost write failed ({e}); local accounting retained.")
 
             logger.info(
                 f"📊 [COST] model={model or '?'} tokens={prompt_tokens + completion_tokens} "

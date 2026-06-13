@@ -135,7 +135,8 @@ DETAILS:
 {refine_block}
 
 RULES:
-- Structure: a greeting line addressing them by first name, then exactly 3 short paragraphs —
+- Structure: open with a greeting line "Hi {prospect_first_name}," on its own line followed by a blank
+  line, then exactly 3 short paragraphs —
   (1) the hook anchored in their reality and the pain it implies,
   (2) the bridge to {sender_name}'s capability, reinforced by the value proof,
   (3) the single ask exactly as framed in 'The ask' / 'role play'.

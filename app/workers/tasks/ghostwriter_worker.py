@@ -273,23 +273,37 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, 
         if not dm: return
 
         campaign = dm.campaign
+        ui = campaign.user_intel
         user_intel = {
-            "company_name": campaign.user_intel.company_name,
-            "deep_research": campaign.user_intel.deep_research
+            "company_name": ui.company_name,
+            "deep_research": ui.deep_research,
+            "proof_points": ui.proof_points or [],
+            "competitive_advantages": ui.competitive_advantages or [],
         }
 
         tc = dm.target_company
+        meddpicc = (tc.v2_intel or {}).get("meddpicc", {}) if (tc and tc.v2_intel) else {}
         target_company_intel = {
             "research_summary": (tc.research_summary or "") if tc else "",
             "growth_hooks": (tc.growth_hooks or []) if tc else [],
             "pain_hooks": (tc.pain_hooks or []) if tc else [],
             "news_hooks": (tc.news_hooks or []) if tc else [],
             "opportunity_reason": (tc.opportunity_reason or "") if tc else "",
+            "matched_pains": (tc.matched_pains or []) if tc else [],
+            "matched_services": (tc.matched_services or []) if tc else [],
+            "metrics": meddpicc.get("metrics", ""),
+            "economic_buyer": meddpicc.get("economic_buyer", ""),
+            "champion": meddpicc.get("champion", ""),
+            "decision_criteria": meddpicc.get("decision_criteria", ""),
+            "need_evidence": meddpicc.get("need_evidence", ""),
+            "recipient_role_signal": dm.relevance_explanation or "",
         }
 
+        # Pull a fuller thread (covers the whole 11-step nudge arc) so each new email
+        # can be richer than ALL previous ones, not just the last few.
         logs = db.query(models.CommunicationLog).filter(
             models.CommunicationLog.dm_id == dm.id
-        ).order_by(models.CommunicationLog.received_at.desc()).limit(5).all()
+        ).order_by(models.CommunicationLog.received_at.desc()).limit(15).all()
 
         history_text = "\n".join([f"{log.direction}: {log.body}" for log in logs])
 

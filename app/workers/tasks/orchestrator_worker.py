@@ -408,15 +408,19 @@ def _deploy_nudge(
                 else "Account Manager"
             )
 
-        last_sent = (
+        # Full history of everything we've already SENT to this prospect (oldest first)
+        # so the reminder drafter can open a genuinely new angle each round and be
+        # richer than ALL previous emails — not just avoid repeating the last one.
+        sent_logs = (
             db.query(models.CommunicationLog)
             .filter(
                 models.CommunicationLog.dm_id == dm.id,
                 models.CommunicationLog.direction == "SENT",
             )
-            .order_by(models.CommunicationLog.received_at.desc())
-            .first()
+            .order_by(models.CommunicationLog.received_at.asc())
+            .all()
         )
+        last_sent = sent_logs[-1] if sent_logs else None
 
         if is_discovery:
             body = (
@@ -431,11 +435,18 @@ def _deploy_nudge(
         else:
             user_intel_obj = dm.campaign.user_intel
             tc = dm.target_company
+            meddpicc = (tc.v2_intel or {}).get("meddpicc", {}) if (tc and tc.v2_intel) else {}
+            previous_emails = "\n\n----- next email -----\n\n".join(
+                f"[Email {i + 1}] Subject: {(l.subject or '')}\n{(l.body or '')}"
+                for i, l in enumerate(sent_logs)
+            )
             body = draft_reminder_escalation_email(
-                previous_email=last_sent.body if last_sent else "",
+                previous_emails=previous_emails,
                 user_intel={
                     "company_name": user_intel_obj.company_name,
                     "deep_research": user_intel_obj.deep_research or "",
+                    "proof_points": user_intel_obj.proof_points or [],
+                    "competitive_advantages": user_intel_obj.competitive_advantages or [],
                 },
                 target_company_intel={
                     "research_summary": (tc.research_summary or "") if tc else "",
@@ -443,6 +454,14 @@ def _deploy_nudge(
                     "pain_hooks": (tc.pain_hooks or []) if tc else [],
                     "news_hooks": (tc.news_hooks or []) if tc else [],
                     "opportunity_reason": (tc.opportunity_reason or "") if tc else "",
+                    "matched_pains": (tc.matched_pains or []) if tc else [],
+                    "matched_services": (tc.matched_services or []) if tc else [],
+                    "metrics": meddpicc.get("metrics", ""),
+                    "economic_buyer": meddpicc.get("economic_buyer", ""),
+                    "champion": meddpicc.get("champion", ""),
+                    "decision_criteria": meddpicc.get("decision_criteria", ""),
+                    "need_evidence": meddpicc.get("need_evidence", ""),
+                    "recipient_role_signal": dm.relevance_explanation or "",
                 },
                 dm_name=dm.name,
                 target_company_name=tc.name if tc else "",

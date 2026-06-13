@@ -360,6 +360,15 @@ def geocode_timezone(location: str | None, cache: dict | None = None) -> str | N
     if cache is not None and key in cache:
         return cache[key]
 
+    # Cross-run/worker cache (Redis): a location's timezone is effectively permanent,
+    # so this avoids re-hitting the rate-limited geocoder for locations seen before.
+    from app.core.cache import geocode_cached, geocode_store
+    hit, tz_cached = geocode_cached(key)
+    if hit:
+        if cache is not None:
+            cache[key] = tz_cached
+        return tz_cached
+
     result: str | None = None
     for candidate in _location_candidates(location):
         tz = _lookup_timezone_from_location(candidate)
@@ -367,6 +376,7 @@ def geocode_timezone(location: str | None, cache: dict | None = None) -> str | N
             result = tz
             break
 
+    geocode_store(key, result)
     if cache is not None:
         cache[key] = result
     return result

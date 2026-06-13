@@ -75,7 +75,7 @@ class TargetCompany(Base):
     )
     
     campaign = relationship("Campaign", back_populates="target_companies")
-    dms = relationship("DecisionMaker", back_populates="target_company", cascade="all, delete-orphan")
+    dms = relationship("DecisionMaker", back_populates="target_company", cascade="all, delete-orphan", passive_deletes=True)
 
 class DecisionMaker(Base):
     __tablename__ = "decision_makers"
@@ -140,7 +140,7 @@ class DecisionMaker(Base):
     
     campaign = relationship("Campaign", back_populates="dms")
     target_company = relationship("TargetCompany", back_populates="dms")
-    drafts = relationship("EmailDraft", back_populates="dm", cascade="all, delete-orphan")
-    logs = relationship("CommunicationLog", back_populates="dm", cascade="all, delete-orphan")
-    transitions = relationship("ProspectLifecycleTransition", back_populates="dm", cascade="all, delete-orphan")
-    outbound_dispatches = relationship("OutboundDispatch", back_populates="dm", cascade="all, delete-orphan")
+    drafts = relationship("EmailDraft", back_populates="dm", cascade="all, delete-orphan", passive_deletes=True)
+    logs = relationship("CommunicationLog", back_populates="dm", cascade="all, delete-orphan", passive_deletes=True)
+    transitions = relationship("ProspectLifecycleTransition", back_populates="dm", cascade="all, delete-orphan", passive_deletes=True)
+    outbound_dispatches = relationship("OutboundDispatch", back_populates="dm", cascade="all, delete-orphan", passive_deletes=True)

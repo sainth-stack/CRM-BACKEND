@@ -34,7 +34,13 @@ class Settings:
     # firmographic requirement. Score-driven (no pass/fail/unknown cliff). Lower to
     # accept more, raise to be stricter. Calibrated on the labeled ICP eval set.
     ICP_ACCEPT_THRESHOLD = int(os.getenv("ICP_ACCEPT_THRESHOLD", "45"))
-    
+
+    # Cross-campaign reuse of a domain's structured research profile (skips crawl +
+    # enrichment). A stored profile is reused only if it was refreshed within this
+    # many days; older than this, the domain is re-crawled + re-enriched so the
+    # research never goes permanently stale.
+    ICP_PROFILE_FRESHNESS_DAYS = int(os.getenv("ICP_PROFILE_FRESHNESS_DAYS", "30"))
+
     # 3. PRODUCTION OBSERVABILITY, METRICS & ALERTS
     SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
     STORAGE_MODE = os.getenv("STORAGE_MODE", "local")

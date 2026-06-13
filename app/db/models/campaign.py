@@ -66,15 +66,18 @@ class Campaign(Base):
     workflow_thread_id = Column(String, nullable=True)
     
     # Relationships
+    # passive_deletes=True: the DB has ON DELETE CASCADE on every child FK, so rely on
+    # Postgres to cascade in ONE statement instead of SQLAlchemy loading + deleting
+    # every child row over the network (which made campaign deletes take minutes).
     owner = relationship("User", back_populates="campaigns")
-    user_intel = relationship("UserCompanyIntel", back_populates="campaign", uselist=False, cascade="all, delete-orphan")
-    leads = relationship("CampaignLead", back_populates="campaign", cascade="all, delete-orphan")
-    target_companies = relationship("TargetCompany", back_populates="campaign", cascade="all, delete-orphan")
-    dms = relationship("DecisionMaker", back_populates="campaign", cascade="all, delete-orphan")
-    drafts = relationship("EmailDraft", back_populates="campaign", cascade="all, delete-orphan")
-    logs = relationship("CommunicationLog", back_populates="campaign", cascade="all, delete-orphan")
-    transitions = relationship("ProspectLifecycleTransition", back_populates="campaign", cascade="all, delete-orphan")
-    outbound_dispatches = relationship("OutboundDispatch", back_populates="campaign", cascade="all, delete-orphan")
+    user_intel = relationship("UserCompanyIntel", back_populates="campaign", uselist=False, cascade="all, delete-orphan", passive_deletes=True)
+    leads = relationship("CampaignLead", back_populates="campaign", cascade="all, delete-orphan", passive_deletes=True)
+    target_companies = relationship("TargetCompany", back_populates="campaign", cascade="all, delete-orphan", passive_deletes=True)
+    dms = relationship("DecisionMaker", back_populates="campaign", cascade="all, delete-orphan", passive_deletes=True)
+    drafts = relationship("EmailDraft", back_populates="campaign", cascade="all, delete-orphan", passive_deletes=True)
+    logs = relationship("CommunicationLog", back_populates="campaign", cascade="all, delete-orphan", passive_deletes=True)
+    transitions = relationship("ProspectLifecycleTransition", back_populates="campaign", cascade="all, delete-orphan", passive_deletes=True)
+    outbound_dispatches = relationship("OutboundDispatch", back_populates="campaign", cascade="all, delete-orphan", passive_deletes=True)
 
 class UserCompanyIntel(Base):
     __tablename__ = "user_company_intel"

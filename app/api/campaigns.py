@@ -1,7 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Form, File, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, Form, File, UploadFile, Response
+from fastapi.encoders import jsonable_encoder
 from starlette.requests import Request
 from sqlalchemy.orm import Session, selectinload
 from pydantic import BaseModel
+import json
 import uuid
 import datetime
 from datetime import UTC
@@ -385,6 +387,23 @@ def get_campaign(
     Deep Intelligence Audit.
     Retrieves comprehensive metadata, discovered stakeholders, and communication history for a specific campaign.
     """
+    from app.core.cache import campaign_detail_key, cache_get, cache_set, CAMPAIGN_DETAIL_TTL
+
+    # Cache fast-path: a cheap access check (no graph load) enforces visibility, then
+    # we serve the prebuilt JSON straight from Redis — skipping the full eager-load +
+    # dict materialization that the 15s poll would otherwise repeat every time.
+    access = db.query(models.Campaign.id).filter(
+        models.Campaign.id == campaign_id,
+        get_visibility_filter(db, current_user),
+    ).first()
+    if not access:
+        raise HTTPException(status_code=404, detail="Campaign not found in your intelligence sector")
+
+    _cache_key = campaign_detail_key(campaign_id)
+    _cached = cache_get(_cache_key)
+    if _cached is not None:
+        return Response(content=_cached, media_type="application/json")
+
     # N+1 Fix: Single query with all relationships eager-loaded
     db_campaign = db.query(models.Campaign).options(
         selectinload(models.Campaign.user_intel),
@@ -540,8 +559,12 @@ def get_campaign(
         ),
         "drafts_count": sum(len(dm.drafts) for dm in db_campaign.dms),
     }
-    
-    return result
+
+    # Serialize exactly as FastAPI would (datetimes/enums via jsonable_encoder), cache
+    # the bytes under the current generation, and return them directly.
+    body = json.dumps(jsonable_encoder(result)).encode()
+    cache_set(_cache_key, body, CAMPAIGN_DETAIL_TTL)
+    return Response(content=body, media_type="application/json")
 
 
 @router.patch("/{campaign_id}")

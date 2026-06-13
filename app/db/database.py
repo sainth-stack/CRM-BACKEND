@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 import os
 from app.core.config import settings
@@ -47,6 +47,57 @@ engine = create_engine(
 
 # Automated identity-scoped session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+# --------------------------------------------------------------------------- #
+# Campaign cache invalidation (single chokepoint for ALL writes)              #
+#                                                                             #
+# The campaign-detail endpoint is cached in Redis keyed by a per-campaign     #
+# generation counter. Rather than clearing the cache at every write call-site #
+# (error-prone), we listen on the session: whenever a commit changes a row    #
+# that feeds the campaign detail payload, we bump that campaign's generation  #
+# so the next read rebuilds fresh. Works for both web and worker processes    #
+# (the generation lives in shared Redis). Fully no-op if Redis is down.       #
+# --------------------------------------------------------------------------- #
+# Model class-names whose changes are visible in the campaign detail payload.
+# (Class-name check avoids importing models here -> no circular import.)
+_CACHE_RELEVANT_MODELS = {
+    "Campaign", "UserCompanyIntel", "TargetCompany", "DecisionMaker",
+    "EmailDraft", "CommunicationLog", "ProspectLifecycleTransition",
+}
+
+
+def _campaign_id_of(obj):
+    cid = getattr(obj, "campaign_id", None)
+    if cid:
+        return cid
+    if type(obj).__name__ == "Campaign":
+        return getattr(obj, "id", None)
+    return None
+
+
+@event.listens_for(SessionLocal, "before_flush")
+def _track_dirty_campaigns(session, flush_context, instances):
+    import itertools
+    dirty = session.info.setdefault("_dirty_campaigns", set())
+    for obj in itertools.chain(session.new, session.dirty, session.deleted):
+        if type(obj).__name__ in _CACHE_RELEVANT_MODELS:
+            cid = _campaign_id_of(obj)
+            if cid:
+                dirty.add(cid)
+
+
+@event.listens_for(SessionLocal, "after_commit")
+def _bump_dirty_campaigns(session):
+    ids = session.info.pop("_dirty_campaigns", None)
+    if not ids:
+        return
+    try:
+        from app.core.cache import bump_campaign_generation
+        for cid in ids:
+            bump_campaign_generation(cid)
+    except Exception as e:  # never let cache bookkeeping break a commit
+        logger.debug(f"[CACHE] campaign generation bump skipped: {e}")
 
 def get_db():
     """

@@ -344,6 +344,10 @@ class CompanyValidationService:
         domains = [d for d in {d for d in domains if d}]
         if not domains:
             return {}
+        # Freshness window: only reuse a profile refreshed within N days; older ones
+        # are excluded so the domain gets re-crawled + re-enriched (never permanently stale).
+        import datetime as _dt
+        cutoff = _dt.datetime.utcnow() - _dt.timedelta(days=settings.ICP_PROFILE_FRESHNESS_DAYS)
         out: dict[str, dict] = {}
         db = SessionLocal()
         try:
@@ -352,6 +356,7 @@ class CompanyValidationService:
                 .filter(
                     models.TargetCompany.domain.in_(domains),
                     models.TargetCompany.icp_research_context != None,  # noqa: E711
+                    models.TargetCompany.updated_at >= cutoff,
                 )
                 .order_by(models.TargetCompany.updated_at.desc())
                 .all()

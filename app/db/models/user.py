@@ -43,8 +43,8 @@ class User(Base):
     cal_event_type_id = Column(Integer, nullable=True)
     cal_timezone = Column(String, default="UTC")
     
-    campaigns = relationship("Campaign", back_populates="owner", cascade="all, delete-orphan")
-    oauth_accounts = relationship("OAuthAccount", back_populates="user", cascade="all, delete-orphan")
+    campaigns = relationship("Campaign", back_populates="owner", cascade="all, delete-orphan", passive_deletes=True)
+    oauth_accounts = relationship("OAuthAccount", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
     
     # Self-referential relationship for administrative lineage
     creator = relationship("User", remote_side=[id], backref="managed_accounts")

@@ -25,11 +25,8 @@ def get_prospect_details(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """
-    Stakeholder Dossier Audit.
-    Retrieves detailed communication history and metadata for a specific prospect.
-    """
-    # Sector Query Boundary: Guarantee hierarchical relationship ownership
+    """Return a prospect's detail: communication history and metadata."""
+    # Scope the lookup to the caller's campaigns (prevents IDOR).
     dm = db.query(models.DecisionMaker).join(models.Campaign).filter(
         models.DecisionMaker.id == dm_id,
         get_visibility_filter(db, current_user)

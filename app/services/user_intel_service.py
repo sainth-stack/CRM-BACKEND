@@ -15,7 +15,7 @@ class UserIntelService:
     async def research_user_company(self, url: str, prompt: str):
         from app.agents.user_intel import research_user_company as agent_research
 
-        logger.info(f"[STAGE 2] Mobilizing Brand Intelligence Agent for: {url}")
+        logger.info(f"[STAGE 2] Researching sender company: {url}")
 
         # Heavy agent work runs off the event loop; holds no DB session.
         research_data = await asyncio.to_thread(agent_research, url, prompt)

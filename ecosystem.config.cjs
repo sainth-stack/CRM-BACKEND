@@ -4,7 +4,7 @@
 // THREE-WORKER layout (5 PM2 apps total):
 //   crm-api                         FastAPI on 127.0.0.1:9001 (nginx proxies /api/)
 //   crm-frontend                    React static bundle on 127.0.0.1:9000
-//   crm-celery-worker-heavy         heavy_research   (AI / Tavily — memory-heavy)
+//   crm-celery-worker-heavy         heavy_research   (AI / LLM — memory-heavy)
 //   crm-celery-worker-light         outbound_dispatch, inbox_polling, orchestrator (latency-sensitive/orchestration)
 //   crm-celery-beat                 scheduler — exactly ONE instance, never scale
 //

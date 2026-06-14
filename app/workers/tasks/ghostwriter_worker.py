@@ -152,11 +152,11 @@ def _update_campaign_draft_status(db, campaign_id: str, lock_key: str) -> None:
 
             if expected_count == 0:
                 campaign.status = models.CampaignStatus.PARTIAL_SUCCESS
-                campaign.status_reason = "Mission stalled: Zero stakeholders identified during previous phases."
+                campaign.status_reason = "No stakeholders were identified."
                 logger.warning(f"[CAMPAIGN] Campaign {campaign_id} stalled: No stakeholders identified.")
             elif drafted_count >= expected_count:
                 campaign.status = models.CampaignStatus.COMPLETED
-                campaign.status_reason = f"Mission successful: {drafted_count}/{expected_count} drafts secured."
+                campaign.status_reason = f"Generated {drafted_count}/{expected_count} drafts."
                 logger.info(f"[CAMPAIGN] Success: Generated {drafted_count}/{expected_count} drafts for {campaign_id}.")
             elif drafted_count > 0:
                 campaign.status = models.CampaignStatus.PARTIAL_SUCCESS
@@ -164,8 +164,8 @@ def _update_campaign_draft_status(db, campaign_id: str, lock_key: str) -> None:
                 logger.warning(f"[CAMPAIGN] Partial Success: Generated {drafted_count}/{expected_count} drafts for {campaign_id}.")
             else:
                 campaign.status = models.CampaignStatus.FAILED
-                campaign.status_reason = "Mission Failure: Zero drafts could be generated despite identified stakeholders."
-                logger.error(f"[CAMPAIGN] Mission Failure: 0/{expected_count} drafts generated for {campaign_id}.")
+                campaign.status_reason = "No drafts could be generated for the identified stakeholders."
+                logger.error(f"[CAMPAIGN] No drafts generated: 0/{expected_count} for {campaign_id}.")
             db.commit()
     finally:
         release_lock(lock_key)
@@ -207,14 +207,26 @@ def draft_emails_worker(self, campaign_id: str):
 
             logger.info(f"[GHOSTWRITER] Generating content for {len(dm_data_list)} prospects.")
             drafter = DraftingService()
-            BATCH_SIZE = 10
+            COMMIT_BATCH = 10   # prospects persisted per DB transaction
             DRAFT_CONCURRENCY = settings.STAGE6_CONCURRENCY
 
-            async def _draft_batch(batch_items):
-                """Draft one batch of prospects CONCURRENTLY (bounded). Each draft is a
-                3-5 LLM-call sub-graph; fanning prospects out cuts Stage-6 wall-clock ~Nx
-                while memory stays flat (only one batch of results is ever held). Each
-                draft still runs with ZERO database sessions held during the LLM work."""
+            def _heartbeat():
+                # Session-safe lease pulse so the stuck-campaign sweeper won't resurrect
+                # this drafting run mid-flight.
+                with db_session() as db_heartbeat:
+                    try:
+                        heartbeat_lease(db_heartbeat, campaign_id, worker_id)
+                    except Exception:
+                        pass
+
+            async def _draft_all(items):
+                """Stream every prospect through ONE bounded pool (DRAFT_CONCURRENCY in
+                flight at all times), persisting drafts every COMMIT_BATCH as they
+                complete. Concurrency is DECOUPLED from the commit batch, so a single
+                slow 3-5 call draft no longer stalls a whole batch (the old per-batch
+                `gather` waited for the slowest of 10 before starting the next 10).
+                Each draft runs with ZERO DB sessions held during the LLM work; the
+                generated drafts are identical — only scheduling changes."""
                 sem = asyncio.Semaphore(DRAFT_CONCURRENCY)
 
                 async def _one(item):
@@ -226,26 +238,39 @@ def draft_emails_worker(self, campaign_id: str):
                             logger.error(f"Drafting Failure for {item['name']}: {draft_e}")
                             return item["id"], None
 
-                return await asyncio.gather(*[_one(it) for it in batch_items])
+                total = len(items)
+                pending = {asyncio.create_task(_one(it)) for it in items}
+                buffer = []
+                processed = 0
+                since_commit = 0
+                try:
+                    while pending:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for fut in done:
+                            dm_id, ds = fut.result()
+                            processed += 1
+                            since_commit += 1
+                            if ds and getattr(ds, "variants", None):
+                                buffer.append((dm_id, ds))
+                            if since_commit >= COMMIT_BATCH:
+                                if buffer:
+                                    _save_drafts_batch(campaign_id, buffer)
+                                    buffer = []
+                                _heartbeat()
+                                logger.info(f"   ↳ [GHOSTWRITER] Drafted {processed}/{total} for {campaign_id}.")
+                                since_commit = 0
+                        del done
+                    if buffer:  # flush the final partial batch
+                        _save_drafts_batch(campaign_id, buffer)
+                        buffer = []
+                        _heartbeat()
+                        logger.info(f"   ↳ [GHOSTWRITER] Drafted {processed}/{total} for {campaign_id}.")
+                finally:
+                    for t in pending:
+                        t.cancel()
 
-            # Process in commit-batches: draft each batch concurrently, persist, heartbeat.
-            for start in range(0, len(dm_data_list), BATCH_SIZE):
-                batch_items = dm_data_list[start:start + BATCH_SIZE]
-                results = asyncio.run(_draft_batch(batch_items))
-
-                pending_drafts = [
-                    (dm_id, ds) for dm_id, ds in results
-                    if ds and getattr(ds, "variants", None)
-                ]
-                if pending_drafts:
-                    _save_drafts_batch(campaign_id, pending_drafts)
-
-                # Heartbeat once per batch (session-safe)
-                with db_session() as db_heartbeat:
-                    try:
-                        heartbeat_lease(db_heartbeat, campaign_id, worker_id)
-                    except Exception:
-                        pass
+            # Single event loop streams ALL prospects (was one asyncio.run per batch).
+            asyncio.run(_draft_all(dm_data_list))
 
             # Final Campaign Status Update in a short write session
             with db_session() as db:
@@ -261,8 +286,8 @@ def draft_emails_worker(self, campaign_id: str):
 
 def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, alternative_slots: list = None):
     """
-    Persistence Engine: Nudge Dispatcher.
-    Also handles 'Manual Coordination' fallbacks when the auto-booking probe fails.
+    Draft and schedule a follow-up nudge.
+    Also handles manual-coordination fallbacks when auto-booking fails.
     """
     db_ctx = None
     if db is None:
@@ -403,8 +428,7 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, 
 
 def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
     """
-    Discovery Protocol Engine.
-    Drafts the formal discovery call request after successful interest classification or auto-booking coordination.
+    Draft the discovery-call request after positive-intent classification or auto-booking.
     """
     db_ctx = None
     if db is None:
@@ -475,13 +499,13 @@ def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
                 dm.retry_after = None
                 if db_ctx:
                     db.commit()
-                logger.info(f"[DISCOVERY] Draft persistent for {dm.name} | Protocol: DISCOVERY_CALL")
+                logger.info(f"[DISCOVERY] Draft saved for {dm.name} (DISCOVERY_CALL)")
             except IntegrityError:
                 if db_ctx: db.rollback()
                 logger.info(f"[IDEMPOTENCY] Discovery draft already exists for {dm.name}")
     except Exception as e:
         if db_ctx: db.rollback()
-        logger.error(f"Discovery Protocol Failure for DM {dm_id}: {e}", exc_info=True)
+        logger.error(f"Discovery draft failed for DM {dm_id}: {e}", exc_info=True)
         raise e
     finally:
         if db_ctx:

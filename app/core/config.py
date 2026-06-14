@@ -25,9 +25,9 @@ class Settings:
     # crawl + one LLM call), NOT CPU-bound, so it can safely run much wider than the
     # old min(stage3, stage4)=3 cap that throttled it. Raise for faster big runs;
     # lower only if the box shows network/socket pressure.
-    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "10"))        # merged ICP gate (extractor + LLM)
-    STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "10"))   # stakeholder ranking (per-company LLM)
-    STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "10"))   # email drafting sub-graph (per-prospect)
+    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "20"))        # merged ICP gate (extractor + LLM)
+    STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "20"))   # stakeholder ranking (per-company LLM)
+    STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "20"))   # email drafting sub-graph (per-prospect)
 
     # ICP acceptance threshold (0-100). A company is accepted when its graded
     # strategic_fit_score >= this value AND it does not hard-fail an explicit

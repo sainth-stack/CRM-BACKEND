@@ -40,10 +40,7 @@ def update_draft(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """
-    Email Protocol Refinement.
-    Updates the subject or body of an outreach draft prior to tactical deployment.
-    """
+    """Update a draft's subject or body before it's sent."""
     db_draft = _lock_query(
         db.query(models.EmailDraft).join(models.Campaign).filter(
             models.EmailDraft.id == draft_id,
@@ -71,7 +68,7 @@ def send_draft(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    # Sector Query Boundary: Hard IDOR prevention & Hierarchical Trust
+    # Scope the lookup to the caller's campaigns (prevents IDOR).
     db_draft = _lock_query(
         db.query(models.EmailDraft).join(models.Campaign).filter(
             models.EmailDraft.id == draft_id,

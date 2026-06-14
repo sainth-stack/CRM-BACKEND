@@ -54,7 +54,7 @@ flowchart TD
 * **Distributed Task Queue**: Celery (queuing tasks on `heavy_research`, `outbound_dispatch`, `inbox_polling`, and `orchestrator` channels).
 * **Database & ORM**: PostgreSQL, Neon DB Serverless, SQLAlchemy ORM, Alembic migrations.
 * **Cache & Memory Broker**: Redis (for active session locks, rate limiting, and request caching).
-* **AI & LLM Services**: LangChain, OpenAI API (`gpt-4o-mini`), Tavily Search API.
+* **AI & LLM Services**: LangChain, OpenAI API (`gpt-4o-mini`), in-house website extractor (`curl_cffi` + `trafilatura`).
 
 ---
 

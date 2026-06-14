@@ -19,8 +19,11 @@ from app.core.logging_config import logger
 from app.core.security import _get_redis
 
 # Detail payload TTL — safety net behind generation invalidation. Also the de-facto
-# max staleness for the rare case where a generation bump silently fails.
-CAMPAIGN_DETAIL_TTL = 30
+# max staleness for the rare case where a generation bump silently fails. Kept long
+# because the generation counter already invalidates on every real write, so a high
+# TTL only saves Neon reads (fewer rebuilds for an idle, open campaign page) without
+# risking staleness.
+CAMPAIGN_DETAIL_TTL = 300
 _GEN_TTL = 7 * 24 * 3600  # abandoned campaigns' gen keys self-expire after a week
 
 # Reused client: _get_redis() builds a fresh client (and TLS connection) per call,

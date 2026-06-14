@@ -45,11 +45,8 @@ def strip_null_bytes(value):
 
 
 def sanitize_html(html_content: str) -> str:
-    """
-    Tactical HTML Decommissioning.
-    Removes script tags, style blocks, and HTML elements to extract clean text 
-    suitable for LLM consumption while preventing cross-site scripting (XSS) artifacts.
-    """
+    """Strip script/style tags and HTML markup to produce clean text for LLM input
+    (also removes XSS artifacts)."""
     if not html_content:
         return ""
     

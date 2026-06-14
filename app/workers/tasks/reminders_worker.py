@@ -1,5 +1,5 @@
 """
-Sentinel Workers: inbox polling, orchestrator nudges, and meeting reminders.
+Background workers: inbox polling, orchestrator nudges, and meeting reminders.
 """
 
 import datetime

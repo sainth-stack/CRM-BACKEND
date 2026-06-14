@@ -71,16 +71,16 @@ def create_campaign(
     current_user: models.User = Depends(get_current_user)
 ):
     """
-    Stage 1 Input Validation Protocol.
-    Initializes a campaign shell only after validating and reviewing user-provided setup inputs.
-    Input parameters are normalized via the Sanitization Engine to mitigate injection risks.
+    Stage 1: input validation.
+    Creates a campaign only after the user-provided setup inputs pass validation.
+    All inputs are sanitized to mitigate injection risks.
     """
-    # Hierarchy boundary: Only localized user identities can initialize campaign setup.
+    # Only end users (not admins) can create campaigns.
     user_role_str = str(current_user.role).lower().split('.')[-1]
     if user_role_str != "user":
-        raise HTTPException(status_code=403, detail="Access Denied: Campaign setup is restricted to user identities.")
+        raise HTTPException(status_code=403, detail="Only end users can create campaigns.")
 
-    # 0. High-Fidelity Input Sanitization
+    # 0. Sanitize inputs.
     sanitized_name = sanitize_text(name, max_length=100)
     # Lengths accommodate comma-separated multi-values (industry/location/size).
     sanitized_industry = sanitize_text(target_industry, max_length=300)
@@ -88,13 +88,13 @@ def create_campaign(
     sanitized_emp_count = sanitize_text(target_employee_count, max_length=120)
     sanitized_prompt = sanitize_text(prompt, max_length=2000)
     
-    # 0.1 Mandatory SSoT Verification
+    # 0.1 Required-field checks.
     if not sanitized_name:
         raise HTTPException(status_code=400, detail="Campaign name is required.")
     if not file:
-        raise HTTPException(status_code=400, detail="SSoT Violation: A Lead CSV file is strictly mandatory for campaign mobilization.")
+        raise HTTPException(status_code=400, detail="A lead CSV file is required.")
     if not user_url:
-        raise HTTPException(status_code=400, detail="Context Violation: A User Company URL is strictly mandatory for Brand Intelligence.")
+        raise HTTPException(status_code=400, detail="A company URL is required.")
     if not sanitized_industry:
         raise HTTPException(status_code=400, detail="Target industry is required.")
     if not sanitized_location:
@@ -109,7 +109,7 @@ def create_campaign(
         raise HTTPException(status_code=400, detail="Campaign prompt is required.")
 
     if not file.filename.lower().endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Tactical Restriction: Only CSV files are authorized for lead injection.")
+        raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
 
     # 0.2 URL Normalization + SSRF Protection
     raw_url = user_url.strip()
@@ -170,7 +170,7 @@ def create_campaign(
     # 1. Create campaign in DB tied to user
     campaign_id = str(uuid.uuid4())
     
-    # 2. Streaming Artifact Ingestion: trim to the MAX_CSV_ROWS SSoT batch.
+    # 2. Stream-trim the CSV to MAX_CSV_ROWS.
     MAX_FILE_SIZE = 200 * 1024 * 1024 # 200MB Limit
 
     try:
@@ -180,7 +180,7 @@ def create_campaign(
         file.file.seek(0)
 
         if file_size > MAX_FILE_SIZE:
-            raise HTTPException(status_code=413, detail="Artifact Oversized: Lead CSV must be under 200MB.")
+            raise HTTPException(status_code=413, detail="CSV file must be under 200MB.")
 
         # F2: stream-trim straight from the upload handle. pandas reads only
         # MAX_CSV_ROWS and stops — the whole file is never pulled into RAM (no
@@ -190,8 +190,8 @@ def create_campaign(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Ingestion Failure: Could not process CSV for campaign {campaign_id}: {e}")
-        raise HTTPException(status_code=500, detail="Internal Ingestion Failure: Mission artifact could not be secured.")
+        logger.error(f"Could not process CSV for campaign {campaign_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process the uploaded CSV.")
 
     # F1: the trimmed CSV is persisted ONLY to the DB (single SSoT). No local
     # uploads/ file is written — removes the orphan-file disk leak and the
@@ -210,9 +210,9 @@ def create_campaign(
     )
     db.add(new_campaign)
     
-    # Commit quota consumption for Demo Users
+    # Consume the one-campaign trial quota for demo users.
     if current_user.is_demo:
-        # Atomic lock constraint: Prevents multi-click race conditions entirely
+        # Atomic update guards against double-submit race conditions.
         updated_rows = db.query(models.User).filter(
             models.User.id == current_user.id,
             models.User.has_used_trial_quota.in_([False, None])
@@ -222,7 +222,7 @@ def create_campaign(
             db.rollback()
             raise HTTPException(
                 status_code=429, 
-                detail="Deployment Lock: Your 1-campaign entitlement has been strictly enforced. Simultaneous operation intercepted."
+                detail="Your trial includes a single campaign, which has already been used."
             )
     
     intel_id = str(uuid.uuid4())
@@ -238,7 +238,7 @@ def create_campaign(
     db.add(new_intel)
     db.commit()
 
-    # 3. Mobilize Gated Background Pipeline.
+    # 3. Kick off the background pipeline.
     # Input validation already ran synchronously above (single validator) and its
     # review is persisted, so only the CSV + brand-intel tracks need dispatching;
     # the persisted review already satisfies the pipeline's val_done gate.
@@ -261,8 +261,7 @@ def get_campaigns(
     page_size: int = Query(20, ge=1, le=100, description="Results per page")
 ):
     """
-    Sovereign Campaign Audit.
-    Retrieves a paginated list of campaigns governed by the actor, enforcing strict multi-tenant isolation boundaries.
+    List the caller's campaigns (paginated), scoped to what they're allowed to see.
     """
     visibility_filter = get_visibility_filter(db, current_user)
     skip = (page - 1) * page_size
@@ -298,10 +297,9 @@ def delete_campaign(
     current_user: models.User = Depends(get_current_user)
 ):
     """
-    Sector Asset Decommissioning.
-    Permanently deletes a campaign and its associated intelligence data from the sector.
+    Permanently delete a campaign and all of its associated data.
     """
-    # Isolation: Apply Zero-Trust boundary
+    # Enforce the caller's visibility scope.
     db_campaign = db.query(models.Campaign).filter(
         models.Campaign.id == campaign_id,
         get_visibility_filter(db, current_user)
@@ -325,8 +323,7 @@ def update_campaign_status(
     current_user: models.User = Depends(get_current_user)
 ):
     """
-    Operational State Redirection.
-    Manually overrides the functional state of a campaign to facilitate human-in-the-loop intervention.
+    Manually override a campaign's status (human-in-the-loop).
     """
     db_campaign = db.query(models.Campaign).filter(
         models.Campaign.id == campaign_id,
@@ -354,11 +351,10 @@ def batch_delete_campaigns(
     current_user: models.User = Depends(get_current_user)
 ):
     """
-    Bulk Intelligence Termination.
-    Efficiently decommissions multiple campaigns simultaneously while maintaining sector integrity.
+    Delete multiple campaigns in a single request.
     """
     campaign_ids = request.campaign_ids
-    # Multi-tenant policy: hierarchical batch isolation
+    # Scope to campaigns the caller is allowed to delete.
     campaigns_to_delete = db.query(models.Campaign).filter(
         models.Campaign.id.in_(campaign_ids),
         get_visibility_filter(db, current_user)
@@ -366,43 +362,52 @@ def batch_delete_campaigns(
     
     count = len(campaigns_to_delete)
     if count == 0:
-        return {"message": "No campaigns identified for decommission within your sector."}
+        return {"message": "No matching campaigns found."}
 
-    # Bulk deletion with hierarchical boundary check
+    # Bulk delete within the caller's scope.
     db.query(models.Campaign).filter(
         models.Campaign.id.in_(campaign_ids),
         get_visibility_filter(db, current_user)
     ).delete(synchronize_session=False)
     db.commit()
-    return {"message": f"Successfully decommissioned {count} campaigns from your intelligence sector."}
+    return {"message": f"Deleted {count} campaign(s)."}
 
 
 @router.get("/{campaign_id}")
 def get_campaign(
+    request: Request,
     campaign_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
     """
-    Deep Intelligence Audit.
-    Retrieves comprehensive metadata, discovered stakeholders, and communication history for a specific campaign.
+    Return a campaign's full detail: metadata, discovered stakeholders, and communication history.
     """
-    from app.core.cache import campaign_detail_key, cache_get, cache_set, CAMPAIGN_DETAIL_TTL
+    from app.core.cache import campaign_detail_key, cache_get, cache_set, CAMPAIGN_DETAIL_TTL, campaign_generation
 
     # Cache fast-path: a cheap access check (no graph load) enforces visibility, then
     # we serve the prebuilt JSON straight from Redis — skipping the full eager-load +
-    # dict materialization that the 15s poll would otherwise repeat every time.
+    # dict materialization that the poll would otherwise repeat every time.
     access = db.query(models.Campaign.id).filter(
         models.Campaign.id == campaign_id,
         get_visibility_filter(db, current_user),
     ).first()
     if not access:
-        raise HTTPException(status_code=404, detail="Campaign not found in your intelligence sector")
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    # Conditional GET: the per-campaign generation counter is the ETag. If the client
+    # already holds the current version, reply 304 (no payload built or sent, and no
+    # Postgres reload). `no-cache` makes the browser revalidate (send If-None-Match)
+    # on each poll rather than re-download an unchanged body.
+    etag = f'W/"{campaign_id}.{campaign_generation(campaign_id)}"'
+    _headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=_headers)
 
     _cache_key = campaign_detail_key(campaign_id)
     _cached = cache_get(_cache_key)
     if _cached is not None:
-        return Response(content=_cached, media_type="application/json")
+        return Response(content=_cached, media_type="application/json", headers=_headers)
 
     # N+1 Fix: Single query with all relationships eager-loaded
     db_campaign = db.query(models.Campaign).options(
@@ -416,7 +421,7 @@ def get_campaign(
         get_visibility_filter(db, current_user)
     ).first()
     if not db_campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found in your intelligence sector")
+        raise HTTPException(status_code=404, detail="Campaign not found.")
     
     # 1. Map Target Companies
     target_companies = []
@@ -425,7 +430,7 @@ def get_campaign(
         tc_dict.pop("_sa_instance_state", None)
         target_companies.append(tc_dict)
         
-    # 2. Cluster Outbound Protocols (Nesting Drafts under DMs)
+    # 2. Group drafts under their decision makers.
     dms = []
     for dm in db_campaign.dms:
         dm_dict = dm.__dict__.copy()
@@ -520,12 +525,12 @@ def get_campaign(
         if email_draft:
             recommendation = {
                 "channel": "email",
-                "reason": f"Active protocol: {state.value if hasattr(state, 'value') else state}"
+                "reason": f"Current state: {state.value if hasattr(state, 'value') else state}"
             }
         else:
              recommendation = {
                 "channel": "email",
-                "reason": "Awaiting protocol generation..."
+                "reason": "Awaiting draft generation..."
             }
             
         dm_dict["outreach_recommendation"] = recommendation
@@ -564,7 +569,7 @@ def get_campaign(
     # the bytes under the current generation, and return them directly.
     body = json.dumps(jsonable_encoder(result)).encode()
     cache_set(_cache_key, body, CAMPAIGN_DETAIL_TTL)
-    return Response(content=body, media_type="application/json")
+    return Response(content=body, media_type="application/json", headers=_headers)
 
 
 @router.patch("/{campaign_id}")
@@ -575,8 +580,7 @@ def update_campaign(
     current_user: models.User = Depends(get_current_user)
 ):
     """
-    Sovereign Asset Refinement.
-    Allows for human-in-the-loop updates to mission briefing and tactical parameters.
+    Update a campaign's editable fields (human-in-the-loop).
     """
     db_campaign = db.query(models.Campaign).filter(
         models.Campaign.id == campaign_id,

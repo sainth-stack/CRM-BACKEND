@@ -20,9 +20,10 @@ _MAX_STALE_DAYS = 3
 
 @celery_app.task
 def sweep_stuck_campaigns_task():
-    """
-    Resurrection Protocol: Recovers ephemeral operations lost to server restarts or unexpected infrastructure failures.
-    Scans the database for campaigns in active but non-terminal states and re-injects them into the appropriate Celery task queue.
+    """Recover campaigns that were mid-processing when the server restarted.
+
+    Scans for campaigns in active, non-terminal states and re-queues them on the
+    appropriate Celery task.
     """
     logger.info("[SENTINEL] Sweeping for ghosted background operations...")
     with db_session() as db:
@@ -49,7 +50,7 @@ def sweep_stuck_campaigns_task():
                 logger.debug("[SENTINEL] No ghosted operations found or all active leases are current.")
                 return
 
-            logger.info(f"[SENTINEL] Discovered {count} dropped operations with expired leases. Initializing V3 Resurrection...")
+            logger.info(f"[SWEEPER] Found {count} stalled campaigns with expired leases; re-queuing.")
 
             from app.workers.tasks.intel_worker import process_csv_worker
 
@@ -100,7 +101,7 @@ def sweep_stuck_campaigns_task():
                 campaign_service.process_state_machine(db, campaign.id)
 
         except Exception as e:
-            logger.error(f"[SENTINEL] Critical error during Resurrection Protocol sweep: {e}", exc_info=True)
+            logger.error(f"[SWEEPER] Error during stuck-campaign sweep: {e}", exc_info=True)
 
 
 @celery_app.task

@@ -1,6 +1,6 @@
 """ICP qualification + deep-research (merged Stage 3+4).
 
-Tavily-free. Evidence comes from the company's OWN website via the bounded
+Evidence comes from the company's OWN website via the bounded
 curl_cffi + trafilatura extractor (`app.integrations.site_extractor.extract_site`).
 Qualification follows the stabilized MEDDPICC engine from the root ICP tool:
 
@@ -299,8 +299,8 @@ bracketed metadata. Then confidence (0-100)."""
 class CompanyValidationService:
     """ICP qualification + deep-research (MEDDPICC, website-evidence only).
 
-    Fully generic: judges each target against the REAL sender dossier (Brand DNA)
-    and the campaign's own requirements (industry / location / size / objective).
+    Judges each target against the sender's actual profile and the campaign's own
+    requirements (industry / location / size / objective).
     No hardcoded sender profile or industry rubric, no paid search API.
     """
 
@@ -564,7 +564,7 @@ class CompanyValidationService:
         target_size = self._as_text(campaign_metadata.get("target_employee_count"))
         campaign_prompt = self._as_text(campaign_metadata.get("prompt"), empty="(no specific objective provided)")
 
-        # Sender Brand DNA (built dynamically — NO hardcoded profile).
+        # Sender profile (built dynamically — no hardcoded values).
         sender_name = user_intel.get("company_name") or user_intel.get("name") or "the sender"
         sender_offerings = self._as_text(user_intel.get("services") or user_intel.get("offerings") or user_intel.get("core_offerings"))
         sender_customers = self._as_text(user_intel.get("target_customers"))

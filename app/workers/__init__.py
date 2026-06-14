@@ -25,7 +25,7 @@ from app.workers.tasks.ghostwriter_worker import (
 # --- Outbound Dispatch --- 
 from app.workers.tasks.outbound_worker import send_draft_worker
 
-# --- Sentinels (APScheduler cron hooks) ---
+# --- Scheduled (cron) tasks ---
 from app.workers.tasks.inbox_worker import poll_inbox_task, poll_all_users_task
 from app.workers.tasks.orchestrator_worker import (
     outreach_orchestrator_worker,

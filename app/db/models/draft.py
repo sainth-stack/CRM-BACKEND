@@ -27,7 +27,7 @@ class EmailDraft(Base):
     dispatch_completed_at = Column(DateTime, nullable=True)
     dispatch_error = Column(Text, nullable=True)
 
-    # V2 Intelligence Upgrades
+    # Enrichment fields
     variants = Column(JSON, nullable=True) # Stores the 3 high-impact variants
     strategic_observation = Column(Text, nullable=True)
     pain_hypothesis = Column(Text, nullable=True)

@@ -76,11 +76,8 @@ from celery.signals import task_failure
 
 @task_failure.connect
 def handle_task_failure(sender=None, task_id=None, exception=None, args=None, kwargs=None, traceback=None, einfo=None, **extra):
-    """
-    Automatic Operational Alerting Hook:
-    Intercepts any background Celery task failure and dispatches structured operational alerts
-    to stderr/logs (and Slack if SLACK_WEBHOOK_URL is configured).
-    """
+    """Fire on any Celery task failure and send a structured alert to the logs
+    (and to Slack if SLACK_WEBHOOK_URL is configured)."""
     task_name = sender.name if sender else "UnknownTask"
     error_msg = (
         f"🚨 *[CELERY FAILURE]* Task `{task_name}` (ID: `{task_id}`) failed in production!\n"
@@ -97,7 +94,7 @@ def handle_task_failure(sender=None, task_id=None, exception=None, args=None, kw
             payload = {
                 "attachments": [
                     {
-                        "title": f"🚨 Background Operational Alert - Task Failure",
+                        "title": f"🚨 Background task failure",
                         "text": error_msg,
                         "color": "#FF0000",
                         "mrkdwn_in": ["text"]
@@ -141,7 +138,7 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
 
     # --- Memory guardrails (OOM defense in depth for heavy_research) ---
-    # Heavy research tasks (Stage 3/4 Tavily + LLM swarms) are the main RAM
+    # Heavy research tasks (Stage 3/4 website-crawl + LLM swarms) are the main RAM
     # drivers. These recycle the worker process *between tasks* before the box
     # OOM-kills it mid-commit, so a clean restart picks up the next chunk/task.
     worker_prefetch_multiplier=1,     # don't hoard tasks on a heavy worker

@@ -53,8 +53,8 @@ class TargetCompany(Base):
     contact_number = Column(String)
     deep_research = Column(Text)
     v2_intel = Column(JSON, nullable=True)
-    relevance_score = Column(Integer, default=0, index=True) # Anchored numeric quality index
-    relevance_explanation = Column(Text, nullable=True) # Strategic reasoning for the score
+    relevance_score = Column(Integer, default=0, index=True) # Numeric quality score
+    relevance_explanation = Column(Text, nullable=True) # Reasoning for the score
     rejection_reason = Column(Text, nullable=True)
     matched_pains = Column(JSON, nullable=True)
     matched_services = Column(JSON, nullable=True)
@@ -95,13 +95,13 @@ class DecisionMaker(Base):
     linkedin = Column(String)
     time_in_role = Column(String, nullable=True)
     time_at_company = Column(String, nullable=True)
-    relevance_score = Column(Integer, default=0, index=True) # Operational lead quality score
-    relevance_explanation = Column(Text, nullable=True) # Agentic reasoning for coordinate selection
+    relevance_score = Column(Integer, default=0, index=True) # Lead quality score
+    relevance_explanation = Column(Text, nullable=True) # Reasoning for selecting this contact
     status = Column(String, default="NEW") # Legacy string status for compatibility
     state = Column(SQLEnum(ProspectState, values_callable=lambda obj: [e.value for e in obj]), default=ProspectState.NEW, index=True)
     termination_reason = Column(SQLEnum(ProspectTerminationReason, values_callable=lambda obj: [e.value for e in obj]), nullable=True, index=True)
     
-    # Temporal & Behavioral Engine Coordinates
+    # Timing / scheduling fields
     last_sent_at = Column(DateTime, nullable=True)
     last_reply_at = Column(DateTime, nullable=True)
     next_action_at = Column(DateTime, nullable=True, index=True) # Key for Orchestrator dispatch

@@ -22,24 +22,13 @@ GMAIL_SCAN_CIRCUIT = CircuitBreakerConfig(
 
 
 class GmailProvider:
-    """
-    Sovereign Gmail Integration Layer.
-    Provides high-fidelity abstractions for scanning, reading, and managing corporate email communications
-    for a specific user sector using established OAuth2 credentials.
-    """
+    """Gmail integration: scan, read, and manage a user's email via OAuth2 credentials."""
     def __init__(self, creds: Credentials = None):
-        """
-        Initializes the Gmail provider for a specific sector (user).
-        Credentials are authenticated and provisioned dynamically via the TokenService.
-        """
+        """Initialize the provider for a user. Credentials are supplied by the TokenService."""
         self.creds = creds
         
     def scan_latest_replies(self, unread_only: bool = True) -> dict:
-        """
-        Inbox Sentinel Logic.
-        Scans for unread messages to reduce overhead and prevent replay cycles.
-        Implements recursive MIME parsing for high-fidelity content extraction.
-        """
+        """Scan for unread messages, parsing MIME recursively to extract their content."""
         if not self.creds:
             return {
                 "status": "NO_CREDENTIALS",

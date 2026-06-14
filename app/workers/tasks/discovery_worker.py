@@ -79,7 +79,7 @@ def find_companies_worker(self, campaign_id: str):
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def find_dms_worker(self, campaign_id: str):
     """
-    STAGE 5: Strategic Stakeholder Ranking
+    STAGE 5: Stakeholder ranking
     """
     from app.services.campaign_service import campaign_service
     from app.core.security import acquire_lock, release_lock

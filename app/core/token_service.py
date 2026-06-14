@@ -14,19 +14,13 @@ from app.core.config import settings
 import requests
 
 class TokenService:
-    """
-    Vaulted Identity Anchor Service.
-    Orchestrates the retrieval and decryption of secure OAuth2 credentials to enable 
-    autonomous sector outreach and communication monitoring.
-    """
+    """Retrieve and decrypt stored OAuth2 credentials so the app can send mail and
+    monitor replies on a user's behalf."""
     @staticmethod
     def get_google_credentials(db: Session, user_id: str) -> Credentials:
-        """
-        Credential Recovery Protocol with Auto-Refresh.
-        Fetches the vaulted refresh token for a user, executes cryptographic decryption, 
-        reconstructs a valid Google Credentials object, and auto-refreshes if expired.
-        """
-        # 1. Fetch Capability from Vaulted Identity Store
+        """Load a user's stored Google refresh token, decrypt it, rebuild a
+        Credentials object, and refresh the access token if it has expired."""
+        # 1. Look up the user's stored Google OAuth account.
         oauth_acc = db.query(models.OAuthAccount).filter(
             models.OAuthAccount.user_id == user_id,
             models.OAuthAccount.provider == "google"
@@ -43,7 +37,7 @@ class TokenService:
             logger.warning(f"[IDENTITY] No Google capability for user {user_id} and no global fallback configured.")
             return None
 
-         # 2. Decrypt the Anchor Token
+         # 2. Decrypt the stored refresh token.
         refresh_token = decrypt_token(oauth_acc.encrypted_refresh_token)
         
         # Load and decrypt access token if it exists
@@ -103,11 +97,8 @@ class TokenService:
 
     @staticmethod
     def refresh_and_update_access(db: Session, user_id: str, provider: str = "google"):
-        """
-        Identity Lifecycle Management with Proactive Refresh.
-        Refreshes access tokens before they expire and updates the database.
-        Supports both Google and Cal.com providers.
-        """
+        """Refresh a provider's access token before it expires and persist it.
+        Supports both Google and Cal.com."""
         try:
             if provider == "google":
                 oauth_acc = db.query(models.OAuthAccount).filter(

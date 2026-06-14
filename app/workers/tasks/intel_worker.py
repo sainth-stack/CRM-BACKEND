@@ -36,7 +36,7 @@ def process_csv_worker(self, db: Session, campaign_id: str):
             logger.error(f"❌ [Track A] Campaign {campaign_id} not found in DB.")
             return
 
-        logger.info(f"🚀 [Track A] Mobilizing SSoT Ingestion from DB for {campaign_id} (Status: {campaign.status})")
+        logger.info(f"[Track A] Loading CSV leads from DB for {campaign_id} (status: {campaign.status})")
 
         # Normalize the trimmed CSV ONCE into campaign_leads rows (typed columns),
         # then drop the blob: the structured rows are now the SSoT and downstream

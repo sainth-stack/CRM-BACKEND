@@ -8,10 +8,7 @@ import logging
 logger = logging.getLogger("CSVTrimmingEngine")
 
 def get_fuzzy_map(cols):
-    """
-    Advanced Fuzzy Logic for SSoT Header Identification.
-    Maps raw CSV headers to the new 60-field protocol.
-    """
+    """Fuzzy-match raw CSV headers to the canonical field names."""
     f_map = {}
     # Base patterns
     patterns = {
@@ -68,10 +65,9 @@ class CSVProcessingService:
     ]
 
     def process_csv_content(self, content: bytes, target_location: str, target_industry: str, target_size: str, campaign_id: str, db: Session):
-        """
-        V2 High-Fidelity CSV Ingestion Engine.
-        Processes SSoT artifacts into normalized contact/company clusters for Stage 3 validation.
-        Uses memory-safe chunked reading to support extremely large files without exhausting server memory.
+        """Parse the CSV into normalized contact/company groups for Stage 3.
+
+        Reads in chunks to stay memory-safe on very large files.
         """
         # 1. Detect Encoding and Load in Chunks
         encodings = ['utf-8', 'latin-1', 'utf-8-sig', 'cp1252', 'iso-8859-1']
@@ -112,7 +108,7 @@ class CSVProcessingService:
                     cols[cols == dupe] = [dupe if i == 0 else f"{dupe}_dupe_{i}" for i in range(cols[cols == dupe].count())]
                 chunk.columns = cols
 
-                # 2. Fuzzy Identity Mapping
+                # 2. Map headers to canonical fields.
                 f_map = get_fuzzy_map(chunk.columns)
                 chunk = chunk.rename(columns=f_map)
 
@@ -160,7 +156,7 @@ class CSVProcessingService:
         except Exception as chunk_e:
             logger.error(f"Failed to process CSV chunk: {chunk_e}")
 
-        logger.info(f"SSoT Chunked Ingestion Complete: {len(unique_cos)} unique companies identified.")
+        logger.info(f"CSV ingestion complete: {len(unique_cos)} unique companies.")
         return contacts_map, unique_cos
 
     def trim_csv_from_filelike(self, fh, max_rows: int = 100) -> str:

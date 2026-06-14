@@ -13,10 +13,8 @@ router = APIRouter()
 
 @router.get("/email")
 def email_health_check(current_user: models.User = Depends(get_current_user)):
-    """
-    Sector Health Status.
-    Authorized diagnostic check. Limited to Super Admins to prevent infrastructure metadata leakage.
-    """
+    """Email-subsystem health check. Restricted to super admins to avoid leaking
+    infrastructure details."""
     if current_user.role != models.UserRole.SUPER_ADMIN:
         return {"status": "OK", "mode": "STRICT_GMAIL_NATIVE"}
 
@@ -73,10 +71,7 @@ def get_system_metrics(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """
-    Enterprise Observability Telemetry.
-    Provides detailed system stats, database pool metrics, and active Redis queue telemetry.
-    """
+    """System metrics: process stats, database pool metrics, and Redis queue telemetry."""
     if current_user.role not in [models.UserRole.SUPER_ADMIN, models.UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Metrics readout is restricted to administrative identities.")
 
@@ -145,7 +140,7 @@ def get_system_metrics(
         "s3_bucket": os.getenv("AWS_STORAGE_BUCKET_NAME", "N/A")
     }
 
-    # 5. Production Observability Telemetry (Task Durations, Retries, AI Latency, Sends)
+    # 5. Observability metrics (task durations, retries, AI latency, sends).
     from app.services.observability_service import ObservabilityService
     telemetry = ObservabilityService.get_metrics_summary()
 

@@ -8,7 +8,7 @@ import re
 
 load_dotenv()
 
-# Specialized LLM for high-fidelity content generation
+# LLM for email content generation
 llm = ChatOpenAI(
     model="gpt-4o-mini", 
     temperature=0,

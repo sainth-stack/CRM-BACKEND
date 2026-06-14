@@ -18,7 +18,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from app.core.logging_config import logger
 
-# --- MAANG-Standard Distributed Dependencies ---
+# Optional distributed dependencies — the agent degrades gracefully if absent.
 try:
     import redis
 except ImportError:
@@ -32,11 +32,13 @@ except ImportError:
     phonenumbers = None
     pytz = None
 
-# --- Tier 4 Resilience Cluster ---
-def maang_sentinel_retry(max_retries: int = 3, backoff: int = 2):
-    """
-    Tier-4 Selective Resilience Decorator.
-    Categorizes failures to prevent cascading retry-storms.
+
+def retry_with_backoff(max_retries: int = 3, backoff: int = 2):
+    """Retry decorator with exponential backoff.
+
+    Terminal Twilio 4xx errors (auth, bad number, billing) are never retried;
+    any other failure backs off for ``backoff ** attempt`` seconds, up to
+    ``max_retries`` attempts.
     """
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -45,7 +47,7 @@ def maang_sentinel_retry(max_retries: int = 3, backoff: int = 2):
                 try:
                     return func(*args, **kwargs)
                 except TwilioRestException as e:
-                    # 4xx (Auth, Bad Number, Billing) are terminal - NO RETRY
+                    # 4xx (auth, bad number, billing) are terminal — do not retry.
                     if 400 <= e.status < 500: raise e
                     retries += 1
                     if retries == max_retries: raise e
@@ -58,39 +60,42 @@ def maang_sentinel_retry(max_retries: int = 3, backoff: int = 2):
         return wrapper
     return decorator
 
-# --- Distributed Cluster state & Rate-Limiting ---
+
 class DistributedCluster:
-    """
-    Sovereign Distributed State & Rate-Limiting Anchor.
-    Manages Atomic Mission Claims, Global Rate Limiting (CPS), and Phone Spam Guards.
+    """Redis-backed shared state for outbound calling.
+
+    Provides cluster-wide rate limiting (calls-per-second), per-number 24h
+    deduplication, atomic call claims, and call telemetry. When Redis is not
+    configured it falls back to permissive no-ops (dev only — no distributed
+    guarantees).
     """
     def __init__(self):
         self.url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self.r = redis.from_url(self.url, decode_responses=True) if redis else None
-        self._ttl = 86400 # 24 Hours
-        self._cps_limit = 2 # Max 2 Calls Per Second (Cluster-wide)
+        self._ttl = 86400  # 24 hours
+        self._cps_limit = 2  # max 2 calls/sec, cluster-wide
 
     def rate_limit_check(self) -> bool:
-        """Global Token Bucket Rate Limiter (Prevent Twilio Bans)."""
-        if not self.r: return True # Fallback for dev (Unsafe)
+        """Cluster-wide calls-per-second cap to avoid Twilio rate bans."""
+        if not self.r: return True  # no Redis in dev: allow (no distributed limiting)
         key = f"sentinel:cps:{int(time.time())}"
         current_calls = self.r.incr(key)
         self.r.expire(key, 2)
         return current_calls <= self._cps_limit
 
     def phone_spam_guard(self, phone: str) -> bool:
-        """Global Deduplication Logic: Max 1 mission per number per 24 hours."""
+        """Deduplication: allow at most one call per number per 24 hours."""
         if not self.r: return True
         key = f"sentinel:phone_lock:{phone}"
         return bool(self.r.set(key, "LOCKED", nx=True, ex=self._ttl))
 
     def claim_mission(self, mission_id: str, data: Dict[str, Any]) -> bool:
-        """Atomic SETNX Mission Capture."""
+        """Atomically claim a call so only one worker dispatches it (SETNX)."""
         if not self.r: return True
         return bool(self.r.set(f"mission:{mission_id}", json.dumps(data), nx=True, ex=self._ttl))
 
     def update_telemetry(self, mission_id: str, status: str, response_time: float):
-        """Distributed Observability Update."""
+        """Record per-call status and latency for observability."""
         if not self.r: return
         key = f"sentinel:metrics:{mission_id}"
         self.r.hset(key, mapping={"status": status, "lat": response_time, "ts": time.time()})
@@ -105,83 +110,82 @@ class MissionMetric(BaseModel):
     transcript: Optional[str]
 
 class CallingAgent:
-    """
-    MAANG-Sentinel v4: Distributed Fault-Tolerant AI Telephony Orchestrator.
-    
-    Tier 4 Sovereign Resilience:
-    1. Distributed Rate Limiting (CPS Shield) & Phone Spam Guard
-    2. Phone-Native Hard-Validation (phonenumbers.is_valid_number)
-    3. Global Trace Correlation (corid) for Observability
-    4. Circuit Breaker Protected & Hard-Timed Dispatch
+    """Fault-tolerant outbound calling agent (Twilio + OpenAI).
+
+    Responsibilities:
+      1. Cluster-wide rate limiting (CPS) and per-number deduplication.
+      2. Strict E.164 phone validation (phonenumbers.is_valid_number).
+      3. A correlation id (corid) threaded through logs for traceability.
+      4. Hard-timed Twilio dispatch with bounded retries.
     """
 
     def __init__(self):
-        # 1. Rigid Multi-Layer Initialization
+        # Credentials and config from the environment.
         self.account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         self.auth_token = os.getenv("TWILIO_AUTH_TOKEN")
         self.from_number = os.getenv("TWILIO_FROM_NUMBER")
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.allowed_webhook_domains = ["ai-priori.com", "localhost"] # Strict domain whitelist
+        self.allowed_webhook_domains = ["ai-priori.com", "localhost"]  # strict domain whitelist
 
         if not all([self.account_sid, self.auth_token, self.from_number]):
-            raise ValueError("Infrastructure Failure: Missing Maang-Sentinel deployment keys.")
+            raise ValueError("Missing required Twilio credentials (account SID / auth token / from number).")
 
         if not (phonenumbers and pytz):
-            raise RuntimeError("Compliance Failure: Tier-4 Jurisdictional libraries mandatory.")
+            raise RuntimeError("Required libraries 'phonenumbers' and 'pytz' are not installed.")
 
         from twilio.http.http_client import TwilioHttpClient
         http_client = TwilioHttpClient(timeout=10)
         self.client = Client(self.account_sid, self.auth_token, http_client=http_client)
         self.cluster = DistributedCluster()
         self.validator = RequestValidator(self.auth_token)
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=50) # High-scale scaling
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=50)  # pool for hard-timed calls
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, top_p=1, seed=42)
 
     def _validate_coordinate(self, phone: str) -> Optional[str]:
-        """Hard Phone-Native Validation & Normalization."""
+        """Validate and normalize a phone number to E.164, or None if invalid."""
         try:
             parsed = phonenumbers.parse(phone, None)
             if not phonenumbers.is_valid_number(parsed):
-                logger.error(f"[MAANG-SENTINEL] Coordinate Refused: {phone} is not a reachable E.164 target.")
+                logger.error(f"[CALLING-AGENT] Rejected {phone}: not a valid E.164 number.")
                 return None
             return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
         except Exception:
             return None
 
     def _is_safe_to_call(self, phone_obj: Any, consent: bool) -> bool:
-        """Absolute Jurisdictional Sync Gate."""
+        """True only with consent AND within the recipient's local business hours."""
         if not consent: return False
         try:
             tz_list = phonenumber_tz.time_zones_for_number(phone_obj)
             target_tz = pytz.timezone(tz_list[0])
             local_now = datetime.datetime.now(pytz.utc).astimezone(target_tz)
-            if local_now.weekday() >= 5: return False # Weekend Block
-            return 9 <= local_now.hour <= 18 # Global Business Window
+            if local_now.weekday() >= 5: return False  # block weekends
+            return 9 <= local_now.hour <= 18  # 9am-6pm local
         except Exception: return False
 
-    @maang_sentinel_retry(max_retries=3)
+    @retry_with_backoff(max_retries=3)
     def mobilize_mission(self, to_phone: str, message: str, webhook_url: str, consent: bool, corid: str = None):
-        """Tier-4 Distributed Outbound Mobilization."""
+        """Place an outbound call after validation, compliance, rate-limit and dedup checks."""
         trace_id = corid or str(uuid.uuid4())
         start_ts = time.time()
 
-        # 1. Coordinate & Domain Sanitization
+        # 1. Validate the phone number and the webhook domain.
         target_phone = self._validate_coordinate(to_phone)
         if not target_phone or not any(domain in webhook_url for domain in self.allowed_webhook_domains):
             return {"status": "BLOCKED", "reason": "SECURITY_SANITY_FAILURE", "corid": trace_id}
 
-        # 2. Compliance & Global Rate Limit Gate
+        # 2. Consent / business-hours and cluster rate-limit gate.
         parsed_phone = phonenumbers.parse(target_phone)
         if not self._is_safe_to_call(parsed_phone, consent) or not self.cluster.rate_limit_check():
             return {"status": "BLOCKED", "reason": "COMPLIANCE_OR_CPS_CAP", "corid": trace_id}
 
-        # 3. Distributed Deduplication (Global Spam Shield)
+        # 3. Per-number 24h deduplication.
         if not self.cluster.phone_spam_guard(target_phone):
-            logger.warning(f"[MAANG-SENTINEL] Deduplication Protect: Prospect {target_phone} already dialed in 24h.")
+            logger.warning(f"[CALLING-AGENT] Skipped {target_phone}: already called within 24h.")
             return {"status": "SKIPPED", "reason": "SPAM_SHIELD_ACTIVE", "corid": trace_id}
 
         try:
-            # 4. Hard-Timed Intelligence recovery (7s cap)
+            # 4. Generate the call script (7s cap; fall back to the raw message).
             try:
                 prompt = ChatPromptTemplate.from_messages([
                     ("system", "Natural B2B voice script. End with meeting email promise. ESCAPE all XML characters."),
@@ -191,11 +195,11 @@ class CallingAgent:
                 script = saxutils.escape(script[:1500])
             except Exception: script = saxutils.escape(message[:1500])
 
-            # 5. Atomic Mission Claim
+            # 5. Atomically claim this call (prevents duplicate dispatch across workers).
             if not self.cluster.claim_mission(trace_id, {"script": script, "to": target_phone}):
                 return {"status": "SKIPPED", "reason": "ATOMIC_COLLISION", "corid": trace_id}
 
-            # 6. Hard-Timed Dispatch (10s cap)
+            # 6. Dispatch via Twilio (10s cap).
             try:
                 call = self.executor.submit(
                     self.client.calls.create,
@@ -203,27 +207,27 @@ class CallingAgent:
                     from_=self.from_number,
                     url=f"{webhook_url}?corid={trace_id}",
                     status_callback=f"{webhook_url}/status?corid={trace_id}",
-                    machine_detection='Enable', # AMD pathing
+                    machine_detection='Enable',  # answering-machine detection
                     record=True,
                     time_limit=300
                 ).result(timeout=10)
-                
+
                 self.cluster.update_telemetry(trace_id, "SUCCESS", time.time() - start_ts)
                 return {"status": "SUCCESS", "call_sid": call.sid, "corid": trace_id}
             except concurrent.futures.TimeoutError:
                 return {"status": "FAILED", "reason": "TWILIO_HANDSHAKE_TIMEOUT", "corid": trace_id}
 
         except Exception as e:
-            logger.error(f"[MAANG-SENTINEL] Mission {trace_id} Deflected: {e}")
+            logger.error(f"[CALLING-AGENT] Call {trace_id} failed: {e}")
             return {"status": "FAILED", "reason": str(e), "corid": trace_id}
 
     def audit_mission(self, call_sid: str, corid: str) -> Optional[MissionMetric]:
-        """Deep Intelligence Audit with Tier-4 Polling Resilience."""
+        """Fetch the call outcome and transcribe its recording (polls for the recording)."""
         try:
             call = self.client.calls(call_sid).fetch()
             start_audit = time.time()
-            
-            # Tier-4 Exponential Backoff Polling (Total 45s window)
+
+            # Poll for the recording with backoff (total ~45s window).
             recording_url = None
             for wait in [5, 10, 15, 15]:
                 recs = self.client.recordings.list(call_sid=call_sid, limit=1)
@@ -236,7 +240,7 @@ class CallingAgent:
             if recording_url:
                 res = requests.get(recording_url, auth=(self.account_sid, self.auth_token), timeout=10)
                 res.raise_for_status()
-                tmp = f"sentinel_{uuid.uuid4()}.mp3"
+                tmp = f"call_recording_{uuid.uuid4()}.mp3"
                 with open(tmp, "wb") as f: f.write(res.content)
                 try:
                     import openai
@@ -255,5 +259,5 @@ class CallingAgent:
                 transcript=transcript
             )
         except Exception as e:
-            logger.error(f"[MAANG-SENTINEL] Mission Audit Failure: {e}")
+            logger.error(f"[CALLING-AGENT] Call audit failed: {e}")
             return None

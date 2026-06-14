@@ -1,8 +1,8 @@
-"""site_extractor.py — Tavily-free company-site extractor (curl_cffi + trafilatura).
+"""site_extractor.py — company-site extractor (curl_cffi + trafilatura).
 
 Ported from the root reference tool (`company_site_extractor.py`, fast mode) and
 hardened for the backend: SSRF-validated entry, bounded memory/latency, no paid
-search API. Used by the Stage-2 brand-intelligence agent in place of Tavily.
+search API. Used by the Stage-2 brand-intelligence agent.
 
 Latency/RAM properties:
   * ONE homepage fetch (robust: https/http + www variants, alt-impersonation on

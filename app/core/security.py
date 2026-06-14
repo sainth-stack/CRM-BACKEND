@@ -6,8 +6,8 @@ import ipaddress
 import urllib.parse
 from datetime import datetime, timedelta, UTC
 from typing import Optional, Dict, Any
-# Defensive Boundary: Force a system-wide socket timeout of 15 seconds.
-# This prevents unshielded external API calls from hanging worker threads indefinitely.
+# Force a global 15-second socket timeout so a slow external API call can't
+# hang worker threads indefinitely.
 socket.setdefaulttimeout(15)
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, status, Depends, Request
@@ -20,15 +20,15 @@ from app.core.logging_config import logger
 from app.core.config import settings
 
 def validate_url_for_ssrf(url: str) -> tuple[str, str]:
-    """
-    Sovereign SSRF Audit Layer (TOCTOU-Resistant).
-    Rejects private IPs, loopback, and cloud metadata endpoints.
-    Mandates DNS resolution and returns the validated IP to prevent DNS Rebinding.
+    """SSRF guard (TOCTOU-resistant).
+
+    Rejects private/loopback/cloud-metadata addresses, resolves DNS up front, and
+    returns the validated IP so a later lookup can't be rebound to an internal host.
     """
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ["http", "https"]:
-            raise HTTPException(status_code=400, detail="Tactical error: Only HTTP/HTTPS protocols are permitted.")
+            raise HTTPException(status_code=400, detail="Only HTTP/HTTPS URLs are permitted.")
         
         hostname = parsed.hostname
         if not hostname:
@@ -47,7 +47,7 @@ def validate_url_for_ssrf(url: str) -> tuple[str, str]:
             except socket.gaierror:
                 raise HTTPException(status_code=400, detail="Coordinate resolution failed. Domain unreachable.")
 
-        # Phase 2: Security Boundary Enforcement (Audit all resolved coordinates)
+        # Reject the URL if ANY resolved IP is private/restricted.
         validated_ip = None
         for ip in resolved_ips:
             # Normalize IPv6 link-local/scope identifiers if present
@@ -56,7 +56,7 @@ def validate_url_for_ssrf(url: str) -> tuple[str, str]:
             
             if curr_ip_obj.is_private or curr_ip_obj.is_loopback or curr_ip_obj.is_link_local or curr_ip_obj.is_reserved:
                  logger.warning(f"[SECURITY] SSRF ATTEMPT BLOCKED: {hostname} resolved to internal/restricted IP {ip}")
-                 raise HTTPException(status_code=400, detail="Restricted Sector: Internal IP access prohibited.")
+                 raise HTTPException(status_code=400, detail="Access to internal IP addresses is prohibited.")
             
             # Prefer IPv4 for outbound compatibility if available
             if not validated_ip or (curr_ip_obj.version == 4 and ipaddress.ip_address(validated_ip).version == 6):
@@ -130,10 +130,7 @@ def _get_redis():
         return None
 
 def revoke_sessions(user_id: str):
-    """
-    Distributed Session Termination.
-    Instantly terminates all pre-existing JWTs for a user across the entire server cluster.
-    """
+    """Revoke all of a user's existing JWTs across the cluster (Redis-backed)."""
     r = _get_redis()
     if r:
         revocation_time = datetime.now(UTC).timestamp()
@@ -185,7 +182,7 @@ def lock_exists(lock_key: str) -> bool:
         return False
 
 def _get_revocation_time(user_id: str) -> float:
-    """Retrieves the last recorded high-precision revocation timestamp for a user identity."""
+    """Return the last recorded revocation timestamp for a user (0.0 if none)."""
     r = _get_redis()
     if r:
         try:
@@ -199,7 +196,7 @@ def _get_revocation_time(user_id: str) -> float:
     return 0.0
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Generates a high-fidelity JWT access token for stateful session management."""
+    """Generate a signed JWT access token."""
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(UTC) + expires_delta
@@ -214,7 +211,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 def create_refresh_token(data: dict) -> str:
-    """Generates a long-lived JWT refresh token designed for persistent identity anchoring."""
+    """Generate a long-lived JWT refresh token."""
     to_encode = data.copy()
     expire = datetime.now(UTC) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     to_encode.update({
@@ -227,10 +224,8 @@ def create_refresh_token(data: dict) -> str:
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> models.User:
-    """
-    Zero-Trust Identity Resolution.
-    Validates JWT integrity, enforces distributed revocation policies, and assembles the localized user identity.
-    """
+    """Resolve the current user from the JWT: validate the token, honor distributed
+    revocation, and load the user from the database."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -246,7 +241,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         if user_id is None:
             raise credentials_exception
             
-        # Enterprise Edge Defense: Distributed Session Revocation Check
+        # Distributed revocation check: reject tokens issued before a global logout.
         iat = payload.get("iat")
         if iat is not None:
             revocation_time = _get_revocation_time(user_id)
@@ -258,7 +253,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
                     headers={"WWW-Authenticate": "Bearer"}
                 )
             
-        # Canonical Identity Resolution: Always load from DB to ensure fresh state (Role, Quota, Demo expiry)
+        # Always load the user from the DB for fresh state (role, quota, demo expiry).
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if user is None:
             raise credentials_exception
@@ -266,7 +261,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     except jwt.PyJWTError:
         raise credentials_exception
 
-    # Tactical Boundary Enforcement: Demo Identity Expiry Gate
+    # Demo accounts: reject once the trial window has expired.
     if user.is_demo and user.demo_expires_at:
         if user.demo_expires_at.replace(tzinfo=UTC) < datetime.now(UTC):
             logger.info(f"[SECURITY] Trial identity expired for {user.email}")
@@ -278,9 +273,9 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 def get_visibility_filter(db: Session, current_user: models.User):
-    """Enforces the Zero-Trust multi-tenant data isolation boundary."""
+    """Return a query filter limiting a user to the campaign data they may see."""
     if str(current_user.role).lower().split('.')[-1] == "super_admin":
-        raise HTTPException(status_code=403, detail="Sovereign authority cannot access localized operational data.")
+        raise HTTPException(status_code=403, detail="Super admins cannot access user-scoped operational data.")
     elif str(current_user.role).lower().split('.')[-1] == "admin":
         target_user_ids = db.query(models.User.id).filter(models.User.created_by_id == current_user.id)
         return models.Campaign.user_id.in_(target_user_ids)

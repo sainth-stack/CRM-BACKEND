@@ -38,7 +38,10 @@ def upgrade() -> None:
 
     inspector = sa.inspect(bind)
 
+    # Create the prospectstate enum if it doesn't exist yet (fresh databases).
+    prospect_state_enum = sa.Enum(models.ProspectState, name="prospectstate")
     if bind.dialect.name == "postgresql":
+        prospect_state_enum.create(bind, checkfirst=True)
         op.execute("ALTER TYPE prospectstate ADD VALUE IF NOT EXISTS 'ON_HOLD'")
 
     termination_enum = sa.Enum(models.ProspectTerminationReason, name="prospectterminationreason")

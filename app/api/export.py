@@ -43,7 +43,7 @@ def export_mission_briefing(
 ## Campaign Parameters
 - **Target Location:** {db_campaign.target_location or 'N/A'}
 - **Target Industry:** {db_campaign.target_industry or 'N/A'}
-- **Mission Context:** {db_campaign.prompt or 'N/A'}
+- **Objective:** {db_campaign.prompt or 'N/A'}
 
 ## Discovered User Intel
 - **Intel Company Name:** {intel.company_name if intel else 'N/A'}
@@ -255,7 +255,7 @@ def export_analysis(
 - **Rejected Target Companies:** {rejected_cos}
 - **Average Synergy Alignment:** {avg_synergy}%
 
-## 1. Qualification Audit (Lead Acceptability Matrix)
+## 1. Qualification Summary
 - **Approved Companies:** {approved_cos} ({round((approved_cos / total_cos) * 100)}%)
 - **Rejected Companies:** {rejected_cos} ({round((rejected_cos / total_cos) * 100)}%)
 

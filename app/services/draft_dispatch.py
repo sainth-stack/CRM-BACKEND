@@ -291,8 +291,8 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
 
         _mark_draft_dispatch_failure(draft_id, str(exc))
         ObservabilityService.increment_metric("dispatch_failed")
-        logger.error(f"Tactical Deployment Failure for draft {draft_id}: {exc}", exc_info=True)
-        return {"status": "failed", "message": f"Tactical deployment failed: {str(exc)}"}
+        logger.error(f"Failed to dispatch draft {draft_id}: {exc}", exc_info=True)
+        return {"status": "failed", "message": f"Failed to dispatch: {str(exc)}"}
     finally:
         release_lock(lock_key)
         db.close()

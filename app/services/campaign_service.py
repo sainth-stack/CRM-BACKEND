@@ -112,19 +112,19 @@ class CampaignService:
         """
         STAGE 3+4 (MERGED): ICP Qualification + Deep Research in one pass.
 
-        Each company gets a single combined agent call (Tavily company-intel +
-        real-time news searches feeding one LLM) that returns the accept/reject
+        Each company gets a single combined agent call (website-evidence company
+        intel feeding one LLM) that returns the accept/reject
         verdict AND the full research dossier. The dossier is persisted for EVERY
         company (accepted or rejected) — only the verdict differs — so there is
         no separate deep-research stage. This halves the per-company round-trips and
         removes an entire Celery stage (the t2.medium latency/CPU win).
         """
-        # 1. Fetch Brand DNA (Short Read Session)
+        # 1. Fetch the sender profile (short read session).
         temp_db = SessionLocal()
         try:
             campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
             ui_record = campaign.user_intel
-            # Full sender Brand DNA so the ICP gate judges against the REAL sender,
+            # Full sender profile so the ICP gate judges against the real sender,
             # not a hardcoded profile.
             user_intel_dict = {
                 "company_name": ui_record.company_name,
@@ -151,14 +151,28 @@ class CampaignService:
         validator = CompanyValidationService()
         import asyncio
 
-        STAGE3_CHUNK_SIZE = 10   # companies committed per transaction
-        # Bounded fan-out via the merged stage's own dedicated setting. Each pipeline
-        # is a website crawl + one LLM call (I/O-bound), so this can run wide without
-        # CPU/memory pressure. Tune via ICP_CONCURRENCY.
+        STAGE3_COMMIT_BATCH = 10   # companies persisted per DB transaction
+        # Concurrency (companies in flight) is deliberately DECOUPLED from the commit
+        # batch size. A streaming worker pool keeps ICP_CONCURRENCY companies running
+        # at all times: the moment one finishes, the freed slot picks up the next, so a
+        # single slow site / slow LLM call can no longer stall a whole batch (the old
+        # per-chunk `gather` waited for the slowest of 10 before starting the next 10).
+        # Verdicts are identical — only scheduling changes. Tune width via ICP_CONCURRENCY.
         semaphore = asyncio.Semaphore(settings.ICP_CONCURRENCY)
+
+        # In-memory circuit flag. We check Redis (circuit_is_open) only at batch
+        # boundaries — NOT once per company — so the per-company path stays free of a
+        # synchronous Redis round-trip that would stall the event loop. validate_one
+        # reads this flag (late-bound) and skips cheaply once it flips.
+        circuit_open = [circuit_is_open(OPENAI_CIRCUIT)[0]]
 
         async def validate_one(domain, co_data, research_cache):
             async with semaphore:
+                # Fail-fast: once the provider circuit is open, drain the remaining
+                # queued companies cheaply instead of burning each one's retry backoff.
+                # They stay unjudged and are resumed on the rescheduled run.
+                if circuit_open[0]:
+                    return domain, {"_circuit_skipped": True}
                 try:
                     res = await validator.qualify_and_enrich(co_data, user_intel_dict, campaign_metadata, research_cache=research_cache)
                     return domain, res
@@ -166,14 +180,12 @@ class CampaignService:
                     logger.error(f"Qualify+enrich failed for {domain}: {e}")
                     return domain, {"status": "ERROR", "reasoning": str(e), "_llm_error": True}
 
-        # 3. Process in chunks: validate a chunk, commit it (upsert), release memory.
+        # 3. Build the work list + resume-awareness: skip companies already given a
+        # terminal ICP verdict for THIS campaign (any status except ERROR) so a
+        # restart/retry/resurrection does not re-pay LLM + crawl for work already done.
+        # ERROR rows are kept so transient failures are re-judged. This changes only
+        # *what is recomputed*, never the qualification result for any company.
         items = list(unique_cos.items())
-
-        # Resume-awareness: skip companies already given a terminal ICP verdict for
-        # THIS campaign (any status except ERROR) so a restart/retry/resurrection
-        # does not re-pay LLM + Tavily for work already done. ERROR rows are kept so
-        # transient failures are re-judged. This changes only *what is recomputed*,
-        # never the qualification result for any company.
         judged = self._fetch_judged_icp_domains(campaign_id)
         if judged:
             before = len(items)
@@ -184,33 +196,68 @@ class CampaignService:
             )
 
         total = len(items)
-        logger.info(f"🚦 [STAGE 3] Filtering {total} companies for {campaign_id} in chunks of {STAGE3_CHUNK_SIZE}.")
+        logger.info(
+            f"🚦 [STAGE 3] Filtering {total} companies for {campaign_id} "
+            f"(streaming pool, concurrency={settings.ICP_CONCURRENCY}, commit batch {STAGE3_COMMIT_BATCH})."
+        )
 
-        for start in range(0, total, STAGE3_CHUNK_SIZE):
-            # Fail fast on a provider outage: if the OpenAI circuit is open, stop
-            # grinding through every company (each call would just burn its retry
-            # backoff). Raising lets find_companies_worker reschedule; the
-            # resume-aware filter above means the retry skips work already done.
-            if circuit_is_open(OPENAI_CIRCUIT)[0]:
-                raise CircuitOpenError("OpenAI circuit open during Stage 3 ICP filtering")
+        # One batched cache read for ALL remaining domains (was once per chunk): any
+        # already-known, still-fresh domain skips crawl + enrich.
+        research_cache = validator.prefetch_icp_research([d for d, _ in items])
 
-            chunk = items[start:start + STAGE3_CHUNK_SIZE]
-            # One batched cache read per chunk (replaces the per-company N+1 lookup).
-            chunk_cache = validator.prefetch_icp_research([d for d, _ in chunk])
-            results = await asyncio.gather(*[validate_one(domain, data, chunk_cache) for domain, data in chunk])
-            self._persist_stage3_chunk(campaign_id, results, unique_cos)
-            logger.info(f"   ↳ [STAGE 3] Committed {min(start + STAGE3_CHUNK_SIZE, total)}/{total} for {campaign_id}.")
+        def _commit_batch(batch: list) -> None:
+            """Persist one batch, pulse the lease heartbeat, and run outage detection.
+            A batch where EVERY company hit an LLM/transport error trips the breaker
+            (keyed off the non-persisted `_llm_error` flag, never a legit REJECTED)."""
+            self._persist_stage3_chunk(campaign_id, batch, unique_cos)
             self._pulse_heartbeat(campaign_id, worker_id)
+            logger.info(f"   ↳ [STAGE 3] Committed {processed}/{total} for {campaign_id}.")
+            if all(r.get("_llm_error") for _, r in batch):
+                record_circuit_failure(OPENAI_CIRCUIT, "Stage 3 batch fully errored")
+            # Refresh the in-memory flag once per batch; once open, remaining queued
+            # companies skip cheaply and we reschedule after the loop.
+            if not circuit_open[0] and circuit_is_open(OPENAI_CIRCUIT)[0]:
+                circuit_open[0] = True
 
-            # Outage detection: a chunk where every company hit an LLM/transport
-            # error trips the breaker so the next iteration fails fast. Keyed off the
-            # non-persisted `_llm_error` flag — NOT the persisted status — so a chunk
-            # of legitimate REJECTED verdicts never trips it.
-            if results and all(r.get("_llm_error") for _, r in results):
-                record_circuit_failure(OPENAI_CIRCUIT, "Stage 3 chunk fully errored")
-                if circuit_is_open(OPENAI_CIRCUIT)[0]:
-                    raise CircuitOpenError("OpenAI circuit opened after repeated Stage 3 failures")
-            del results
+        # 4. Streaming fan-out: every company is launched behind the shared semaphore
+        #    (so at most ICP_CONCURRENCY run at once) and results are handled AS THEY
+        #    COMPLETE, persisted every STAGE3_COMMIT_BATCH. Completed tasks are released
+        #    each loop so only the in-flight working set stays in memory.
+        pending = {
+            asyncio.create_task(validate_one(domain, data, research_cache))
+            for domain, data in items
+        }
+        buffer: list = []
+        processed = 0
+        skipped = 0
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    domain, res = fut.result()
+                    if res.get("_circuit_skipped"):
+                        skipped += 1
+                        continue
+                    buffer.append((domain, res))
+                    processed += 1
+                    if len(buffer) >= STAGE3_COMMIT_BATCH:
+                        _commit_batch(buffer)
+                        buffer = []
+                del done
+            if buffer:  # flush the final partial batch
+                _commit_batch(buffer)
+                buffer = []
+        finally:
+            for t in pending:
+                t.cancel()
+
+        # If the provider circuit opened mid-run we deliberately skipped the remaining
+        # companies; reschedule so the resume-aware filter finishes them next pass.
+        if skipped:
+            logger.warning(
+                f"[STAGE 3] Provider circuit open: {skipped} companies deferred for {campaign_id}. Rescheduling."
+            )
+            raise CircuitOpenError("OpenAI circuit open during Stage 3 ICP filtering")
 
         # 4. Mark stage complete once every chunk has landed. Because qualification
         # AND research happened together, accepted companies are already
@@ -326,14 +373,14 @@ class CampaignService:
 
     async def stage_5_stakeholder_ranking(self, db: Session, campaign_id: str, worker_id: str = None):
         """
-        STAGE 5: Strategic Stakeholder Ranking
-        Selects Top 4 and applies Primary-First email logic using AI.
+        STAGE 5: Stakeholder ranking.
+        Selects the top 4 and applies primary-first email logic using AI.
 
         Contacts are read per-chunk from campaign_leads (not held as one big
         contacts_map), so memory stays flat regardless of batch size.
         """
         from app.services import lead_repository
-        # 1. Fetch Researched Companies & Brand DNA (Short Read Session)
+        # 1. Fetch researched companies + sender profile (short read session).
         temp_db = SessionLocal()
         try:
             campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
@@ -362,18 +409,20 @@ class CampaignService:
         finally:
             temp_db.close()
 
-        STAGE5_CHUNK_SIZE = 10   # companies committed per transaction
+        STAGE5_COMMIT_BATCH = 10   # companies persisted per DB transaction
         total = len(researched_cos_data)
-        logger.info(f"🔍 [STAGE 5] Ranking stakeholders for {total} researched companies in chunks of {STAGE5_CHUNK_SIZE}.")
+        logger.info(
+            f"🔍 [STAGE 5] Ranking stakeholders for {total} researched companies "
+            f"(streaming pool, concurrency={settings.STAGE5_CONCURRENCY}, commit batch {STAGE5_COMMIT_BATCH})."
+        )
 
-        # 2. Process companies in chunks; rank (sequential, ZERO DB held), then commit each chunk.
         # Resumability: each committed company flips to STAKEHOLDERS_IDENTIFIED, so the
         # read query (status == "ACCEPTED") won't re-select it on a retry.
         ranking_svc = StakeholderRankingService()
         import asyncio
         from app.core.scheduler import geocode_timezone
         # Per-run cache so each distinct contact location is geocoded only once
-        # (Nominatim is rate-limited). Shared across all chunks in this Stage 5 run.
+        # (Nominatim is rate-limited). Shared across the whole Stage 5 run.
         tz_cache: dict = {}
 
         def get_fuzzy(data, targets, default=None):
@@ -385,88 +434,106 @@ class CampaignService:
                         return data.get(k)
             return default
 
-        for start in range(0, total, STAGE5_CHUNK_SIZE):
-            chunk = researched_cos_data[start:start + STAGE5_CHUNK_SIZE]
-            dms_to_create = []
-            company_status_updates = []
+        # Preload every accepted company's contacts in ONE short session (was once per
+        # chunk). domains in campaign_leads and TargetCompany.domain are both normalized
+        # (lowercased), so an exact match reproduces the old case-insensitive lookup.
+        cdb = SessionLocal()
+        try:
+            all_contacts = lead_repository.load_contacts_for_domains(
+                cdb, campaign_id, [co["domain"] for co in researched_cos_data]
+            )
+        finally:
+            cdb.close()
 
-            # Load this chunk's contacts in ONE short session, then release the
-            # connection before the (slow) AI ranking calls. domains in campaign_leads
-            # and TargetCompany.domain are both normalized (lowercased), so an exact
-            # match reproduces the old case-insensitive lookup.
-            cdb = SessionLocal()
-            try:
-                chunk_contacts = lead_repository.load_contacts_for_domains(
-                    cdb, campaign_id, [co["domain"] for co in chunk]
-                )
-            finally:
-                cdb.close()
+        # Concurrency (companies in flight) is DECOUPLED from the commit batch size: a
+        # streaming pool keeps STAGE5_CONCURRENCY rankings running at all times so one
+        # slow AI persona-fit call no longer stalls a whole batch (the old per-chunk
+        # `gather` waited for the slowest of 10). Ranking holds ZERO DB connections;
+        # DM-building (geocode via the shared tz_cache) runs serially in the result
+        # handler so Nominatim stays rate-limited and the cache stays race-free.
+        rank_sem = asyncio.Semaphore(settings.STAGE5_CONCURRENCY)
 
-            # Rank every company in the chunk CONCURRENTLY (bounded). The per-company
-            # AI persona-fit call is the slow step; fanning the chunk out cuts Stage-5
-            # wall-clock ~Nx while keeping memory flat (only this chunk is in flight).
-            rank_sem = asyncio.Semaphore(settings.STAGE5_CONCURRENCY)
+        async def _rank_company(co):
+            domain_key = (co["domain"] or "").strip().lower()
+            prospects = all_contacts.get(domain_key, [])
+            if not prospects:
+                return co, []
+            research_context = co["research_summary"] or ""
+            async with rank_sem:
+                try:
+                    ranked = await ranking_svc.rank_stakeholders_with_ai(
+                        prospects, user_intel_dict, research_context,
+                        objective=objective, industry=co.get("industry") or "",
+                    )
+                    return co, ranked[:4]
+                except Exception as e:
+                    logger.error(f"Failed to rank stakeholders with AI for {domain_key}: {e}")
+                    return co, prospects[:4]
 
-            async def _rank_company(co):
-                domain_key = (co["domain"] or "").strip().lower()
-                prospects = chunk_contacts.get(domain_key, [])
-                if not prospects:
-                    return co, []
-                research_context = co["research_summary"] or ""
-                async with rank_sem:
-                    try:
-                        ranked = await ranking_svc.rank_stakeholders_with_ai(
-                            prospects, user_intel_dict, research_context,
-                            objective=objective, industry=co.get("industry") or "",
-                        )
-                        return co, ranked[:4]
-                    except Exception as e:
-                        logger.error(f"Failed to rank stakeholders with AI for {domain_key}: {e}")
-                        return co, prospects[:4]
+        pending = {asyncio.create_task(_rank_company(co)) for co in researched_cos_data}
+        dms_to_create: list = []
+        company_status_updates: list = []
+        processed = 0
 
-            ranked_chunk = await asyncio.gather(*[_rank_company(co) for co in chunk])
-
-            # Build DM rows sequentially (cheap; geocode is Nominatim-rate-limited + cached).
-            for co, prospects_to_process in ranked_chunk:
-                for p in prospects_to_process:
-                    # Reachability is decided solely by the Primary Email now; the
-                    # per-slot email-validation columns were removed.
-                    target_email = get_fuzzy(p, ["primary email", "email"])
-                    is_verified = bool(target_email)
-                    if not target_email:
-                        continue
-
-                    # Eagerly resolve & persist the prospect timezone now (geocoded
-                    # from the contact location, company location as fallback) so it
-                    # is no longer NULL waiting for the first dispatch.
-                    contact_loc = get_fuzzy(p, ["contact location", "location"])
-                    tz_location = contact_loc or get_fuzzy(p, ["company location"])
-                    resolved_tz = geocode_timezone(tz_location, tz_cache)
-
-                    dms_to_create.append({
-                        "target_company_id": co["id"],
-                        "name": get_fuzzy(p, ["contact full name", "name"], "Unknown"),
-                        "position": get_fuzzy(p, ["title", "position"], "Stakeholder"),
-                        "seniority": get_fuzzy(p, ["seniority"]),
-                        "location": contact_loc,
-                        "display_timezone": resolved_tz,
-                        "email": target_email,
-                        "phone": get_fuzzy(p, ["contact mobile phone", "contact phone 1", "phone"]),
-                        "company_phone": get_fuzzy(p, ["company phone 1", "company phone"]),
-                        "linkedin": get_fuzzy(p, ["contact li profile url", "linkedin"]),
-                        "time_in_role": get_fuzzy(p, ["time in role"]),
-                        "time_at_company": get_fuzzy(p, ["time at company"]),
-                        "is_email_verified": is_verified,
-                        "relevance_score": p.get("strategic_score", 0),
-                        "relevance_explanation": p.get("strategic_reasoning") or "Identified via SToT matching."
-                    })
-
-                company_status_updates.append(co["id"])
-
+        def _commit_batch() -> None:
             self._persist_stage5_chunk(campaign_id, dms_to_create, company_status_updates)
-            logger.info(f"   ↳ [STAGE 5] Committed {min(start + STAGE5_CHUNK_SIZE, total)}/{total} for {campaign_id}.")
             self._pulse_heartbeat(campaign_id, worker_id)
-            del dms_to_create, company_status_updates, chunk_contacts
+            logger.info(f"   ↳ [STAGE 5] Committed {processed}/{total} for {campaign_id}.")
+
+        # Streaming fan-out: handle each ranking AS IT COMPLETES, persisting every
+        # STAGE5_COMMIT_BATCH companies. Completed tasks are released each loop.
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    co, prospects_to_process = fut.result()
+                    for p in prospects_to_process:
+                        # Reachability is decided solely by the Primary Email now; the
+                        # per-slot email-validation columns were removed.
+                        target_email = get_fuzzy(p, ["primary email", "email"])
+                        is_verified = bool(target_email)
+                        if not target_email:
+                            continue
+
+                        # Eagerly resolve & persist the prospect timezone now (geocoded
+                        # from the contact location, company location as fallback) so it
+                        # is no longer NULL waiting for the first dispatch.
+                        contact_loc = get_fuzzy(p, ["contact location", "location"])
+                        tz_location = contact_loc or get_fuzzy(p, ["company location"])
+                        resolved_tz = geocode_timezone(tz_location, tz_cache)
+
+                        dms_to_create.append({
+                            "target_company_id": co["id"],
+                            "name": get_fuzzy(p, ["contact full name", "name"], "Unknown"),
+                            "position": get_fuzzy(p, ["title", "position"], "Stakeholder"),
+                            "seniority": get_fuzzy(p, ["seniority"]),
+                            "location": contact_loc,
+                            "display_timezone": resolved_tz,
+                            "email": target_email,
+                            "phone": get_fuzzy(p, ["contact mobile phone", "contact phone 1", "phone"]),
+                            "company_phone": get_fuzzy(p, ["company phone 1", "company phone"]),
+                            "linkedin": get_fuzzy(p, ["contact li profile url", "linkedin"]),
+                            "time_in_role": get_fuzzy(p, ["time in role"]),
+                            "time_at_company": get_fuzzy(p, ["time at company"]),
+                            "is_email_verified": is_verified,
+                            "relevance_score": p.get("strategic_score", 0),
+                            "relevance_explanation": p.get("strategic_reasoning") or "Identified via SToT matching."
+                        })
+
+                    company_status_updates.append(co["id"])
+                    processed += 1
+                    if len(company_status_updates) >= STAGE5_COMMIT_BATCH:
+                        _commit_batch()
+                        dms_to_create = []
+                        company_status_updates = []
+                del done
+            if company_status_updates or dms_to_create:  # flush final partial batch
+                _commit_batch()
+                dms_to_create = []
+                company_status_updates = []
+        finally:
+            for t in pending:
+                t.cancel()
 
         # 3. Mark stage complete once every chunk has landed.
         temp_db = SessionLocal()

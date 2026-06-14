@@ -7,9 +7,16 @@ Create Date: 2026-04-23 23:10:00
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from app.db import models
 
+# Reference to the existing PostgreSQL enum – never re-create it in this migration.
+_prospect_state_enum = postgresql.ENUM(
+    *[e.value for e in models.ProspectState],
+    name="prospectstate",
+    create_type=False,
+)
 
 revision = "a20260423_0002"
 down_revision = "a20260423_0001"
@@ -58,8 +65,8 @@ def upgrade() -> None:
             sa.Column("id", sa.String(), primary_key=True, nullable=False),
             sa.Column("campaign_id", sa.String(), sa.ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False),
             sa.Column("dm_id", sa.String(), sa.ForeignKey("decision_makers.id", ondelete="CASCADE"), nullable=False),
-            sa.Column("from_state", sa.Enum(models.ProspectState, name="prospectstate"), nullable=True),
-            sa.Column("to_state", sa.Enum(models.ProspectState, name="prospectstate"), nullable=True),
+            sa.Column("from_state", _prospect_state_enum, nullable=True),
+            sa.Column("to_state", _prospect_state_enum, nullable=True),
             sa.Column("from_status", sa.String(), nullable=True),
             sa.Column("to_status", sa.String(), nullable=True),
             sa.Column("reason", sa.String(), nullable=True),

@@ -13,7 +13,7 @@ from app.core.sanitizer import sanitize_for_llm
 
 load_dotenv()
 
-# Deterministic LLM for high-fidelity extraction. Tail latency is capped (60s × 1
+# Deterministic LLM for extraction. Tail latency is capped (60s × 1
 # retry): this runs in a background worker, so a slow provider must not pin a
 # worker slot for minutes.
 llm = ChatOpenAI(
@@ -75,7 +75,7 @@ class UserIntelResponse(BaseModel):
 
 def research_user_company(company_url: str, campaign_prompt: str = "", return_context: bool = False):
     """
-    User Identity & Intent Research Orchestrator.
+    Research a user's company from its website.
 
     Maps a company's value-drivers by crawling its OWN website (homepage +
     high-value pages) with curl_cffi + trafilatura — no paid search API. The
@@ -89,8 +89,8 @@ def research_user_company(company_url: str, campaign_prompt: str = "", return_co
     parsed = urlparse(company_url if '://' in company_url else f'https://{company_url}')
     domain = parsed.netloc.replace('www.', '')
 
-    # Phase 0+1: Identity mapping + reconnaissance via the site extractor.
-    logger.info(f"[USER INTEL] Mobilizing site extraction for domain: {domain}")
+    # Crawl the company site via the extractor.
+    logger.info(f"[USER INTEL] Extracting site for domain: {domain}")
     extract = asyncio.run(extract_site(company_url, max_pages=5, per_page_chars=7000))
 
     if extract.ok:
@@ -104,7 +104,7 @@ def research_user_company(company_url: str, campaign_prompt: str = "", return_co
             f"Discovered Sitemap Verticals: {', '.join(extract.nav_paths)}"
             if extract.nav_paths else ""
         )
-        # Vertical data = the company's own high-value sub-pages (replaces Tavily snippets).
+        # Vertical data = the company's own high-value sub-pages.
         results_text = "\n".join(
             f"Source: {p.url}\nSnippet: {p.text}\n" for p in extract.subpages[:10]
         )
@@ -116,7 +116,7 @@ def research_user_company(company_url: str, campaign_prompt: str = "", return_co
 
     master_context = f"{ground_truth_text}\n{nav_context}\n\nRELEVANT VERTICAL DATA:\n{results_text}"
 
-    # Phase 2: Intelligence Extraction with Sovereign Policy Enforcement
+    # Extract structured intel via the LLM.
     structured_llm = llm.with_structured_output(UserIntelResponse)
     STRICT_PROMPT = USER_INTEL_PROMPT + f"\n\nUSER CAMPAIGN CONTEXT: {campaign_prompt}\n\nSTRICT SOVEREIGNTY: Focus ONLY on {domain}. Discard similar entities. If {domain} has sub-pages for Courses or Projects, list EVERY item found in those paths."
 

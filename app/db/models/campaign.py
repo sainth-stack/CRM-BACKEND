@@ -10,7 +10,7 @@ class CampaignStatus(enum.Enum):
     INPUT_VALIDATED = "INPUT_VALIDATED"
     PENDING = "PENDING"
     
-    # NEW Granular Intelligence Stages (SSoT-First)
+    # Pipeline stages
     STAGE_1_CSV_TRIMMED = "STAGE_1_CSV_TRIMMED"
     STAGE_2_USER_INTEL_COMPLETE = "STAGE_2_USER_INTEL_COMPLETE"
     STAGE_3_ICP_FILTERED = "STAGE_3_ICP_FILTERED"
@@ -39,7 +39,7 @@ class Campaign(Base):
     input_validation_review = Column(JSON, nullable=True)
 
     status = Column(SQLEnum(CampaignStatus, values_callable=lambda obj: [e.value for e in obj]), default=CampaignStatus.INPUT_VALIDATED, index=True)
-    status_reason = Column(Text, nullable=True) # Operational metadata for terminal states
+    status_reason = Column(Text, nullable=True) # Human-readable reason for terminal states
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
     
     # Target company parameters
@@ -55,7 +55,7 @@ class Campaign(Base):
     # local disk.
     csv_file_url = Column(String, nullable=True)
     
-    # Operational Telemetry (Lease & Heartbeat System)
+    # Lease & heartbeat tracking
     last_heartbeat = Column(DateTime, nullable=True)
     locked_by = Column(String, nullable=True) # ID of the worker currently holding the lease
 
@@ -90,7 +90,7 @@ class UserCompanyIntel(Base):
     offerings = Column(Text)
     deep_research = Column(Text)
     
-    # Enriched Dossier Cluster (The Brand DNA)
+    # Enriched research fields (sender profile)
     target_customers = Column(JSON, nullable=True)
     competitive_advantages = Column(JSON, nullable=True)
     proof_points = Column(JSON, nullable=True)

@@ -51,6 +51,55 @@ if not FRONTEND_URL:
 if not FRONTEND_URL:
     FRONTEND_URL = "http://localhost:5173"
 
+def _client_ip(request: Request) -> str | None:
+    """Resolve client IP, honoring the proxy chain (Render terminates TLS upstream)."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+def record_login_session(db: Session, request: Request, user: "models.User") -> None:
+    """
+    Login Audit Anchor.
+    Writes a LoginSession row capturing IP + device for the admin audit trail.
+    Best-effort: a failure here must never block authentication.
+    """
+    try:
+        session = models.LoginSession(
+            user_id=user.id,
+            user_email=user.email,
+            org_id=user.organization_id,
+            ip_address=_client_ip(request),
+            device_info=request.headers.get("user-agent"),
+            login_time=datetime.datetime.now(UTC),
+            status="active",
+        )
+        db.add(session)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning(f"[AUDIT] Failed to record login session for {user.email}: {e}")
+
+
+def build_identity_context(db: Session, user: "models.User") -> dict:
+    """Resolve the tenant / organization / permission context for a user."""
+    from app.core.rbac import get_user_permissions
+    org = db.query(models.Organization).filter(models.Organization.id == user.organization_id).first() if user.organization_id else None
+    tenant = db.query(models.Tenant).filter(models.Tenant.id == user.tenant_id).first() if user.tenant_id else None
+    return {
+        "tenant": {
+            "tenant_id": tenant.id, "tenant_name": tenant.name,
+            "tenant_type": tenant.type, "tenant_timeout": tenant.timeout,
+        } if tenant else None,
+        "organization": {
+            "organization_id": org.id, "organization_name": org.name,
+            "logo_url": org.logo_url,
+        } if org else None,
+        "permissions": get_user_permissions(db, user),
+    }
+
+
 def issue_refresh_token(db: Session, user_id: str) -> str:
     """
     Identity Anchor Generation.
@@ -101,12 +150,23 @@ def login(request: Request, credentials: LoginRequest = Body(...), db: Session =
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Activation Gate: an administrator may disable an identity without deleting it.
+    if user.is_active is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account has been deactivated. Please contact your administrator.",
+        )
+
     # Issue Internal Stateless Session (Slim JWT)
     access_token = create_access_token(data={
-        "sub": user.id, 
+        "sub": user.id,
         "role": user.role.value
     })
     refresh_token = issue_refresh_token(db, user.id)
+
+    # Login audit + multi-tenant identity context
+    record_login_session(db, request, user)
+    identity = build_identity_context(db, user)
 
     return {
         "access_token": access_token,
@@ -119,7 +179,11 @@ def login(request: Request, credentials: LoginRequest = Body(...), db: Session =
             "is_demo": user.is_demo,
             "demo_expires_at": user.demo_expires_at.isoformat() if user.demo_expires_at else None,
             "user_limit": user.user_limit,
-            "provider": user.provider
+            "provider": user.provider,
+            "is_active": user.is_active,
+            "tenant": identity["tenant"],
+            "organization": identity["organization"],
+            "permissions": identity["permissions"],
         }
     }
 
@@ -442,8 +506,22 @@ def logout(request: Request, payload: RefreshRequest, db: Session = Depends(get_
         db_token.is_revoked = True
         # Also kill access tokens for this user globally as a standard sign-out measure
         revoke_sessions(db_token.user_id)
+
+        # Close the most recent open login-audit session for this user.
+        open_session = db.query(models.LoginSession).filter(
+            models.LoginSession.user_id == db_token.user_id,
+            models.LoginSession.status == "active"
+        ).order_by(models.LoginSession.login_time.desc()).first()
+        if open_session:
+            now = datetime.datetime.now(UTC)
+            open_session.logout_time = now
+            if open_session.login_time:
+                login_aware = open_session.login_time if open_session.login_time.tzinfo else open_session.login_time.replace(tzinfo=UTC)
+                open_session.duration_minutes = round((now - login_aware).total_seconds() / 60.0, 2)
+            open_session.status = "ended"
+
         db.commit()
-        
+
     return {"message": "Session terminated successfully."}
 
 @router.get("/me")
@@ -460,10 +538,15 @@ def get_me(current_user: models.User = Depends(get_current_user), db: Session = 
     if current_user.is_demo and current_user.demo_expires_at:
         is_expired = current_user.demo_expires_at.replace(tzinfo=UTC) < datetime.datetime.now(UTC)
         
+    identity = build_identity_context(db, current_user)
     return {
         "id": current_user.id,
         "email": current_user.email,
         "role": current_user.role.value,
+        "is_active": current_user.is_active,
+        "tenant": identity["tenant"],
+        "organization": identity["organization"],
+        "permissions": identity["permissions"],
         "is_demo": current_user.is_demo,
         "demo_expires_at": current_user.demo_expires_at,
         "is_expired": is_expired,

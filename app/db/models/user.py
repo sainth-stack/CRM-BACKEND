@@ -24,7 +24,15 @@ class User(Base):
     role = Column(SQLEnum(UserRole, values_callable=lambda obj: [e.value for e in obj]), default=UserRole.USER, index=True)
     user_limit = Column(Integer, default=0) # Total users an admin can create
     created_by_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
-    
+
+    # Account activation toggle (admin enable/disable). Distinct from deletion.
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    # Multi-tenant placement. Nullable so legacy/super-admin identities can exist
+    # outside any single organization; populated for org-scoped users.
+    tenant_id = Column(String, ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True, index=True)
+    organization_id = Column(String, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True)
+
     is_demo = Column(Boolean, default=False)
     demo_expires_at = Column(DateTime, nullable=True)
     signup_source = Column(String, nullable=True) # demo, manual, organic

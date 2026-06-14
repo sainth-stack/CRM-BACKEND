@@ -10,7 +10,7 @@ import os
 from app.core.logging_config import setup_logging
 from app.core.limiter import limiter
 from app.workers import sweep_stuck_campaigns_task
-from app.api import auth, export, campaigns, drafts, prospects, health
+from app.api import auth, admin, export, campaigns, drafts, prospects, health
 
 # Initialize Enterprise Logging
 logger = setup_logging()
@@ -71,6 +71,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # --- Modular Route Registration ---
 app.include_router(auth.router)
 app.include_router(auth.capability_router)
+app.include_router(admin.router)
 app.include_router(export.router)
 app.include_router(campaigns.router, prefix="/campaigns", tags=["campaigns"])
 app.include_router(drafts.router, prefix="/drafts", tags=["drafts"])

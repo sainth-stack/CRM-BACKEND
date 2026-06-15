@@ -420,10 +420,9 @@ class CampaignService:
         # read query (status == "ACCEPTED") won't re-select it on a retry.
         ranking_svc = StakeholderRankingService()
         import asyncio
-        from app.core.scheduler import geocode_timezone
-        # Per-run cache so each distinct contact location is geocoded only once
-        # (Nominatim is rate-limited). Shared across the whole Stage 5 run.
-        tz_cache: dict = {}
+        # NOTE: timezone geocoding is intentionally NOT done in this stage anymore — it
+        # is deferred to send time (see the DM-build block below). Stakeholder filtering
+        # is now pure LLM ranking with no network-geocode wall.
 
         def get_fuzzy(data, targets, default=None):
             for k in data.keys():
@@ -449,8 +448,7 @@ class CampaignService:
         # streaming pool keeps STAGE5_CONCURRENCY rankings running at all times so one
         # slow AI persona-fit call no longer stalls a whole batch (the old per-chunk
         # `gather` waited for the slowest of 10). Ranking holds ZERO DB connections;
-        # DM-building (geocode via the shared tz_cache) runs serially in the result
-        # handler so Nominatim stays rate-limited and the cache stays race-free.
+        # DM-building is pure dict assembly (no geocoding) so the result handler is fast.
         rank_sem = asyncio.Semaphore(settings.STAGE5_CONCURRENCY)
 
         async def _rank_company(co):
@@ -495,12 +493,14 @@ class CampaignService:
                         if not target_email:
                             continue
 
-                        # Eagerly resolve & persist the prospect timezone now (geocoded
-                        # from the contact location, company location as fallback) so it
-                        # is no longer NULL waiting for the first dispatch.
+                        # Timezone is DETACHED from stakeholder filtering: we no longer
+                        # geocode here (that was a serial, rate-limited Nominatim call per
+                        # prospect — the stage-5 latency wall). We persist the location
+                        # string only; the timezone is resolved lazily at SEND time by
+                        # scheduler.resolve_prospect_timezone (offline country/state map
+                        # first, geopy fallback), where it is naturally spread over the
+                        # send window instead of bursting here.
                         contact_loc = get_fuzzy(p, ["contact location", "location"])
-                        tz_location = contact_loc or get_fuzzy(p, ["company location"])
-                        resolved_tz = geocode_timezone(tz_location, tz_cache)
 
                         dms_to_create.append({
                             "target_company_id": co["id"],
@@ -508,7 +508,7 @@ class CampaignService:
                             "position": get_fuzzy(p, ["title", "position"], "Stakeholder"),
                             "seniority": get_fuzzy(p, ["seniority"]),
                             "location": contact_loc,
-                            "display_timezone": resolved_tz,
+                            "display_timezone": None,  # resolved lazily at send time
                             "email": target_email,
                             "phone": get_fuzzy(p, ["contact mobile phone", "contact phone 1", "phone"]),
                             "company_phone": get_fuzzy(p, ["company phone 1", "company phone"]),

@@ -28,6 +28,70 @@ STAGGER_MINUTES = 3
 # Public API
 # ---------------------------------------------------------------------------
 
+# Single-timezone countries -> IANA tz. Country-level is EXACT for these (one zone),
+# so it is a correct, instant answer with no geocoding. (Multi-tz countries like the
+# US/CA/AU are handled by the state map below; anything unmatched falls to geopy.)
+_COUNTRY_TZ = {
+    "united kingdom": "Europe/London", "uk": "Europe/London", "england": "Europe/London",
+    "scotland": "Europe/London", "wales": "Europe/London", "northern ireland": "Europe/London",
+    "ireland": "Europe/Dublin", "france": "Europe/Paris", "germany": "Europe/Berlin",
+    "spain": "Europe/Madrid", "italy": "Europe/Rome", "netherlands": "Europe/Amsterdam",
+    "belgium": "Europe/Brussels", "switzerland": "Europe/Zurich", "austria": "Europe/Vienna",
+    "sweden": "Europe/Stockholm", "norway": "Europe/Oslo", "denmark": "Europe/Copenhagen",
+    "finland": "Europe/Helsinki", "poland": "Europe/Warsaw", "portugal": "Europe/Lisbon",
+    "czechia": "Europe/Prague", "czech republic": "Europe/Prague", "ireland": "Europe/Dublin",
+    "india": "Asia/Kolkata", "singapore": "Asia/Singapore", "japan": "Asia/Tokyo",
+    "south korea": "Asia/Seoul", "china": "Asia/Shanghai", "hong kong": "Asia/Hong_Kong",
+    "uae": "Asia/Dubai", "united arab emirates": "Asia/Dubai", "israel": "Asia/Jerusalem",
+    "new zealand": "Pacific/Auckland",
+}
+# US state -> tz (dominant zone; the few split states use their majority zone — accurate
+# enough for choosing business-hours send windows).
+_US_STATE_TZ = {
+    "california": "America/Los_Angeles", "washington": "America/Los_Angeles",
+    "oregon": "America/Los_Angeles", "nevada": "America/Los_Angeles",
+    "arizona": "America/Phoenix", "utah": "America/Denver", "colorado": "America/Denver",
+    "new mexico": "America/Denver", "montana": "America/Denver", "wyoming": "America/Denver",
+    "idaho": "America/Denver",
+    "texas": "America/Chicago", "illinois": "America/Chicago", "minnesota": "America/Chicago",
+    "wisconsin": "America/Chicago", "iowa": "America/Chicago", "missouri": "America/Chicago",
+    "arkansas": "America/Chicago", "louisiana": "America/Chicago", "oklahoma": "America/Chicago",
+    "kansas": "America/Chicago", "nebraska": "America/Chicago", "mississippi": "America/Chicago",
+    "alabama": "America/Chicago", "tennessee": "America/Chicago", "north dakota": "America/Chicago",
+    "south dakota": "America/Chicago",
+    "new york": "America/New_York", "new jersey": "America/New_York", "pennsylvania": "America/New_York",
+    "massachusetts": "America/New_York", "connecticut": "America/New_York", "rhode island": "America/New_York",
+    "vermont": "America/New_York", "new hampshire": "America/New_York", "maine": "America/New_York",
+    "ohio": "America/New_York", "michigan": "America/New_York", "indiana": "America/New_York",
+    "kentucky": "America/New_York", "virginia": "America/New_York", "west virginia": "America/New_York",
+    "north carolina": "America/New_York", "south carolina": "America/New_York", "georgia": "America/New_York",
+    "florida": "America/New_York", "maryland": "America/New_York", "delaware": "America/New_York",
+    "district of columbia": "America/New_York",
+    "alaska": "America/Anchorage", "hawaii": "Pacific/Honolulu",
+}
+
+
+def _offline_tz_from_location(location: str) -> str | None:
+    """Resolve an IANA timezone from a location string WITHOUT any network call.
+
+    Handles the overwhelmingly common cases — a single-timezone country, or a US state
+    — instantly and exactly. Returns None when it cannot place the string confidently,
+    so the caller falls through to the (rate-limited) geopy ladder for the rare rest."""
+    if not location:
+        return None
+    t = " " + re.sub(r"\s+", " ", re.sub(r"[^a-z ]", " ", location.lower())) + " "
+    # US first: a recognizable state pins the zone (a bare "United States" with no state
+    # stays None -> geopy, since the US spans 4+ zones).
+    if " united states " in t or " usa " in t or " u s a " in t:
+        for state, tz in _US_STATE_TZ.items():
+            if f" {state} " in t:
+                return tz
+    for country, tz in _COUNTRY_TZ.items():
+        if f" {country} " in t:
+            return tz
+    return None
+
+
 def resolve_prospect_timezone(db: Session, dm) -> str:
     """
     Returns a valid pytz timezone string for a DecisionMaker.
@@ -104,7 +168,18 @@ def resolve_prospect_timezone(db: Session, dm) -> str:
         if row and row[0] and _is_valid_tz(row[0]):
             return _save_and_return(row[0])
 
-    # 4. Geocoding (cleaned + laddered) — only reached when the DB has no record.
+    # 3.5 OFFLINE country/state -> timezone (instant, no network). Resolves the common
+    #     case (single-tz countries, US/CA/AU states) without touching the rate-limited
+    #     geocoder, so the geopy ladder below is reached only for genuinely ambiguous
+    #     strings. This is what keeps send-time resolution from re-introducing the wall
+    #     that was removed from Stage 5.
+    if location:
+        off = _offline_tz_from_location(location)
+        if off and _is_valid_tz(off):
+            return _save_and_return(off)
+
+    # 4. Geocoding (cleaned + laddered) — only reached when the DB has no record AND the
+    #    offline map could not place the location.
     if location:
         tz = geocode_timezone(location)
         if tz:

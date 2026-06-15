@@ -25,9 +25,18 @@ class Settings:
     # crawl + one LLM call), NOT CPU-bound, so it can safely run much wider than the
     # old min(stage3, stage4)=3 cap that throttled it. Raise for faster big runs;
     # lower only if the box shows network/socket pressure.
-    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "20"))        # merged ICP gate (extractor + LLM)
-    STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "20"))   # stakeholder ranking (per-company LLM)
-    STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "20"))   # email drafting sub-graph (per-prospect)
+    # GOVERNOR IS OpenAI TPM, NOT RAM/CPU. Measured: ICP at concurrency 40 peaks at
+    # ~400 MB RAM (safe) but instantly saturates a 200K-TPM (Tier-1) account and 429s.
+    # Each ICP company ≈ 10K tokens, so ~19 companies/min is the Tier-1 ceiling and
+    # concurrency ~20 already saturates it — going higher only causes 429s. Stages run
+    # sequentially, so each gets the full TPM budget. Right-size to YOUR tier:
+    #   Tier 1 (200K TPM): ~20  |  Tier 2 (2M TPM): 40+  |  Tier 3+: 60+.
+    # ICP trimmed to ~8K tokens/company (12K enrich input + lean validation profile),
+    # so 200K TPM / 8K ≈ 25 companies/min -> concurrency 25 saturates Tier-1 without
+    # 429s. Raise alongside the tier (Tier 2 = 2M TPM -> 40+).
+    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "25"))        # ICP gate (extractor + 2 LLM) — TPM-bound
+    STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "25"))   # stakeholder ranking
+    STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "25"))   # email drafting (single MEDDPICC call)
 
     # ICP acceptance threshold (0-100). A company is accepted when its inferred
     # operator_fit score (+ optional need/precondition bonus) >= this value AND it

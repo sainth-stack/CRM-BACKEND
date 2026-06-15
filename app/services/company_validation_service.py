@@ -59,13 +59,12 @@ class CompanyResearchProfile(BaseModel):
     pain_hooks: List[str] = Field(default_factory=list, description="ONLY challenges/problems/needs the evidence EXPLICITLY states about this company. Do NOT infer from what they do. [] if none stated.")
     news_hooks: List[str] = Field(default_factory=list, description="ONLY recent items in the evidence explicitly about this company. [] if none.")
     executive_summary: str = Field(description=(
-        "A COMPREHENSIVE research dossier (aim for 5-8 substantial paragraphs / 1500-3500 chars when the "
-        "evidence supports it) where EVERY claim traces to the provided evidence. Mine the evidence "
-        "thoroughly and cover, in prose: (1) what the company makes/does and its core products/services; "
-        "(2) the markets, industries, and customer types it serves; (3) scale and operations — facilities, "
-        "locations, headcount, revenue, certifications, named technologies/equipment; (4) recent "
-        "developments, growth, expansion, or initiatives; (5) notable operational characteristics. Do NOT "
-        "invent facts to hit a length — if evidence is thin, write only what is grounded and say so."))
+        "A focused research dossier (aim for 3-4 tight paragraphs / 900-1600 chars when the evidence "
+        "supports it) where EVERY claim traces to the provided evidence. Cover, in prose: (1) what the "
+        "company makes/does and its core products/services; (2) the markets, industries, and customer "
+        "types it serves; (3) scale and operations — facilities, locations, headcount, revenue, "
+        "certifications, named technologies; (4) any recent developments or notable operational traits. "
+        "Be concise and concrete — do NOT pad. If evidence is thin, write only what is grounded and say so."))
 
 
 class ICPMeddpiccJudgment(BaseModel):
@@ -361,9 +360,13 @@ class CompanyValidationService:
         parts = [p.strip() for p in re.split(r"[,;\n]+", text) if p.strip()]
         return ", ".join(parts) if parts else empty
 
-    # Max chars of raw crawl fed to the enrichment model. Generously under half of
-    # the model's context window; the structured profile it returns is far smaller.
-    _ENRICH_INPUT_CHARS = 24000
+    # Max chars of raw crawl fed to the enrichment model. Trimmed 24K -> 12K to cut
+    # input tokens (TPM is the latency governor): a marketing site's identity — what
+    # it makes/does/serves, its scale and markets — lives in the homepage/about/
+    # products pages, which the extractor ranks first and which fit well under 12K.
+    # The trimmed tail is blog/case-study filler that does not change the structured
+    # profile (and therefore does not change the ICP verdict or score).
+    _ENRICH_INPUT_CHARS = 12000
 
     def prefetch_icp_research(self, domains: list[str]) -> dict[str, dict]:
         """Batch-load cached STRUCTURED research profiles for many domains in ONE query
@@ -438,11 +441,21 @@ class CompanyValidationService:
         return profile.model_dump()
 
     @staticmethod
-    def _render_profile(profile: dict) -> str:
-        """Render a structured profile dict into readable text for the validation prompt."""
+    def _render_profile(profile: dict, summary_chars: int = 600) -> str:
+        """Render a structured profile dict into readable text for the validation prompt.
+
+        The ICP verdict + score are driven by the STRUCTURED facts below (actual
+        business, products, markets, scale, signals, pains) — NOT by the prose
+        dossier. So the long `executive_summary` is truncated to `summary_chars` for
+        the validation LLM to cut input tokens, while the FULL summary is still stored
+        and used by the drafting stage. Pass summary_chars<=0 to omit it entirely."""
         def _lst(key):
             vals = profile.get(key) or []
             return "; ".join(str(v) for v in vals) if vals else "None stated"
+        summary = (profile.get("executive_summary") or "").strip()
+        if summary_chars and len(summary) > summary_chars:
+            summary = summary[:summary_chars].rsplit(" ", 1)[0] + " …"
+        summary_block = f"\nSummary (excerpt):\n{summary}" if summary_chars and summary else ""
         return (
             f"Actual business: {profile.get('actual_business') or 'Unknown'}\n"
             f"Products/services: {_lst('products_services')}\n"
@@ -450,8 +463,8 @@ class CompanyValidationService:
             f"Scale & operations: {profile.get('scale_operations') or 'Not stated'}\n"
             f"Evidenced signals: {_lst('evidenced_signals')}\n"
             f"Stated challenges/pains: {_lst('pain_hooks')}\n"
-            f"Recent items: {_lst('news_hooks')}\n\n"
-            f"Summary:\n{profile.get('executive_summary') or 'No summary available.'}"
+            f"Recent items: {_lst('news_hooks')}\n"
+            f"{summary_block}"
         )
 
     # ----------------------------------------------------------------------- #
@@ -808,7 +821,7 @@ class CompanyValidationService:
                 "csv_size": csv_size,
                 "campaign_prompt": campaign_prompt[:1500],
                 "name": name,
-                "profile": rendered[:12000],
+                "profile": rendered[:8000],
             })
         except Exception as e:
             # Fail-closed: a failed judgment is REJECTED. `_llm_error` is the transient,

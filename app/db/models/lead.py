@@ -28,13 +28,22 @@ class CampaignLead(Base):
     domain = Column(String, index=True)            # normalized website domain (anchor key)
     website_raw = Column(String)                   # raw domain/website value as supplied
     company_name_cleaned = Column(String)
-    company_location = Column(String)
+    company_location = Column(String)              # DEPRECATED raw blob; superseded by country/state/city
     company_industry = Column(String)
     company_staff_count_range = Column(String)
     company_description = Column(Text)
     company_revenue_range = Column(String)
     company_li_profile_url = Column(String)
     company_linkedin_id = Column(String)
+    # Richer firmographics (high fill-rate CSV fields the ICP engine now uses).
+    company_sic_code = Column(String)              # deterministic industry (SIC supercategory)
+    company_naics_code = Column(String)            # deterministic industry (NAICS supercategory)
+    company_staff_count = Column(String)           # EXACT headcount -> continuous scale score
+    company_annual_revenue = Column(String)        # EXACT revenue -> continuous scale score
+    company_founded_year = Column(String)          # company age / maturity signal
+    company_country = Column(String)               # structured location (drives ICP location match)
+    company_state = Column(String)
+    company_city = Column(String)
 
     # ---- Contact cluster ----
     contact_full_name = Column(String)

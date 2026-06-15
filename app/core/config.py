@@ -29,11 +29,13 @@ class Settings:
     STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "20"))   # stakeholder ranking (per-company LLM)
     STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "20"))   # email drafting sub-graph (per-prospect)
 
-    # ICP acceptance threshold (0-100). A company is accepted when its graded
-    # strategic_fit_score >= this value AND it does not hard-fail an explicit
-    # firmographic requirement. Score-driven (no pass/fail/unknown cliff). Lower to
-    # accept more, raise to be stricter. Calibrated on the labeled ICP eval set.
-    ICP_ACCEPT_THRESHOLD = int(os.getenv("ICP_ACCEPT_THRESHOLD", "45"))
+    # ICP acceptance threshold (0-100). A company is accepted when its inferred
+    # operator_fit score (+ optional need/precondition bonus) >= this value AND it
+    # does not hard-fail an explicit firmographic requirement. Score-driven (no
+    # pass/fail/unknown cliff). Lower to accept more, raise to be stricter.
+    # Recalibrated for the inference-based fit model (operator_fit bands: 55-79 solid,
+    # 80+ strong); the old default of 45 was tuned to the broken 0.70-clamped scores.
+    ICP_ACCEPT_THRESHOLD = int(os.getenv("ICP_ACCEPT_THRESHOLD", "55"))
 
     # Cross-campaign reuse of a domain's structured research profile (skips crawl +
     # enrichment). A stored profile is reused only if it was refreshed within this

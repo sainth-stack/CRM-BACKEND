@@ -95,12 +95,21 @@ class ICPMeddpiccJudgment(BaseModel):
             "or operate in an adjacent vertical are NOT competitors — they are operators. "
             "'out_of_domain' = the target matches NEITHER profile."))
     role_reason: str = Field(description="One sentence: what the target does, and why that role relative to the sender.")
-    operator_fit: int = Field(description="0-100 (operator_end_user only; else 0): how strongly the target matches the sender's target-customer profile. VARY by match strength — never stamp a default.")
+    # ---- Operator fit, scored as THREE independent sub-factors (operators only; else 0). ----
+    # These are summed by the system into operator_fit (0-100). Scoring three separate
+    # axes forces real differentiation between companies instead of stamping a single
+    # round default — a large multi-site OEM matching many signals should clearly outscore
+    # a small single-process shop. INFER each from what the company does; never require a
+    # stated problem.
+    operational_overlap: int = Field(description="0-45 (operators only; else 0): how DIRECTLY the target's core operations match the sender's buyer profile and derived operational signals. 38-45 = textbook match to the central signal; 25-37 = clear match; 12-24 = partial/adjacent overlap; 1-11 = loose. Spread this — do NOT default to a round number; two different companies should rarely get the same value.")
+    scale_readiness: int = Field(default=0, description="SYSTEM-COMPUTED from firmographics — do NOT score this, just output 0.")
+    signal_breadth: int = Field(default=0, description="SYSTEM-COMPUTED from matched pains/services — do NOT score this, just output 0.")
+    operator_fit: int = Field(default=0, description="SYSTEM-COMPUTED (operational_overlap + computed scale + computed breadth) — output 0; the system fills it.")
 
-    # ---- Two evidence floors (both derived from the sender profile) ----
-    has_evidenced_need: bool = Field(description="True ONLY if the research profile EXPLICITLY shows a problem/need/initiative that the SENDER'S offering addresses (derive from the sender's capability->pain map). Being a plausible customer or 'uses technology' is NOT a need.")
+    # ---- Corroborating evidence signals (BONUS only — absence is neutral) ----
+    has_evidenced_need: bool = Field(description="True if the research profile shows a problem/need/initiative the SENDER'S offering addresses (derive from the sender's capability->pain map). A POSITIVE BONUS signal only — when false the score is NOT penalised (websites rarely state needs). Do not force it true: 'uses technology' alone is not a need.")
     need_evidence: str = Field(description="The exact evidenced need (quote/paraphrase from the profile). 'None evidenced' when has_evidenced_need is false.")
-    has_evidenced_precondition: bool = Field(description="True ONLY if the profile shows the PRECONDITION that makes the sender's solution usable for this target (the operations, assets, data, scale, or context the offering requires). Derive from the sender's offering.")
+    has_evidenced_precondition: bool = Field(description="True if the profile shows the PRECONDITION that makes the sender's solution usable (the operations, assets, data, scale, or context the offering requires). A POSITIVE BONUS signal only — when false the score is NOT penalised. Derive from the sender's offering.")
     precondition_evidence: str = Field(description="The exact evidenced precondition (quote/paraphrase). 'None evidenced' when has_evidenced_precondition is false.")
     evidence_confidence: int = Field(description="0-100: share of the assessment read from EXPLICIT profile facts vs inference.")
 
@@ -121,7 +130,9 @@ class ICPMeddpiccJudgment(BaseModel):
     overall_reasoning: str = Field(description=(
         "A professional 2-3 sentence FACTUAL assessment, in polished business English, of this target's "
         "fit for the sender's ICP — written as if briefing a sales team. Ground it in the MEDDPICC read: "
-        "name what the company actually does/operates, and whether a pain the sender solves is evidenced. "
+        "name what the company actually does/operates and why that matches (or does not match) the "
+        "sender's target-customer profile. Reason from operations — do NOT comment on whether a pain is "
+        "'evidenced' or note the absence of stated problems. "
         "Be specific and cite evidenced facts. Do NOT state or imply an accept/reject decision, do NOT "
         "recommend whether to pursue, and do NOT hedge with 'may not be a fit / needs further "
         "exploration' — the system decides qualification separately from this text. STRICTLY no internal "
@@ -216,13 +227,27 @@ For each, return verdict (pass | fail | unknown) + one-sentence evidence (cite t
    - If the CSV label is AMBIGUOUS between supercategories (e.g. "Consumer Electronics", "Logistics",
      "Dairy", "Technology") -> UNKNOWN. Do NOT guess; UNKNOWN does not disqualify.
    - Return FAIL ONLY when the CSV industry is UNAMBIGUOUSLY in a DIFFERENT supercategory than EVERY target
-     (e.g. a recruitment agency, a coffee shop, or a law firm against a "Manufacturing" filter).
+     (e.g. a recruitment agency, a coffee shop, or a law firm against a "Manufacturing" filter). Against a
+     "Manufacturing" target, ANY label that denotes making / producing / fabricating / engineering physical
+     goods is a PASS, NOT a fail — this explicitly INCLUDES "Textiles", "Industrial", "Industrial
+     Automation", "Machinery", "Electrical/Electronic Manufacturing", "Composites", "Materials", and the
+     like (textile *manufacturing* is manufacturing). Reserve FAIL for pure non-physical services with no
+     production at all. If the label could plausibly involve making physical goods, return UNKNOWN, never
+     FAIL.
 2. location_match and 3. size_match: the SYSTEM validates these two deterministically from the CSV fields
    AFTER your response, so do NOT spend effort on them — just return verdict "unknown" with evidence
    "validated separately by the system" for both. (industry_match above IS yours to decide.)
 
 ==================== PART B — MEDDPICC ICP QUALIFICATION (sender-fit) ====================
 This is where the CAMPAIGN OBJECTIVE and the RESEARCH PROFILE are used.
+
+HOW TO READ THE EVIDENCE (critical): the RESEARCH PROFILE is distilled from the target's own MARKETING
+website, which describes what the company DOES, MAKES, SELLS, and SERVES — its capabilities — and almost
+NEVER states the company's internal problems, gaps, or needs. Therefore judge fit by INFERENCE from what
+the company does: if its operations match the sender's buyer profile, it is a fit, REGARDLESS of whether
+any pain is spelled out. The ABSENCE of a stated need or problem is NOT evidence against fit and must NOT
+lower the fit grade. Reserve low fit grades for companies whose operations genuinely do not match the
+buyer profile — not for companies that simply did not advertise a weakness.
 
 CAMPAIGN OBJECTIVE (the user's own words — the target should help satisfy this): {campaign_prompt}
 
@@ -267,12 +292,18 @@ Then ground EVERY field in the RESEARCH PROFILE, judged in light of the campaign
   Do NOT default to out_of_domain just because the target's product category differs from the sender's
   typical customers; the decisive question is whether the target's OPERATIONS match the derived BUYER
   PROFILE.
-- operator_fit (0-100, operators only; else 0) — VARY by how strongly the target matches the BUYER
-  PROFILE; do NOT stamp a default number.
-- has_evidenced_need + need_evidence: TRUE only if THE NEED (iii) is EXPLICIT in the research profile;
-  else false + 'None evidenced'. A plausible customer or 'uses technology' is NOT a need.
-- has_evidenced_precondition + precondition_evidence: TRUE only if THE PRECONDITION (iv) is EXPLICIT in
-  the research profile.
+- operational_overlap (0-45, operators only; else 0) — the ONLY fit number you score. Judge how DIRECTLY
+  the target's core operations match the BUYER PROFILE and its derived signals, inferred from what the
+  company does/makes/serves: 38-45 textbook match to the central signal; 25-37 clear match; 12-24
+  partial/adjacent overlap; 1-11 loose. DIFFERENTIATE — avoid round-number defaults; two different
+  companies should rarely get the same value. Never lower it because no pain is stated.
+  (scale_readiness, signal_breadth and operator_fit are computed by the system from firmographics and the
+  matched pains/services — output 0 for all three.)
+- has_evidenced_need + need_evidence: a CORROBORATING BONUS only. TRUE if THE NEED (iii) happens to be
+  explicit in the profile; otherwise false + 'None evidenced'. Setting it false does NOT reduce the score
+  — it just means no bonus. Do NOT force it true, and do NOT downgrade operator_fit when it is false.
+- has_evidenced_precondition + precondition_evidence: a CORROBORATING BONUS only, same rule — TRUE if THE
+  PRECONDITION (iv) is explicit; false otherwise, with no penalty.
 - evidence_confidence (0-100). metrics (value hypothesis tied to the evidenced need, else 'unclear — no
   evidenced need'). economic_buyer / champion: a ROLE/TITLE only — NEVER a named person unless that exact
   name is in the evidence. decision_criteria. decision_process / paper_process: each start 'NEEDS
@@ -288,9 +319,11 @@ only map them to THIS sender.)
 - matched_pains / matched_services: the sender pains/services that apply to what the profile shows.
 
 Finally: overall_reasoning — a professional, polished 2-3 sentence FACTUAL assessment (use the exact
-sender name {sender_name}) of the target's MEDDPICC fit: what it does/operates and whether a
-sender-solvable pain is evidenced. Do NOT state or imply accept/reject, do NOT recommend whether to
-pursue, and do NOT hedge ('may not be a fit', 'needs exploration') — qualification is decided
+sender name {sender_name}) of the target's MEDDPICC fit: what it does/operates and why that matches (or
+does not match) {sender_name}'s target-customer profile. Reason from operations; do NOT comment on
+whether a pain is 'evidenced' or remark on the absence of stated problems. Do NOT state or imply
+accept/reject, do NOT recommend whether to pursue, and do NOT hedge ('may not be a fit', 'needs
+exploration') — qualification is decided
 separately. Write it for a human sales reader — NO scores, field names, booleans, verdict labels, or
 bracketed metadata. Then confidence (0-100)."""
 )
@@ -424,28 +457,174 @@ class CompanyValidationService:
     # ----------------------------------------------------------------------- #
     # MEDDPICC scoring (from the stabilized root ICP engine)                   #
     # ----------------------------------------------------------------------- #
+    # ---- Deterministic sub-scores (option A): computed from hard facts, not LLM grades. --- #
+    # gpt-class judges cannot reliably produce DIFFERENTIATED 0-N numbers — they stamp a
+    # "safe middle" on every company (observed: scale=20 for a single-site shop AND an
+    # $11B multinational). So the two objective axes are computed in code from facts the
+    # LLM is good at EXTRACTING (revenue, headcount, markets, products, matched pains/
+    # services). Only operational_overlap (a genuine qualitative judgment) stays on the LLM.
     @staticmethod
-    def _overall_score(m: ICPMeddpiccJudgment):
+    def _revenue_score(revenue: str) -> int:
+        """0-12 from a revenue-range string (uses the UPPER bound). Blank -> neutral 3."""
+        t = (revenue or "").lower().replace(",", "").replace("$", "")
+        if not t.strip():
+            return 3
+        vals = []
+        for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([bmk])?", t):
+            if not num:
+                continue
+            mult = {"b": 1_000_000_000, "m": 1_000_000, "k": 1_000}.get(unit, 1)
+            vals.append(float(num) * mult)
+        if not vals:
+            return 3
+        v = max(vals)
+        for thr, sc in ((1e9, 12), (5e8, 11), (1e8, 9), (5e7, 7), (2e7, 5), (5e6, 4), (1e6, 2)):
+            if v >= thr:
+                return sc
+        return 1
+
+    @classmethod
+    def _headcount_score(cls, size: str) -> int:
+        """0-8 from an employee-size string (uses the UPPER bound). Blank -> neutral 2."""
+        ranges = cls._parse_ranges(size or "")
+        if not ranges:
+            return 2
+        hi = max(h if h != float("inf") else l for l, h in ranges)
+        for thr, sc in ((5000, 8), (1000, 7), (500, 6), (200, 5), (50, 4), (10, 3)):
+            if hi >= thr:
+                return sc
+        return 2
+
+    @staticmethod
+    def _age_score(founded_year: str) -> int:
+        """0-3 company-maturity score from a founded year/date. Blank -> neutral 1."""
+        if not founded_year:
+            return 1
+        m = re.search(r"(19|20)\d{2}", str(founded_year))
+        if not m:
+            return 1
+        import datetime as _dt
+        age = _dt.datetime.utcnow().year - int(m.group(0))
+        for thr, sc in ((50, 3), (20, 2), (3, 1)):
+            if age >= thr:
+                return sc
+        return 1
+
+    @classmethod
+    def _compute_scale_readiness(cls, company_data: dict, profile: dict) -> int:
+        """0-30 from real firmographic + profile facts. Prefers the EXACT headcount /
+        revenue figures (continuous -> finer spread) and falls back to the coarse bands
+        when the exact fields are absent. Spreads naturally because these facts genuinely
+        differ company to company.
+
+          revenue 0-12 + headcount 0-8 + markets 0-4 + products 0-3 + age 0-3 = 30."""
+        score = cls._revenue_score(company_data.get("annual_revenue") or company_data.get("revenue"))
+        score += cls._headcount_score(company_data.get("staff_count") or company_data.get("size"))
+        score += min(4, len(profile.get("markets_served") or []))
+        score += min(3, len(profile.get("products_services") or []))
+        score += cls._age_score(company_data.get("founded_year"))
+        return max(0, min(30, score))
+
+    # ---- Deterministic industry classification from SIC / NAICS codes ---------- #
+    # Code -> canonical supercategory + the keywords a user's target-industry string
+    # might use for it. A code match forces industry_match=PASS (a precise, positive
+    # override of the LLM's label-guessing); it NEVER forces a FAIL, so it can only add
+    # precision, not new false negatives.
+    _SUPERCATEGORY_KEYWORDS = {
+        "Manufacturing": ("manufactur", "industrial", "factory", "production", "oem", "fabricat"),
+        "Healthcare": ("health", "medical", "pharma", "clinical", "biotech", "life science"),
+        "Financial Services": ("financ", "bank", "insurance", "fintech", "asset manage", "capital"),
+        "Technology": ("tech", "software", "saas", "it ", "information", "computer", "digital", "internet"),
+        "Construction": ("construct", "building", "engineering & construction"),
+        "Retail": ("retail", "ecommerce", "e-commerce", "consumer goods"),
+        "Wholesale": ("wholesale", "distribut"),
+        "Transportation": ("transport", "logistics", "freight", "supply chain"),
+        "Energy": ("energy", "oil", "gas", "utilit", "power"),
+        "Agriculture": ("agricultur", "farming", "forestry"),
+    }
+
+    @staticmethod
+    def _sic_supercategory(sic: str) -> str | None:
+        m = re.match(r"\s*(\d{2})", str(sic or ""))
+        if not m:
+            return None
+        d = int(m.group(1))
+        if 1 <= d <= 9:   return "Agriculture"
+        if 10 <= d <= 14: return "Energy"
+        if 15 <= d <= 17: return "Construction"
+        if 20 <= d <= 39: return "Manufacturing"
+        if 40 <= d <= 49: return "Transportation"
+        if 50 <= d <= 51: return "Wholesale"
+        if 52 <= d <= 59: return "Retail"
+        if 60 <= d <= 67: return "Financial Services"
+        return None
+
+    @staticmethod
+    def _naics_supercategory(naics: str) -> str | None:
+        m = re.match(r"\s*(\d{2})", str(naics or ""))
+        if not m:
+            return None
+        d = int(m.group(1))
+        return {
+            11: "Agriculture", 21: "Energy", 22: "Energy", 23: "Construction",
+            31: "Manufacturing", 32: "Manufacturing", 33: "Manufacturing",
+            42: "Wholesale", 44: "Retail", 45: "Retail", 48: "Transportation",
+            49: "Transportation", 51: "Technology", 52: "Financial Services",
+            53: "Financial Services", 54: "Technology", 62: "Healthcare",
+        }.get(d)
+
+    @classmethod
+    def _deterministic_industry_pass(cls, sic: str, naics: str, target_industry: str) -> str | None:
+        """Return the matched supercategory when the company's SIC/NAICS code falls under
+        a target industry; else None. Positive-only (never fails a company)."""
+        target = (target_industry or "").lower()
+        if not target or target == "any":
+            return None
+        for cat in (cls._naics_supercategory(naics), cls._sic_supercategory(sic)):
+            if not cat:
+                continue
+            kws = cls._SUPERCATEGORY_KEYWORDS.get(cat, ())
+            if cat.lower() in target or any(k.strip() in target for k in kws):
+                return cat
+        return None
+
+    @staticmethod
+    def _compute_signal_breadth(m: "ICPMeddpiccJudgment") -> int:
+        """0-25 from how many sender pains/services the target matched. These LLM LISTS
+        vary per company (the LLM is reliable at producing them), so the derived number
+        spreads where a direct 0-25 grade collapsed."""
+        n = len(m.matched_pains or []) + len(m.matched_services or [])
+        return max(0, min(25, n * 4))
+
+    # Bonus added when an explicit need / precondition IS stated in the evidence.
+    # These are POSITIVE signals only — their absence is neutral, never a penalty,
+    # because marketing websites describe capabilities, not internal problems, so a
+    # company rarely "confesses" a need or precondition even when it is a perfect fit.
+    _NEED_BONUS = 8
+    _PRECONDITION_BONUS = 7
+
+    @classmethod
+    def _overall_score(cls, m: ICPMeddpiccJudgment):
         """Continuous 0-100 fit score for genuine operators, or None for role-gated
         companies (vendors / out-of-domain) where a fit score is meaningless.
 
-        The score is anchored on `operator_fit` — the LLM's graded measure of how well
-        the target matches THIS sender's target-customer profile (input-driven, varies
-        per company). The two evidence floors then DISCOUNT it rather than hard-cap it
-        at the threshold: a confident, fully-evidenced fit keeps its raw score, while a
-        match with no explicitly evidenced need/precondition is scaled down (lower
-        confidence) but still ranks by its underlying fit. This keeps scores spread out
-        and meaningful instead of every borderline company stamping the threshold."""
+        The score is the LLM's graded `operator_fit` — an INFERENCE of how well the
+        target's actual operations match THIS sender's ideal-customer profile, read
+        from what the company does/makes/serves (the only thing a marketing site
+        reliably exposes). An explicitly stated need or precondition then ADDS a small
+        bonus on top (a positive corroborating signal); their ABSENCE is neutral and
+        never discounts the score. This is the key fix for the old multiplicative
+        floors, which pinned almost every company to ~0.70 of its fit (websites never
+        state pains) and clustered all scores in a narrow band at the threshold."""
         if m.target_role != "operator_end_user":
             return None
         base = max(0, min(100, int(m.operator_fit or 0)))
-        if m.has_evidenced_need and m.has_evidenced_precondition:
-            factor = 1.0                 # both floors evidenced -> full confidence
-        elif m.has_evidenced_need or m.has_evidenced_precondition:
-            factor = 0.85                # one floor evidenced -> light discount
-        else:
-            factor = 0.70                # buyer-type only, neither floor evidenced -> larger discount
-        return round(base * factor)
+        bonus = 0
+        if m.has_evidenced_need:
+            bonus += cls._NEED_BONUS
+        if m.has_evidenced_precondition:
+            bonus += cls._PRECONDITION_BONUS
+        return min(100, base + bonus)
 
     # ----------------------------------------------------------------------- #
     # Deterministic firmographic matching — LOCATION + SIZE (CSV fields only)   #
@@ -553,9 +732,14 @@ class CompanyValidationService:
         domain = company_data.get("domain") or company_data.get("website")
         name = company_data.get("name")
 
+        # Prefer the structured country for deterministic location matching; the free
+        # location string remains the prompt-facing label.
         csv_loc = company_data.get("location") or "N/A"
+        csv_country = company_data.get("country") or csv_loc
         csv_size = company_data.get("size") or "N/A"
         csv_industry = company_data.get("industry") or "N/A"
+        csv_sic = company_data.get("sic_code") or ""
+        csv_naics = company_data.get("naics_code") or ""
         csv_desc = company_data.get("description") or ""
 
         # Campaign requirements (the user's explicit filters for THIS campaign).
@@ -647,13 +831,63 @@ class CompanyValidationService:
                 err["_eval_context"] = rendered[:9000]
             return err
 
+        # operator_fit = LLM operational_overlap (qualitative) + the two DETERMINISTIC
+        # sub-scores computed from facts. The LLM number clustered when scored directly;
+        # computing scale + breadth from real firmographics/lists restores per-company
+        # spread. Operators only; gated roles score 0.
+        if res.target_role == "operator_end_user":
+            res.scale_readiness = self._compute_scale_readiness(company_data, profile)
+            res.signal_breadth = self._compute_signal_breadth(res)
+            res.operator_fit = (
+                max(0, min(45, int(res.operational_overlap or 0)))
+                + res.scale_readiness
+                + res.signal_breadth
+            )
+        else:
+            res.operational_overlap = 0
+            res.scale_readiness = 0
+            res.signal_breadth = 0
+            res.operator_fit = 0
+
         # Location + size are validated deterministically against the CSV fields ONLY
         # (overriding the model, which wavered between the CSV field and headcounts/
-        # locations mentioned in the research profile). Industry stays as the model judged.
-        lv, le = self._match_location(csv_loc, target_loc)
+        # locations mentioned in the research profile). Location uses the structured
+        # country when present (cleaner than the free-text blob).
+        lv, le = self._match_location(csv_country, target_loc)
         sv, se = self._match_size(csv_size, target_size)
         res.location_match = DimensionVerdict(verdict=lv, evidence=le)
         res.size_match = DimensionVerdict(verdict=sv, evidence=se)
+
+        # Deterministic industry PASS from SIC/NAICS codes (precise, positive-only). When
+        # the company's official code falls under a target industry, trust it over the
+        # LLM's label-guessing — this is what makes "Textiles" (NAICS 313) correctly read
+        # as Manufacturing instead of being hard-failed. Never forces a FAIL.
+        matched_cat = self._deterministic_industry_pass(csv_sic, csv_naics, target_industry)
+        if matched_cat:
+            res.industry_match = DimensionVerdict(
+                verdict="pass",
+                evidence=(f"SIC/NAICS code ({csv_sic or csv_naics}) classifies this company under "
+                          f"{matched_cat}, which falls within the target industry."),
+            )
+
+        # Industry-gate safety net: the model sometimes hard-FAILS a CSV industry that is
+        # really a manufacturing sub-sector (e.g. "Textiles", "Industrial") while ALSO
+        # classifying the company as a genuine operator that runs the operations the sender
+        # serves. Those two judgments are contradictory: a clear different-supercategory
+        # company could not be an operator_end_user for this sender. When they conflict,
+        # trust the role read and soften the FAIL to UNKNOWN (which does not disqualify) so
+        # a true manufacturer is not silently dropped on a mislabelled industry string.
+        if res.industry_match.verdict == "fail" and res.target_role == "operator_end_user":
+            logger.info(
+                f"[ICP] Softening industry FAIL->UNKNOWN for {domain}: model classified it as "
+                f"operator_end_user, so the CSV industry '{csv_industry}' is not a clear "
+                f"different-supercategory mismatch."
+            )
+            res.industry_match = DimensionVerdict(
+                verdict="unknown",
+                evidence=(f"CSV industry '{csv_industry}' is ambiguous against the target, but the "
+                          f"company operates as a genuine end-user in the sender's domain."),
+            )
 
         result = self._decide(res, profile)
         if return_context:
@@ -698,8 +932,8 @@ class CompanyValidationService:
                 note = ("It does not qualify: its operations fall outside the domain the sender's offering "
                         "serves.")
             else:
-                note = ("It does not qualify: the available evidence is insufficient to establish a need or "
-                        "operational fit strong enough to meet the qualification bar for this sender.")
+                note = ("It does not qualify: its operations are too weak a match for the sender's "
+                        "target-customer profile to meet the qualification bar for this sender.")
 
         return f"{base} {note}".strip()
 

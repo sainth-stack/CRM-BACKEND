@@ -10,6 +10,7 @@ Create Date: 2026-06-13
 """
 from typing import Sequence, Union
 import uuid
+import datetime
 
 from alembic import op
 import sqlalchemy as sa
@@ -145,7 +146,7 @@ def upgrade() -> None:
                 "VALUES (:id, :name, :type, :timeout, :created_at)"
             ),
             {"id": default_tenant_id, "name": "Default Tenant", "type": "internal",
-             "timeout": 60, "created_at": sa.func.now()},
+             "timeout": 60, "created_at": datetime.datetime.utcnow()},
         )
 
     existing_org = bind.execute(
@@ -161,7 +162,7 @@ def upgrade() -> None:
                 "VALUES (:id, :name, :tenant_id, NULL, :created_at)"
             ),
             {"id": default_org_id, "name": "Default Organization",
-             "tenant_id": default_tenant_id, "created_at": sa.func.now()},
+             "tenant_id": default_tenant_id, "created_at": datetime.datetime.utcnow()},
         )
 
     # Attach only users not already placed (super admins intentionally left

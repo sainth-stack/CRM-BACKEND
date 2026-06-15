@@ -32,7 +32,18 @@ def get_fuzzy_map(cols):
         'time_in_role': r'time\s*in\s*role',
         'time_at_company': r'time\s*at\s*company',
         'contact_mobile_phone': r'contact\s*mobile\s*phone$',
-        'company_phone_1': r'company\s*phone\s*1'
+        'company_phone_1': r'company\s*phone\s*1',
+        # Richer firmographics (high fill-rate; drive deterministic ICP scoring).
+        # Patterns are END-ANCHORED where a near-duplicate sibling header exists
+        # (Staff Count vs ...Range, Country vs ...Alpha 2, State vs ...Abbr).
+        'company_sic_code': r'^sic\s*code$',
+        'company_naics_code': r'^naics\s*code$',
+        'company_staff_count': r'^company\s*staff\s*count$',
+        'company_annual_revenue': r'^company\s*annual\s*revenue$',
+        'company_founded_year': r'^company\s*founded\s*date$',
+        'company_country': r'^company\s*country$',
+        'company_state': r'^company\s*state$',
+        'company_city': r'^company\s*city$',
     }
 
     # Dynamic Clustered Patterns (Mobile 1-10). Email-validation slots
@@ -61,7 +72,10 @@ class CSVProcessingService:
         "Contact Phone 1", "Company Phone 1", "Contact Location", "Company Location",
         "Company Description", "Company Website Domain", "Company Industry",
         "Company LI Profile Url", "Company LinkedIn ID", "Company Revenue Range",
-        "Company Staff Count Range", "Time in Role", "Time at Company"
+        "Company Staff Count Range", "Time in Role", "Time at Company",
+        # Richer firmographics for ICP scoring.
+        "SIC Code", "NAICS Code", "Company Staff Count", "Company Annual Revenue",
+        "Company Founded Date", "Company Country", "Company State", "Company City",
     ]
 
     def process_csv_content(self, content: bytes, target_location: str, target_industry: str, target_size: str, campaign_id: str, db: Session):
@@ -126,17 +140,34 @@ class CSVProcessingService:
                     
                     # Company Normalization
                     if domain not in unique_cos:
+                        # Prefer a CLEAN location built from the structured parts; fall
+                        # back to the raw blob only when the parts are absent (no
+                        # redundant full-address storage — the parts are the source).
+                        def _val(key):
+                            v = row.get(key)
+                            return str(v).strip() if v is not None and str(v).strip() and str(v).strip().lower() != 'nan' else None
+                        city, state, country = _val('company_city'), _val('company_state'), _val('company_country')
+                        clean_loc = ", ".join([p for p in (city, state, country) if p]) or row.get('company_location')
                         unique_cos[domain] = {
                             "name": row.get('company_name_cleaned') or domain,
                             "domain": domain,
-                            "location": row.get('company_location'),
+                            "location": clean_loc,
                             "industry": row.get('company_industry'),
                             "size": row.get('company_staff_count_range'),
                             "description": row.get('company_description'),
                             "revenue": row.get('company_revenue_range'),
                             "linkedin": row.get('company_li_profile_url'),
                             "linkedin_id": row.get('company_linkedin_id'),
-                            "website": raw_domain
+                            "website": raw_domain,
+                            # Richer firmographics (None when absent).
+                            "sic_code": _val('company_sic_code'),
+                            "naics_code": _val('company_naics_code'),
+                            "staff_count": _val('company_staff_count'),
+                            "annual_revenue": _val('company_annual_revenue'),
+                            "founded_year": _val('company_founded_year'),
+                            "country": country,
+                            "state": state,
+                            "city": city,
                         }
                     
                     # Contact Clustering

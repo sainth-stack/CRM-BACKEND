@@ -44,18 +44,30 @@ def has_leads(db: Session, campaign_id: str) -> bool:
 
 
 def _company_row_fields(domain: str, co: dict) -> dict:
-    """Map a legacy unique_cos value -> CampaignLead company columns."""
+    """Map a unique_cos value -> CampaignLead company columns.
+
+    The raw `company_location` blob is intentionally NOT stored — the structured
+    country/state/city columns are the source of truth and the clean location string
+    is reconstructed from them in `load_unique_cos` (no redundant full-address blob)."""
     return {
         "domain": domain,
         "website_raw": co.get("website"),
         "company_name_cleaned": co.get("name"),
-        "company_location": co.get("location"),
         "company_industry": co.get("industry"),
         "company_staff_count_range": co.get("size"),
         "company_description": co.get("description"),
         "company_revenue_range": co.get("revenue"),
         "company_li_profile_url": co.get("linkedin"),
         "company_linkedin_id": co.get("linkedin_id"),
+        # Richer firmographics.
+        "company_sic_code": co.get("sic_code"),
+        "company_naics_code": co.get("naics_code"),
+        "company_staff_count": co.get("staff_count"),
+        "company_annual_revenue": co.get("annual_revenue"),
+        "company_founded_year": co.get("founded_year"),
+        "company_country": co.get("country"),
+        "company_state": co.get("state"),
+        "company_city": co.get("city"),
     }
 
 
@@ -140,10 +152,15 @@ def load_unique_cos(db: Session, campaign_id: str) -> dict:
     for r in q:
         if not r.domain or r.domain in unique_cos:
             continue
+        # Reconstruct a clean location from the structured parts; fall back to the
+        # legacy blob for old rows ingested before the firmographic columns existed.
+        clean_loc = ", ".join(
+            p for p in (r.company_city, r.company_state, r.company_country) if p
+        ) or r.company_location
         unique_cos[r.domain] = {
             "name": r.company_name_cleaned or r.domain,
             "domain": r.domain,
-            "location": r.company_location,
+            "location": clean_loc,
             "industry": r.company_industry,
             "size": r.company_staff_count_range,
             "description": r.company_description,
@@ -151,6 +168,15 @@ def load_unique_cos(db: Session, campaign_id: str) -> dict:
             "linkedin": r.company_li_profile_url,
             "linkedin_id": r.company_linkedin_id,
             "website": r.website_raw,
+            # Richer firmographics for ICP scoring.
+            "sic_code": r.company_sic_code,
+            "naics_code": r.company_naics_code,
+            "staff_count": r.company_staff_count,
+            "annual_revenue": r.company_annual_revenue,
+            "founded_year": r.company_founded_year,
+            "country": r.company_country,
+            "state": r.company_state,
+            "city": r.company_city,
         }
     return unique_cos
 

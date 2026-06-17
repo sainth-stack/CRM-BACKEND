@@ -207,7 +207,7 @@ class MicrosoftAuthService:
 
 class CalAuthService:
     @staticmethod
-    def get_authorization_url(user_id: str) -> str:
+    def get_authorization_url(user_id: str, email: str = None) -> str:
         """
         Generates a secure Cal.com OAuth2 portal URL for calendar synchronization.
         Implements CSRF protection via a secure state token.
@@ -224,13 +224,23 @@ class CalAuthService:
             logger.critical("[AUTH] Redis unreachable. Cal state verification suspended.")
             raise HTTPException(status_code=503, detail="Security infrastructure unreachable.")
 
+        # prompt=login is the OIDC-standard way to force the provider to re-show its
+        # login screen and ignore any cached browser session. Cal.com silently ignores
+        # the gentler prompt=select_account when its cookie is set, which caused users
+        # to be silently authorized as the wrong Cal.com account and rejected by our
+        # email-match check. login_hint prefills the email field so the user only has
+        # to enter their password — keeping the happy path one click away.
         config_params = {
             "client_id": CAL_CLIENT_ID,
             "redirect_uri": CAL_REDIRECT_URI,
             "response_type": "code",
             "scope": "BOOKING_READ BOOKING_WRITE PROFILE_READ EVENT_TYPE_READ SCHEDULE_READ",
-            "state": state
+            "state": state,
+            "prompt": "login",
         }
+
+        if email:
+            config_params["login_hint"] = email
         
         base_endpoint = "https://app.cal.com/auth/oauth2/authorize"
         return f"{base_endpoint}?{urlencode(config_params)}"

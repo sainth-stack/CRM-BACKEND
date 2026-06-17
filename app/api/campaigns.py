@@ -107,8 +107,8 @@ def create_campaign(
     if not sanitized_prompt:
         raise HTTPException(status_code=400, detail="Campaign prompt is required.")
 
-    if not file.filename.lower().endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
+    if not file.filename.lower().endswith((".csv", ".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only CSV or Excel (.xlsx, .xls) files are accepted.")
 
     # 0.2 URL Normalization + SSRF Protection
     raw_url = user_url.strip()
@@ -185,7 +185,20 @@ def create_campaign(
         # MAX_CSV_ROWS and stops — the whole file is never pulled into RAM (no
         # file.file.read(), no BytesIO copy). Bounds ingestion memory + latency.
         csv_svc = CSVProcessingService()
-        trimmed_content = csv_svc.trim_csv_from_filelike(file.file, max_rows=settings.MAX_CSV_ROWS)
+        # xlsx/xls inputs are converted to CSV bytes RIGHT HERE so every line of the
+        # downstream pipeline (trim -> parse -> persist) treats the upload as CSV with
+        # zero special-casing. Excel cannot be true-streamed so we read the first sheet
+        # of the workbook once (capped to MAX_CSV_ROWS) and hand the resulting CSV to
+        # the regular trim path as if the user had uploaded CSV in the first place.
+        upload_fh = file.file
+        if file.filename.lower().endswith((".xlsx", ".xls")):
+            import io, pandas as pd
+            engine = "openpyxl" if file.filename.lower().endswith(".xlsx") else None
+            upload_fh.seek(0)
+            df_xl = pd.read_excel(upload_fh, sheet_name=0, nrows=settings.MAX_CSV_ROWS, engine=engine)
+            upload_fh = io.BytesIO(df_xl.to_csv(index=False).encode("utf-8"))
+
+        trimmed_content = csv_svc.trim_csv_from_filelike(upload_fh, max_rows=settings.MAX_CSV_ROWS)
     except HTTPException:
         raise
     except Exception as e:

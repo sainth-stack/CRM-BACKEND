@@ -1241,7 +1241,7 @@ def get_cal_auth_url(current_user: models.User = Depends(get_current_user)):
     Returns the secure Cal.com authorization URL for redirecting the client.
     """
     from app.core.auth import CalAuthService
-    return {"url": CalAuthService.get_authorization_url(user_id=current_user.id)}
+    return {"url": CalAuthService.get_authorization_url(user_id=current_user.id, email=current_user.email)}
 
 
 @capability_router.post("/cal/callback")

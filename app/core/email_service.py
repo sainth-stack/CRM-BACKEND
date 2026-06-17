@@ -113,78 +113,102 @@ class EmailService:
             logger.error(f"Failed to load system mailbox credentials: {e}")
             raise Exception(f"Failed to load system mailbox credentials: {e}")
             
-        subject = "Your verification code"
+        subject = "Your FocalReach verification code"
+        # FocalReach brand: deep dark + cyan accent ("Reach" in cyan).
         body = f"""
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #f0f0f0; border-radius: 10px;">
-            <h2 style="color: #ed213a; text-align: center;">AI-PRIORI Authentication</h2>
-            <p>Your one-time verification code is:</p>
-            <div style="background-color: #f8f9fa; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; letter-spacing: 12px; color: #1e293b; border-radius: 8px; margin: 20px 0;">
+        <div style="font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 32px; border: 1px solid #e2e8f0; border-radius: 16px; background-color: #ffffff;">
+            <div style="text-align: center; margin-bottom: 28px;">
+                <h2 style="margin: 0; font-size: 22px; font-weight: 900; letter-spacing: -0.5px; color: #0A0E1A;">Focal<span style="color: #00f0ff;">Reach</span></h2>
+                <div style="margin-top: 4px; font-size: 10px; font-weight: 800; color: #94A3B8; letter-spacing: 3px; text-transform: uppercase;">AI Outreach</div>
+            </div>
+            <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0 0 16px;">Your one-time verification code is:</p>
+            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; padding: 22px; text-align: center; font-size: 32px; font-weight: bold; letter-spacing: 12px; color: #0A0E1A; border-radius: 12px; margin: 20px 0;">
                 {otp}
             </div>
-            <p style="color: #64748b; font-size: 14px;">This code expires in 10 minutes. If you didn't request it, you can safely ignore this email.</p>
-            <hr style="border: 0; border-top: 1px solid #f0f0f0; margin: 20px 0;">
-            <p style="color: #94a3b8; font-size: 12px; text-align: center;">AI-PRIORI</p>
+            <p style="color: #64748b; font-size: 13px; line-height: 1.6;">This code expires in 10 minutes. If you didn't request it, you can safely ignore this email.</p>
+            <hr style="border: 0; border-top: 1px solid #f1f5f9; margin: 24px 0 16px;">
+            <p style="color: #94a3b8; font-size: 11px; text-align: center; letter-spacing: 2px; text-transform: uppercase; margin: 0;">FocalReach</p>
         </div>
         """
         return self._send_via_gmail(to_email, subject, body, creds)
 
     def send_provisioning_email(self, to_email: str, role: str, setup_url: str, creds: Credentials):
-        """Send the welcome / account-setup email to a newly created admin or user."""
-        subject = f"Your AI-PRIORI {role.replace('_', ' ').title()} account is ready"
+        """Send the welcome / account-setup email to a newly created admin or user.
 
-        # Brand colors
-        COLOR_PRIMARY = "#FE1919"
-        COLOR_SECONDARY = "#0073B1"
-        COLOR_ACCENT = "#F8931F"
-        COLOR_DARK = "#111827"
-        
+        Styled to match the FocalReach in-app brand: deep brand-dark text on a clean
+        light card, with the signature "Reach" cyan accent (#00f0ff) on the wordmark
+        and the CTA glow. Inline styles + table-friendly markup so it renders well
+        across Gmail / Outlook / Apple Mail without dark-mode quirks.
+        """
+        role_label = role.replace("_", " ").title()
+        subject = f"Your FocalReach {role_label} account is ready"
+
+        # FocalReach brand palette
+        BRAND_DARK = "#0A0E1A"      # primary dark — wordmark, headings, CTA bg
+        BRAND_CYAN = "#00f0ff"      # signature accent (used on "Reach", CTA glow, divider)
+        BODY = "#475569"
+        MUTED = "#94A3B8"
+        CARD_BORDER = "#e2e8f0"
+        PAGE_BG = "#F8FAFC"
+
         body = f"""
-        <div style="font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 20px auto; padding: 40px; border: 1px solid #f1f5f9; border-radius: 24px; color: #1e293b; background-color: #ffffff; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
-            <div style="text-align: center; margin-bottom: 40px;">
-                <h1 style="color: {COLOR_PRIMARY}; margin: 0; font-size: 32px; font-weight: 900; letter-spacing: -1.5px; text-transform: uppercase;">AI-PRIORI</h1>
-                <div style="margin-top: 8px; text-align: center;">
-                    <span style="font-size: 10px; font-weight: 800; color: {COLOR_SECONDARY}; letter-spacing: 2px; text-transform: uppercase;">DATA</span>
-                    <span style="color: #cbd5e1; margin: 0 8px; font-size: 10px;">-</span>
-                    <span style="font-size: 10px; font-weight: 800; color: {COLOR_ACCENT}; letter-spacing: 2px; text-transform: uppercase;">INTELLIGENCE</span>
-                    <span style="color: #cbd5e1; margin: 0 8px; font-size: 10px;">-</span>
-                    <span style="font-size: 10px; font-weight: 800; color: {COLOR_PRIMARY}; letter-spacing: 2px; text-transform: uppercase;">AUTONOMY</span>
-                </div>
-            </div>
-            
-            <div style="border-left: 4px solid {COLOR_PRIMARY}; padding-left: 20px; margin-bottom: 30px;">
-                <h2 style="font-size: 20px; font-weight: 800; color: {COLOR_DARK}; margin: 0;">Account created</h2>
-                <p style="margin-top: 5px; color: #64748b; font-size: 14px;">Role: <strong>{role.replace('_', ' ').upper()}</strong></p>
-            </div>
-            
-            <p style="line-height: 1.6; color: #475569; font-size: 15px;">An <strong>AI-PRIORI</strong> account has been created for you. Set your password using the link below to get started.</p>
-            
-            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 20px; padding: 30px; margin: 35px 0;">
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr>
-                        <td>
-                            <span style="font-size: 10px; font-weight: 800; color: #94a3b8; text-transform: uppercase; letter-spacing: 1.5px; display: block; margin-bottom: 5px;">Account email</span>
-                            <span style="font-size: 16px; font-weight: 700; color: {COLOR_DARK};">{to_email}</span>
-                        </td>
-                    </tr>
-                </table>
+        <div style="background-color: {PAGE_BG}; padding: 32px 16px; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+          <div style="max-width: 600px; margin: 0 auto; padding: 40px; border: 1px solid {CARD_BORDER}; border-radius: 20px; color: #1e293b; background-color: #ffffff; box-shadow: 0 4px 6px -1px rgba(10, 14, 26, 0.06);">
+
+            <!-- Brand -->
+            <div style="text-align: center; margin-bottom: 36px;">
+              <h1 style="margin: 0; font-size: 30px; font-weight: 900; letter-spacing: -1px; color: {BRAND_DARK};">
+                Focal<span style="color: {BRAND_CYAN};">Reach</span>
+              </h1>
+              <div style="margin-top: 6px; font-size: 10px; font-weight: 800; color: {MUTED}; letter-spacing: 3px; text-transform: uppercase;">
+                AI Outreach
+              </div>
             </div>
 
-            <p style="line-height: 1.6; color: #475569; font-size: 14px; text-align: center;">To finish setting up your account, create your password.</p>
-            
-            <div style="text-align: center; margin-top: 35px;">
-                <a href="{setup_url}" style="background-color: {COLOR_DARK}; color: #ffffff; padding: 18px 40px; border-radius: 14px; text-decoration: none; font-weight: 800; font-size: 14px; text-transform: uppercase; letter-spacing: 2px; display: inline-block; box-shadow: 0 10px 15px -3px rgba(17, 24, 39, 0.2);">Setup Account & Login</a>
+            <!-- Headline -->
+            <div style="border-left: 4px solid {BRAND_CYAN}; padding-left: 20px; margin-bottom: 28px;">
+              <h2 style="font-size: 20px; font-weight: 800; color: {BRAND_DARK}; margin: 0;">Account created</h2>
+              <p style="margin: 6px 0 0; color: #64748b; font-size: 14px;">Role: <strong style="color: {BRAND_DARK};">{role_label.upper()}</strong></p>
             </div>
-            
-            <div style="margin-top: 50px; padding-top: 25px; border-top: 1px solid #f1f5f9; text-align: center;">
-                <p style="font-size: 11px; color: #94a3b8; line-height: 1.8; margin: 0;">
-                    <strong>Security notice:</strong> This setup link expires in 24 hours. <br>
-                    If you didn't expect this email, please ignore it.
-                </p>
-                <div style="margin-top: 15px; font-size: 10px; color: #cbd5e1; font-weight: 700; letter-spacing: 3px; text-transform: uppercase;">
-                    AI-PRIORI
-                </div>
+
+            <p style="line-height: 1.65; color: {BODY}; font-size: 15px; margin: 0 0 24px;">
+              A <strong style="color: {BRAND_DARK};">FocalReach</strong> account has been created for you. Set your password using the link below to get started.
+            </p>
+
+            <!-- Account email panel -->
+            <div style="background-color: #f8fafc; border: 1px solid {CARD_BORDER}; border-radius: 14px; padding: 22px 26px; margin: 28px 0;">
+              <table style="width: 100%; border-collapse: collapse;">
+                <tr>
+                  <td>
+                    <span style="font-size: 10px; font-weight: 800; color: {MUTED}; text-transform: uppercase; letter-spacing: 1.5px; display: block; margin-bottom: 6px;">Account email</span>
+                    <span style="font-size: 16px; font-weight: 700; color: {BRAND_DARK};">{to_email}</span>
+                  </td>
+                </tr>
+              </table>
             </div>
-        </div>
+
+            <p style="line-height: 1.6; color: {BODY}; font-size: 14px; text-align: center; margin: 0 0 8px;">
+              To finish setting up your account, create your password.
+            </p>
+
+            <!-- CTA: dark button, cyan glow -->
+            <div style="text-align: center; margin: 28px 0 8px;">
+              <a href="{setup_url}" style="background-color: {BRAND_DARK}; color: #ffffff; padding: 16px 40px; border-radius: 12px; text-decoration: none; font-weight: 800; font-size: 14px; text-transform: uppercase; letter-spacing: 2px; display: inline-block; box-shadow: 0 10px 24px -6px rgba(0, 240, 255, 0.45);">
+                Set Up &amp; Sign In
+              </a>
+            </div>
+
+            <!-- Footer -->
+            <div style="margin-top: 44px; padding-top: 22px; border-top: 1px solid #f1f5f9; text-align: center;">
+              <p style="font-size: 11px; color: {MUTED}; line-height: 1.8; margin: 0;">
+                <strong style="color: {BRAND_DARK};">Security notice:</strong> This setup link expires in 24 hours.<br>
+                If you didn't expect this email, you can safely ignore it.
+              </p>
+              <div style="margin-top: 14px; font-size: 10px; color: #cbd5e1; font-weight: 700; letter-spacing: 3px; text-transform: uppercase;">
+                FocalReach
+              </div>
+            </div>
+          </div>
         </div>
         """
         return self._send_via_gmail(to_email, subject, body, creds)

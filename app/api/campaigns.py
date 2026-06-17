@@ -75,10 +75,9 @@ def create_campaign(
     Creates a campaign only after the user-provided setup inputs pass validation.
     All inputs are sanitized to mitigate injection risks.
     """
-    # Only end users (not admins) can create campaigns.
-    user_role_str = str(current_user.role).lower().split('.')[-1]
-    if user_role_str != "user":
-        raise HTTPException(status_code=403, detail="Only end users can create campaigns.")
+    # Any authenticated role (user, admin, super_admin) may start a campaign — it is
+    # always owned by current_user.id (their own account / mailbox), so admins and
+    # super admins start campaigns under themselves, not on behalf of other users.
 
     # 0. Sanitize inputs.
     sanitized_name = sanitize_text(name, max_length=100)

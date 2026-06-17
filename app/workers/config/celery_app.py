@@ -137,6 +137,16 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,  # Re-queue if worker crashes mid-execution
     broker_connection_retry_on_startup=True,
 
+    # --- Idle Redis-command reduction (Upstash bills per command) ---
+    # Nothing in the app uses Celery remote control, inspect, task events, or Flower,
+    # so turn off the per-worker pidbox control mailbox + event emission. This removes
+    # the constant idle polling/publishing of those side-channels with ZERO effect on
+    # task execution (speed/throughput/latency are unchanged — only the admin/monitoring
+    # channels are dropped, which we don't use).
+    worker_enable_remote_control=False,
+    worker_send_task_events=False,
+    task_send_sent_event=False,
+
     # --- Memory guardrails (OOM defense in depth for heavy_research) ---
     # Heavy research tasks (Stage 3/4 website-crawl + LLM swarms) are the main RAM
     # drivers. These recycle the worker process *between tasks* before the box
@@ -215,7 +225,9 @@ celery_app.conf.beat_schedule = {
     # the 10-min stranded sweep, both of which could drop/smear sends).
     "dispatch-due-drafts": {
         "task": "app.workers.tasks.outbound_worker.dispatch_due_drafts_task",
-        "schedule": float(os.getenv("DISPATCH_POLL_SECONDS", "60")),
+        # 60 -> 120s: halves this poller's idle command churn; a scheduled send now
+        # waits at most ~2 min to go out (negligible for cold outreach).
+        "schedule": float(os.getenv("DISPATCH_POLL_SECONDS", "120")),
         "options": {"queue": "outbound_dispatch"},
     },
     "refresh-oauth-tokens-every-6-hours": {

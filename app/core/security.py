@@ -273,11 +273,23 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 def get_visibility_filter(db: Session, current_user: models.User):
-    """Return a query filter limiting a user to the campaign data they may see."""
-    if str(current_user.role).lower().split('.')[-1] == "super_admin":
-        raise HTTPException(status_code=403, detail="Super admins cannot access user-scoped operational data.")
-    elif str(current_user.role).lower().split('.')[-1] == "admin":
+    """Return a query filter limiting a user to the campaign data they may see.
+
+    Every role can now own and operate on its OWN campaigns (admins and super admins
+    can start/view/delete campaigns under their own account). Scope by role:
+      * super_admin -> ONLY their own campaigns (no access to other users'/admins' data).
+      * admin       -> campaigns of the users they created PLUS their own.
+      * user        -> their own campaigns.
+    """
+    from sqlalchemy import or_
+    role = str(current_user.role).lower().split('.')[-1]
+    if role == "super_admin":
+        return models.Campaign.user_id == current_user.id
+    if role == "admin":
         target_user_ids = db.query(models.User.id).filter(models.User.created_by_id == current_user.id)
-        return models.Campaign.user_id.in_(target_user_ids)
+        return or_(
+            models.Campaign.user_id.in_(target_user_ids),
+            models.Campaign.user_id == current_user.id,
+        )
     return models.Campaign.user_id == current_user.id
 

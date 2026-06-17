@@ -844,6 +844,127 @@ def provision_user(
         "email_dispatched": email_sent
     }
 
+# --- Unified provision endpoint (single form for the admin panel) -------------- #
+# Replaces the parallel /sovereign/admins + /management/users flows for the new
+# admin-panel "User Roles" form. The form sends one request that carries:
+#   email + system_role (user|admin|super_admin) + tenant_id + organization_id.
+# We do NOT touch the old endpoints (the legacy management page may still use them).
+class UnifiedProvisionRequest(BaseModel):
+    email: str
+    system_role: str = "user"        # "user" | "admin" | "super_admin"
+    tenant_id: str
+    organization_id: str
+    user_limit: int = 5              # only honored when minting an admin
+
+
+@router.post("/management/provision")
+@limiter.limit("5/minute")
+def provision_member(
+    request: Request,
+    payload: UnifiedProvisionRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Provision a User / Admin / Super Admin from the unified admin form.
+
+    Authorization rules (match the legacy provision_admin + provision_user guards):
+      * Only super_admin may mint a super_admin or admin.
+      * Admin may mint a user (still bound by their `user_limit`).
+      * Plain users may not mint anyone.
+    Org/tenant are required; the org must belong to the chosen tenant. Sends the
+    same one-time onboarding email as the legacy flows.
+    """
+    # 1. Authorize the caller against the requested role.
+    try:
+        requested_role = models.UserRole(payload.system_role)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Unknown role '{payload.system_role}'.")
+
+    if current_user.role == models.UserRole.USER:
+        raise HTTPException(status_code=403, detail="Administrator privileges required.")
+    if requested_role in (models.UserRole.SUPER_ADMIN, models.UserRole.ADMIN) \
+            and current_user.role != models.UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Only a Super Admin may mint admins or super admins.")
+
+    # 2. Verify tenant + org consistency.
+    tenant = db.query(models.Tenant).filter(models.Tenant.id == payload.tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=400, detail="Referenced tenant does not exist.")
+    org = db.query(models.Organization).filter(models.Organization.id == payload.organization_id).first()
+    if not org:
+        raise HTTPException(status_code=400, detail="Referenced organization does not exist.")
+    if org.tenant_id != tenant.id:
+        raise HTTPException(status_code=400, detail="Organization does not belong to the chosen tenant.")
+
+    # 3. Enforce admin's per-seat quota when minting an end user.
+    if current_user.role == models.UserRole.ADMIN and requested_role == models.UserRole.USER:
+        fresh_admin = _lock_query(
+            db.query(models.User).filter(models.User.id == current_user.id)
+        ).first()
+        if not fresh_admin:
+            raise HTTPException(status_code=401, detail="Administrator identity invalid.")
+        user_count = db.query(models.User).filter(models.User.created_by_id == current_user.id).count()
+        if user_count >= fresh_admin.user_limit:
+            raise HTTPException(
+                status_code=400,
+                detail=f"User limit reached ({fresh_admin.user_limit}). Contact your super admin to raise it.",
+            )
+
+    # 4. Uniqueness guard on email.
+    if db.query(models.User).filter(models.User.email == payload.email).first():
+        raise HTTPException(status_code=400, detail="An account with this email already exists.")
+
+    # 5. Create the user.
+    new_user = models.User(
+        email=payload.email,
+        role=requested_role,
+        tenant_id=tenant.id,
+        organization_id=org.id,
+        created_by_id=current_user.id,
+        signup_source="manual",
+        user_limit=payload.user_limit if requested_role == models.UserRole.ADMIN else None,
+    )
+    db.add(new_user)
+    db.flush()
+
+    db.add(models.AdministrativeLog(
+        actor_id=current_user.id,
+        target_id=new_user.id,
+        action="PROVISION",
+        details=(f"Provisioned {requested_role.value} {new_user.email} "
+                 f"in tenant={tenant.name} org={org.name}"),
+    ))
+    db.commit()
+
+    # 6. Send the one-time onboarding email (best-effort; account creation is the
+    # priority, a failed email is non-fatal — same pattern as the legacy flows).
+    email_sent = False
+    try:
+        setup_token = create_access_token(
+            data={"sub": new_user.id, "purpose": "account_onboarding"},
+            expires_delta=timedelta(hours=24),
+        )
+        setup_url = f"{FRONTEND_URL}/setup-password?token={setup_token}"
+        creds = TokenService.get_google_credentials(db, current_user.id)
+        if creds:
+            email_service.send_provisioning_email(
+                to_email=new_user.email,
+                role=requested_role.value.replace("_", " ").title(),
+                setup_url=setup_url,
+                creds=creds,
+            )
+            email_sent = True
+            logger.info(f"[PROVISION] Onboarding email sent to {requested_role.value} {new_user.email}")
+    except Exception as e:
+        logger.error(f"[PROVISION] Onboarding email failed for {new_user.email}: {e}")
+
+    return {
+        "message": f"{requested_role.value.replace('_', ' ').title()} account created.",
+        "email_dispatched": email_sent,
+        "user_id": new_user.id,
+    }
+
+
 @router.post("/management/resend-activation/{user_id}")
 @limiter.limit("5/minute")
 def resend_activation(

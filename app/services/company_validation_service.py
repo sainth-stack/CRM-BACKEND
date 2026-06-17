@@ -198,10 +198,8 @@ USER-SPECIFIED REQUIREMENTS (may contain one or more values each):
 - Target locations: {target_loc}
 - Target employee size: {target_size}
 
-CSV FIRMOGRAPHIC FIELDS (the ONLY source for PART A):
-- Industry: {csv_industry}
-- Location: {csv_loc}
-- Employee size: {csv_size}
+The CSV FIRMOGRAPHIC FIELDS (the ONLY source for PART A) are given in the TARGET RECORD at the END of this
+prompt — judge industry_match against the "Industry" line there (ignore the research profile for PART A).
 
 For each, return verdict (pass | fail | unknown) + one-sentence evidence (cite the CSV field):
 1. industry_match (compare the CSV Industry to the target industries): the question is ONLY "does the CSV
@@ -250,10 +248,9 @@ buyer profile — not for companies that simply did not advertise a weakness.
 
 CAMPAIGN OBJECTIVE (the user's own words — the target should help satisfy this): {campaign_prompt}
 
-TARGET COMPANY:
-- Name: {name}
-- RESEARCH PROFILE (distilled from the company's own website — treat this as THE evidence; quote from it):
-\"\"\"{profile}\"\"\"
+The TARGET COMPANY name and its RESEARCH PROFILE (distilled from the company's own website) are given in
+the TARGET RECORD at the END of this prompt. Treat that RESEARCH PROFILE as THE evidence — quote from it
+for every field below.
 
 First, from the SENDER PROFILE ONLY, define:
   (i)   BUYER PROFILE — a genuine end-user customer of this sender;
@@ -324,7 +321,18 @@ whether a pain is 'evidenced' or remark on the absence of stated problems. Do NO
 accept/reject, do NOT recommend whether to pursue, and do NOT hedge ('may not be a fit', 'needs
 exploration') — qualification is decided
 separately. Write it for a human sales reader — NO scores, field names, booleans, verdict labels, or
-bracketed metadata. Then confidence (0-100)."""
+bracketed metadata. Then confidence (0-100).
+
+==================== TARGET RECORD (the ONLY per-company inputs) ====================
+CSV FIRMOGRAPHIC FIELDS (for PART A):
+- Industry: {csv_industry}
+- Location: {csv_loc}
+- Employee size: {csv_size}
+
+TARGET COMPANY:
+- Name: {name}
+- RESEARCH PROFILE (THE evidence — quote from it):
+\"\"\"{profile}\"\"\""""
 )
 
 

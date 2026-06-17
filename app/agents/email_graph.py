@@ -88,8 +88,8 @@ class DraftState(TypedDict, total=False):
 _COMPOSE_PROMPT = ChatPromptTemplate.from_template(
     """You are an elite B2B outreach strategist AND ghostwriter. In ONE pass you will (A) PLAN a cold email
 using the MEDDPICC framework, then (B) WRITE it. Fill the plan fields first, then the subject and body —
-the email MUST be grounded in your own plan and in the data below. Everything must be a REAL fact from the
-data; never invent.
+the email MUST be grounded in your own plan and in the RECIPIENT & TARGET data given at the END. Everything
+must be a REAL fact from that data; never invent.
 
 SENDER:
 - Company: {sender_name} | Sender name (sign-off): {user_name}
@@ -98,6 +98,39 @@ SENDER:
 - Proof points / outcomes: {sender_proof}
 - Differentiators: {sender_advantages}
 
+CAMPAIGN OBJECTIVE (the email must serve it): {objective}
+
+PART A — PLAN with MEDDPICC (fill the plan fields), using the RECIPIENT & TARGET data at the end:
+1. IDENTIFY PAIN -> pick the most specific, credible hook (a REAL fact from the intelligence, never generic)
+   and the pain it implies that THIS sender solves.
+2. CAPABILITY + DECISION CRITERIA -> the exact sender capability that bridges to it, leaning on the
+   differentiator most relevant to their likely decision criteria.
+3. METRICS -> one credible value_proof (a sender proof point or a value pattern). If no real number exists,
+   frame it as a general pattern — NEVER invent a company-specific metric.
+4. ECONOMIC BUYER vs CHAMPION -> compare THIS recipient's title/role to the likely economic buyer and
+   champion, and set recipient_play + the ask altitude accordingly.
+
+PART B — WRITE the email from your plan, obeying every RULE:
+- Structure: open with a greeting line — the word "Hi " then the recipient's first name (given below) then
+  a comma (e.g. "Hi Sarah,") — on its own line, a blank line, then EXACTLY 3 short paragraphs — (1) the
+  hook anchored in their reality + the pain it implies, (2) the bridge to {sender_name}'s capability
+  reinforced by the value proof, (3) the single ask exactly as planned.
+- 110-160 words. Senior, direct, insight-led. Zero marketing fluff, zero clichés ("hope this finds you well").
+- GROUNDING: state only facts present in the data/plan. Do NOT invent metrics, momentum, or superlatives.
+  A general-pattern value proof must be phrased as one ("teams like yours typically…"), never as a claim
+  about THIS company's numbers.
+- ABSOLUTELY NO PLACEHOLDERS or bracketed/curly tokens of ANY kind (no [Name], [Company], {{metric}}, <X>).
+  Every value must be a real, spelled-out fact. If you lack a detail, omit it — never bracket it.
+- Do NOT expose framework jargon (MEDDPICC, "economic buyer", "champion") in the email text.
+- LINE BREAKS: each paragraph is ONE continuous line with NO hard breaks inside it; separate the greeting
+  and the 3 paragraphs with a single blank line only.
+- Sign off EXACTLY, blank line after 'Best regards,' and a single line break between name and company:
+  "Best regards,
+
+  {user_name}
+  {sender_name}"
+
+================= THE RECIPIENT & TARGET (the only per-email inputs) =================
 PROSPECT (the recipient):
 - First name: {prospect_first_name} | Title: {prospect_role} | Seniority: {prospect_seniority}
 - Company: {target_company}
@@ -119,38 +152,7 @@ MEDDPICC READ (from qualification — hypotheses, NOT confirmed facts):
 - Likely champion (role): {champion}
 - Likely decision criteria: {decision_criteria}
 
-CAMPAIGN OBJECTIVE (the email must serve it): {objective}
-
-{refine_block}
-
-PART A — PLAN with MEDDPICC (fill the plan fields):
-1. IDENTIFY PAIN -> pick the most specific, credible hook (a REAL fact from the intelligence, never generic)
-   and the pain it implies that THIS sender solves.
-2. CAPABILITY + DECISION CRITERIA -> the exact sender capability that bridges to it, leaning on the
-   differentiator most relevant to their likely decision criteria.
-3. METRICS -> one credible value_proof (a sender proof point or a value pattern). If no real number exists,
-   frame it as a general pattern — NEVER invent a company-specific metric.
-4. ECONOMIC BUYER vs CHAMPION -> compare THIS recipient's title/role to the likely economic buyer and
-   champion, and set recipient_play + the ask altitude accordingly.
-
-PART B — WRITE the email from your plan, obeying every RULE:
-- Structure: open with "Hi {prospect_first_name}," on its own line, a blank line, then EXACTLY 3 short
-  paragraphs — (1) the hook anchored in their reality + the pain it implies, (2) the bridge to
-  {sender_name}'s capability reinforced by the value proof, (3) the single ask exactly as planned.
-- 110-160 words. Senior, direct, insight-led. Zero marketing fluff, zero clichés ("hope this finds you well").
-- GROUNDING: state only facts present in the data/plan. Do NOT invent metrics, momentum, or superlatives.
-  A general-pattern value proof must be phrased as one ("teams like yours typically…"), never as a claim
-  about THIS company's numbers.
-- ABSOLUTELY NO PLACEHOLDERS or bracketed/curly tokens of ANY kind (no [Name], [Company], {{metric}}, <X>).
-  Every value must be a real, spelled-out fact. If you lack a detail, omit it — never bracket it.
-- Do NOT expose framework jargon (MEDDPICC, "economic buyer", "champion") in the email text.
-- LINE BREAKS: each paragraph is ONE continuous line with NO hard breaks inside it; separate the greeting
-  and the 3 paragraphs with a single blank line only.
-- Sign off EXACTLY, blank line after 'Best regards,' and a single line break between name and company:
-  "Best regards,
-
-  {user_name}
-  {sender_name}\""""
+{refine_block}"""
 )
 
 

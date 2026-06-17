@@ -146,11 +146,11 @@ seniority ranking, and never the same number for everyone.
 SENDER'S IDEAL BUYER PROFILES: {target_profiles}
 PAINS THE SENDER SOLVES: {pains_solved}
 CAMPAIGN OBJECTIVE (the user's goal): {objective}
-TARGET COMPANY INDUSTRY: {industry}
-TARGET COMPANY RESEARCH: {research_context}
+(The per-company TARGET COMPANY INDUSTRY, RESEARCH, and CONTACTS are provided at the
+very END, after these instructions — they are the only inputs that change per company.)
 
 STEP 1 — Define the BUYING COMMITTEE for THIS deal. From the CAMPAIGN OBJECTIVE and the TARGET COMPANY
-INDUSTRY, work out which functions/departments own the budget, the decision, and the internal-champion
+INDUSTRY (shown below), work out which functions/departments own the budget, the decision, and the internal-champion
 role for THIS specific solution in THIS specific industry. The right functions CHANGE with the objective
 and the industry — derive them, do not assume a fixed list. Examples (illustrative, not exhaustive):
   • predictive-maintenance / industrial-data offering to a MANUFACTURER -> Operations, Plant,
@@ -196,6 +196,10 @@ seniority, or tenure should get visibly different scores.
         would be the head of operations or plant management."
        "Junior maintenance engineer — useful internal champion to validate technical fit, but not the
         decision-maker."
+
+================= THIS TARGET COMPANY (the only per-company inputs) =================
+TARGET COMPANY INDUSTRY: {industry}
+TARGET COMPANY RESEARCH: {research_context}
 
 CONTACTS (score EVERY index):
 {contacts_block}

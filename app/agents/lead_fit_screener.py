@@ -658,19 +658,18 @@ class LeadFitScreener:
             parsed: IndustryScreenVerdict = raw_output["parsed"]
             ai_msg = raw_output.get("raw")
 
-            # Read token usage from the AIMessage — this is the only path that
-            # exposes prompt_tokens_details.cached_tokens through LangChain.
+            # Read token usage from the raw AIMessage response_metadata.
+            # usage_metadata only has input/output totals; cached_tokens lives in
+            # response_metadata["token_usage"]["prompt_tokens_details"]["cached_tokens"].
             tok = dict(_empty_tok)
             if ai_msg is not None:
-                usage = getattr(ai_msg, "usage_metadata", None) or {}
-                if isinstance(usage, dict):
-                    tok["input_tokens"]  = usage.get("input_tokens", 0) or 0
-                    tok["output_tokens"] = usage.get("output_tokens", 0) or 0
-                    details = usage.get("input_token_details") or {}
-                    tok["cached_tokens"] = (
-                        details.get("cached", 0) if isinstance(details, dict)
-                        else getattr(details, "cached", 0)
-                    ) or 0
+                usage_meta = getattr(ai_msg, "usage_metadata", None) or {}
+                tok["input_tokens"]  = usage_meta.get("input_tokens", 0) or 0
+                tok["output_tokens"] = usage_meta.get("output_tokens", 0) or 0
+                rm = getattr(ai_msg, "response_metadata", None) or {}
+                token_usage = rm.get("token_usage") or {}
+                details = token_usage.get("prompt_tokens_details") or {}
+                tok["cached_tokens"] = details.get("cached_tokens", 0) or 0
 
             check = CheckResult(
                 verdict=parsed.verdict,

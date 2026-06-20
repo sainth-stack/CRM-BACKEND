@@ -28,64 +28,215 @@ STAGGER_MINUTES = 3
 # Public API
 # ---------------------------------------------------------------------------
 
-# Single-timezone countries -> IANA tz. Country-level is EXACT for these (one zone),
-# so it is a correct, instant answer with no geocoding. (Multi-tz countries like the
-# US/CA/AU are handled by the state map below; anything unmatched falls to geopy.)
+# ---------------------------------------------------------------------------
+# Offline timezone maps — no network, no rate-limiting.
+# Single-timezone countries resolve here instantly and exactly.
+# Multi-timezone countries (US / CA / AU) are handled by their state/province
+# maps below; a bare country name with no state stays None → geopy.
+# ---------------------------------------------------------------------------
+
 _COUNTRY_TZ = {
-    "united kingdom": "Europe/London", "uk": "Europe/London", "england": "Europe/London",
-    "scotland": "Europe/London", "wales": "Europe/London", "northern ireland": "Europe/London",
-    "ireland": "Europe/Dublin", "france": "Europe/Paris", "germany": "Europe/Berlin",
-    "spain": "Europe/Madrid", "italy": "Europe/Rome", "netherlands": "Europe/Amsterdam",
-    "belgium": "Europe/Brussels", "switzerland": "Europe/Zurich", "austria": "Europe/Vienna",
-    "sweden": "Europe/Stockholm", "norway": "Europe/Oslo", "denmark": "Europe/Copenhagen",
-    "finland": "Europe/Helsinki", "poland": "Europe/Warsaw", "portugal": "Europe/Lisbon",
-    "czechia": "Europe/Prague", "czech republic": "Europe/Prague", "ireland": "Europe/Dublin",
-    "india": "Asia/Kolkata", "singapore": "Asia/Singapore", "japan": "Asia/Tokyo",
-    "south korea": "Asia/Seoul", "china": "Asia/Shanghai", "hong kong": "Asia/Hong_Kong",
-    "uae": "Asia/Dubai", "united arab emirates": "Asia/Dubai", "israel": "Asia/Jerusalem",
-    "new zealand": "Pacific/Auckland",
+    # ── Europe ───────────────────────────────────────────────────────────────
+    "united kingdom": "Europe/London", "uk": "Europe/London",
+    "england": "Europe/London", "scotland": "Europe/London",
+    "wales": "Europe/London", "northern ireland": "Europe/London",
+    "ireland": "Europe/Dublin", "republic of ireland": "Europe/Dublin",
+    "france": "Europe/Paris", "germany": "Europe/Berlin",
+    "spain": "Europe/Madrid", "italy": "Europe/Rome",
+    "netherlands": "Europe/Amsterdam", "holland": "Europe/Amsterdam",
+    "belgium": "Europe/Brussels", "switzerland": "Europe/Zurich",
+    "austria": "Europe/Vienna", "sweden": "Europe/Stockholm",
+    "norway": "Europe/Oslo", "denmark": "Europe/Copenhagen",
+    "finland": "Europe/Helsinki", "poland": "Europe/Warsaw",
+    "portugal": "Europe/Lisbon", "czechia": "Europe/Prague",
+    "czech republic": "Europe/Prague", "slovakia": "Europe/Bratislava",
+    "hungary": "Europe/Budapest", "romania": "Europe/Bucharest",
+    "bulgaria": "Europe/Sofia", "greece": "Europe/Athens",
+    "croatia": "Europe/Zagreb", "slovenia": "Europe/Ljubljana",
+    "serbia": "Europe/Belgrade", "bosnia": "Europe/Sarajevo",
+    "bosnia and herzegovina": "Europe/Sarajevo",
+    "montenegro": "Europe/Podgorica", "albania": "Europe/Tirane",
+    "north macedonia": "Europe/Skopje", "macedonia": "Europe/Skopje",
+    "moldova": "Europe/Chisinau", "ukraine": "Europe/Kiev",
+    "belarus": "Europe/Minsk", "lithuania": "Europe/Vilnius",
+    "latvia": "Europe/Riga", "estonia": "Europe/Tallinn",
+    "luxembourg": "Europe/Luxembourg", "iceland": "Atlantic/Reykjavik",
+    "malta": "Europe/Malta", "cyprus": "Asia/Nicosia",
+    "turkey": "Europe/Istanbul", "turkiye": "Europe/Istanbul",
+    # ── Middle East ──────────────────────────────────────────────────────────
+    "uae": "Asia/Dubai", "united arab emirates": "Asia/Dubai",
+    "saudi arabia": "Asia/Riyadh", "ksa": "Asia/Riyadh",
+    "israel": "Asia/Jerusalem", "iraq": "Asia/Baghdad",
+    "jordan": "Asia/Amman", "lebanon": "Asia/Beirut",
+    "kuwait": "Asia/Kuwait", "bahrain": "Asia/Bahrain",
+    "qatar": "Asia/Qatar", "oman": "Asia/Muscat",
+    "yemen": "Asia/Aden", "iran": "Asia/Tehran",
+    "syria": "Asia/Damascus",
+    # ── Asia ─────────────────────────────────────────────────────────────────
+    "india": "Asia/Kolkata", "singapore": "Asia/Singapore",
+    "japan": "Asia/Tokyo", "south korea": "Asia/Seoul", "korea": "Asia/Seoul",
+    "china": "Asia/Shanghai", "hong kong": "Asia/Hong_Kong",
+    "taiwan": "Asia/Taipei", "thailand": "Asia/Bangkok",
+    "vietnam": "Asia/Ho_Chi_Minh", "viet nam": "Asia/Ho_Chi_Minh",
+    "malaysia": "Asia/Kuala_Lumpur", "philippines": "Asia/Manila",
+    "myanmar": "Asia/Rangoon", "burma": "Asia/Rangoon",
+    "cambodia": "Asia/Phnom_Penh", "laos": "Asia/Vientiane",
+    "nepal": "Asia/Kathmandu", "sri lanka": "Asia/Colombo",
+    "bangladesh": "Asia/Dhaka", "pakistan": "Asia/Karachi",
+    "afghanistan": "Asia/Kabul", "mongolia": "Asia/Ulaanbaatar",
+    "uzbekistan": "Asia/Tashkent", "tajikistan": "Asia/Dushanbe",
+    "turkmenistan": "Asia/Ashgabat", "kyrgyzstan": "Asia/Bishkek",
+    "armenia": "Asia/Yerevan", "azerbaijan": "Asia/Baku",
+    # "georgia" intentionally absent — ambiguous with the US state.
+    # Resolved by city-level disambiguation in _offline_tz_from_location.
+    # ── Africa ───────────────────────────────────────────────────────────────
+    "south africa": "Africa/Johannesburg",
+    "nigeria": "Africa/Lagos", "ghana": "Africa/Accra",
+    "kenya": "Africa/Nairobi", "ethiopia": "Africa/Addis_Ababa",
+    "tanzania": "Africa/Dar_es_Salaam", "uganda": "Africa/Kampala",
+    "rwanda": "Africa/Kigali", "egypt": "Africa/Cairo",
+    "morocco": "Africa/Casablanca", "algeria": "Africa/Algiers",
+    "tunisia": "Africa/Tunis", "libya": "Africa/Tripoli",
+    "sudan": "Africa/Khartoum", "senegal": "Africa/Dakar",
+    "ivory coast": "Africa/Abidjan", "cote d ivoire": "Africa/Abidjan",
+    "cameroon": "Africa/Douala", "angola": "Africa/Luanda",
+    "mozambique": "Africa/Maputo", "zambia": "Africa/Lusaka",
+    "zimbabwe": "Africa/Harare", "mali": "Africa/Bamako",
+    "namibia": "Africa/Windhoek",
+    # ── Americas (single-timezone) ───────────────────────────────────────────
+    "argentina": "America/Argentina/Buenos_Aires",
+    "colombia": "America/Bogota", "peru": "America/Lima",
+    "venezuela": "America/Caracas", "ecuador": "America/Guayaquil",
+    "bolivia": "America/La_Paz", "uruguay": "America/Montevideo",
+    "paraguay": "America/Asuncion", "panama": "America/Panama",
+    "costa rica": "America/Costa_Rica", "guatemala": "America/Guatemala",
+    "el salvador": "America/El_Salvador", "honduras": "America/Tegucigalpa",
+    "nicaragua": "America/Managua", "cuba": "America/Havana",
+    "jamaica": "America/Jamaica",
+    "trinidad": "America/Port_of_Spain", "trinidad and tobago": "America/Port_of_Spain",
+    "barbados": "America/Barbados", "guyana": "America/Guyana",
+    "suriname": "America/Paramaribo", "haiti": "America/Port-au-Prince",
+    "dominican republic": "America/Santo_Domingo",
+    "puerto rico": "America/Puerto_Rico",
+    # Brazil spans 4 zones; São Paulo / BRT covers ~95 % of B2B contacts.
+    # A bare "Brazil" resolves here; city-level strings fall to geopy for precision.
+    "brazil": "America/Sao_Paulo", "brasil": "America/Sao_Paulo",
+    # Chile has a single mainland zone (Easter Island is tiny/irrelevant for B2B).
+    "chile": "America/Santiago",
+    # Mexico spans 4 zones but Central time covers Mexico City + most business.
+    # State-level strings in mx_city_tz fall to geopy for precision.
+    "mexico": "America/Mexico_City",
+    # ── Oceania ──────────────────────────────────────────────────────────────
+    "new zealand": "Pacific/Auckland", "fiji": "Pacific/Fiji",
+    "papua new guinea": "Pacific/Port_Moresby",
+    # Australia is multi-zone — handled by _AU_STATE_TZ below.
+    # Canada is multi-zone — handled by _CA_PROVINCE_TZ below.
 }
-# US state -> tz (dominant zone; the few split states use their majority zone — accurate
-# enough for choosing business-hours send windows).
+
+# US state → tz (dominant zone; split-state edge cases use their majority zone).
 _US_STATE_TZ = {
     "california": "America/Los_Angeles", "washington": "America/Los_Angeles",
     "oregon": "America/Los_Angeles", "nevada": "America/Los_Angeles",
-    "arizona": "America/Phoenix", "utah": "America/Denver", "colorado": "America/Denver",
-    "new mexico": "America/Denver", "montana": "America/Denver", "wyoming": "America/Denver",
-    "idaho": "America/Denver",
-    "texas": "America/Chicago", "illinois": "America/Chicago", "minnesota": "America/Chicago",
-    "wisconsin": "America/Chicago", "iowa": "America/Chicago", "missouri": "America/Chicago",
-    "arkansas": "America/Chicago", "louisiana": "America/Chicago", "oklahoma": "America/Chicago",
-    "kansas": "America/Chicago", "nebraska": "America/Chicago", "mississippi": "America/Chicago",
-    "alabama": "America/Chicago", "tennessee": "America/Chicago", "north dakota": "America/Chicago",
-    "south dakota": "America/Chicago",
-    "new york": "America/New_York", "new jersey": "America/New_York", "pennsylvania": "America/New_York",
-    "massachusetts": "America/New_York", "connecticut": "America/New_York", "rhode island": "America/New_York",
-    "vermont": "America/New_York", "new hampshire": "America/New_York", "maine": "America/New_York",
-    "ohio": "America/New_York", "michigan": "America/New_York", "indiana": "America/New_York",
-    "kentucky": "America/New_York", "virginia": "America/New_York", "west virginia": "America/New_York",
-    "north carolina": "America/New_York", "south carolina": "America/New_York", "georgia": "America/New_York",
-    "florida": "America/New_York", "maryland": "America/New_York", "delaware": "America/New_York",
-    "district of columbia": "America/New_York",
+    "arizona": "America/Phoenix",
+    "utah": "America/Denver", "colorado": "America/Denver",
+    "new mexico": "America/Denver", "montana": "America/Denver",
+    "wyoming": "America/Denver", "idaho": "America/Denver",
+    "texas": "America/Chicago", "illinois": "America/Chicago",
+    "minnesota": "America/Chicago", "wisconsin": "America/Chicago",
+    "iowa": "America/Chicago", "missouri": "America/Chicago",
+    "arkansas": "America/Chicago", "louisiana": "America/Chicago",
+    "oklahoma": "America/Chicago", "kansas": "America/Chicago",
+    "nebraska": "America/Chicago", "mississippi": "America/Chicago",
+    "alabama": "America/Chicago", "tennessee": "America/Chicago",
+    "north dakota": "America/Chicago", "south dakota": "America/Chicago",
+    "new york": "America/New_York", "new jersey": "America/New_York",
+    "pennsylvania": "America/New_York", "massachusetts": "America/New_York",
+    "connecticut": "America/New_York", "rhode island": "America/New_York",
+    "vermont": "America/New_York", "new hampshire": "America/New_York",
+    "maine": "America/New_York", "ohio": "America/New_York",
+    "michigan": "America/New_York", "indiana": "America/New_York",
+    "kentucky": "America/New_York", "virginia": "America/New_York",
+    "west virginia": "America/New_York", "north carolina": "America/New_York",
+    "south carolina": "America/New_York", "georgia": "America/New_York",
+    "florida": "America/New_York", "maryland": "America/New_York",
+    "delaware": "America/New_York", "district of columbia": "America/New_York",
     "alaska": "America/Anchorage", "hawaii": "Pacific/Honolulu",
+}
+
+# Canadian province → tz
+_CA_PROVINCE_TZ = {
+    "british columbia": "America/Vancouver", "bc": "America/Vancouver",
+    "alberta": "America/Edmonton", "ab": "America/Edmonton",
+    "saskatchewan": "America/Regina", "sk": "America/Regina",
+    "manitoba": "America/Winnipeg", "mb": "America/Winnipeg",
+    "ontario": "America/Toronto", "on": "America/Toronto",
+    "quebec": "America/Toronto", "qc": "America/Toronto",
+    "new brunswick": "America/Moncton", "nb": "America/Moncton",
+    "nova scotia": "America/Halifax", "ns": "America/Halifax",
+    "prince edward island": "America/Halifax", "pei": "America/Halifax",
+    "newfoundland": "America/St_Johns", "nl": "America/St_Johns",
+}
+
+# Australian state → tz
+_AU_STATE_TZ = {
+    "new south wales": "Australia/Sydney", "nsw": "Australia/Sydney",
+    "victoria": "Australia/Melbourne", "vic": "Australia/Melbourne",
+    "queensland": "Australia/Brisbane", "qld": "Australia/Brisbane",
+    "south australia": "Australia/Adelaide", "sa": "Australia/Adelaide",
+    "western australia": "Australia/Perth", "wa": "Australia/Perth",
+    "tasmania": "Australia/Hobart", "tas": "Australia/Hobart",
+    "northern territory": "Australia/Darwin", "nt": "Australia/Darwin",
+    "australian capital territory": "Australia/Sydney", "act": "Australia/Sydney",
 }
 
 
 def _offline_tz_from_location(location: str) -> str | None:
     """Resolve an IANA timezone from a location string WITHOUT any network call.
 
-    Handles the overwhelmingly common cases — a single-timezone country, or a US state
-    — instantly and exactly. Returns None when it cannot place the string confidently,
-    so the caller falls through to the (rate-limited) geopy ladder for the rare rest."""
+    Checks multi-zone countries (US / CA / AU) against their state/province maps
+    first, then falls through to the single-timezone country map. Returns None only
+    when the string cannot be placed confidently so the caller can try geopy."""
     if not location:
         return None
     t = " " + re.sub(r"\s+", " ", re.sub(r"[^a-z ]", " ", location.lower())) + " "
-    # US first: a recognizable state pins the zone (a bare "United States" with no state
-    # stays None -> geopy, since the US spans 4+ zones).
+
+    # US: check DC explicitly BEFORE the generic state loop — "washington" in
+    # _US_STATE_TZ maps to America/Los_Angeles (WA state), which is wrong for DC.
     if " united states " in t or " usa " in t or " u s a " in t:
+        if " washington dc " in t or " district of columbia " in t:
+            return "America/New_York"
         for state, tz in _US_STATE_TZ.items():
             if f" {state} " in t:
                 return tz
+        return None
+
+    # Canada: province match pins the zone; bare "Canada" stays None → geopy.
+    if " canada " in t or " canadian " in t:
+        for province, tz in _CA_PROVINCE_TZ.items():
+            if f" {province} " in t:
+                return tz
+        return None
+
+    # Australia: state match pins the zone; bare "Australia" stays None → geopy.
+    if " australia " in t or " australian " in t:
+        for state, tz in _AU_STATE_TZ.items():
+            if f" {state} " in t:
+                return tz
+        return None
+
+    # Georgia: "Georgia" is both a Caucasus country and a US state, so it cannot
+    # be resolved by name alone. Disambiguate by city: known Georgian cities →
+    # country; known GA cities → US state; anything else → geopy.
+    if " georgia " in t:
+        _GEO_COUNTRY_CITIES = {" tbilisi ", " batumi ", " kutaisi ", " rustavi ", " gori "}
+        _GA_US_CITIES = {" atlanta ", " savannah ", " augusta ", " macon ", " athens ", " columbus "}
+        if any(c in t for c in _GEO_COUNTRY_CITIES):
+            return "Asia/Tbilisi"
+        if any(c in t for c in _GA_US_CITIES):
+            return "America/New_York"
+        return None  # genuinely ambiguous → geopy
+
+    # Single-timezone country map (covers the rest of the world).
     for country, tz in _COUNTRY_TZ.items():
         if f" {country} " in t:
             return tz

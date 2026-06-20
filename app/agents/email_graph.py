@@ -1,30 +1,27 @@
-"""Email drafting as a LangGraph sub-graph: a SINGLE MEDDPICC compose call.
+"""Email drafting as a LangGraph sub-graph: pain-first cold email.
 
-Collapsed from the old Strategist -> Writer -> Critic -> refine loop (3-5 LLM
-calls/email) to ONE call, with no loss of MEDDPICC rigor:
+Architecture (2 focused LLM calls per compose cycle):
+  compose  (reasoning LLM):
+    Call 1 — structured output for the PAIN PLAN (8 fields).
+              Plan fields only; no email text in schema so the model
+              focuses entirely on strategic reasoning.
+    Call 2 — plain-text email generation, grounded in the plan.
+              No schema constraints = no field-omission edge cases.
+  validate (no LLM):
+    Deterministic checks — placeholders, banned openers, word count,
+    greeting format, sign-off, sender-name-in-para-1-2 rule, and
+    at least one ICP pain keyword in paragraph 1.
 
-  compose  (reasoning) : in ONE structured call, the model first PLANS the email
-                         with MEDDPICC (hook / pain / capability bridge / value
-                         proof / economic-buyer-vs-champion play / ask) and then
-                         WRITES the email grounded in that plan. The plan fields
-                         come first in the schema, so the model reasons before it
-                         writes (chain-of-thought in a single round-trip).
-  validate (no LLM)    : the old LLM critic's two real jobs — catching placeholders
-                         and fabricated/ungrounded content — are done with cheap,
-                         deterministic checks (regex + rules), which are faster AND
-                         more reliable than an LLM reviewer.
-
-A single bounded rewrite fires ONLY when the deterministic checks fail (rare), so
-the typical email costs exactly ONE LLM call; worst case is two. Mini models only,
-routed via app.core.llm. The graph's output contract is unchanged: `strategy` +
-`draft` + `critique` are still in the final state for the drafting service.
+Typical cost: 2 LLM calls (plan + write). A bounded rewrite fires only
+when deterministic validation fails (rare), making worst case 4 calls.
 """
 from __future__ import annotations
 
 import os
 import re
-from typing import List, Literal, TypedDict
+from typing import List, Literal, Optional, TypedDict
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
@@ -32,184 +29,248 @@ from pydantic import BaseModel, Field
 from app.core.llm import get_chat_llm
 from app.core.logging_config import logger
 
-# Bounded safety rewrites. Default 1 means: 1 compose call + at most 1 rewrite when
-# the deterministic validator flags an issue. Set to 0 to force strictly one call.
 MAX_ATTEMPTS = int(os.getenv("EMAIL_MAX_DRAFT_ATTEMPTS", "1"))
 
-# Filler/hedge openers an elite cold email must never contain.
 _BANNED_PHRASES = (
     "hope this finds you well", "hope this email finds you", "hope you are doing well",
     "hope you're doing well", "hope all is well", "i hope this", "reaching out to you today",
 )
 
 
-# --------------------------------------------------------------------------- #
-# Structured output — ONE object carrying the MEDDPICC plan AND the email.      #
-# The plan fields are declared FIRST so the model fills them before it writes   #
-# the subject/body (single-call chain-of-thought).                             #
-# --------------------------------------------------------------------------- #
-class MeddpiccDraft(BaseModel):
-    # ---- MEDDPICC plan (reason first; this is the strategy brief) ----
-    hook: str = Field(description="The single most specific, evidenced fact/angle to lead with (from the research) — the entry point for Identify-Pain.")
-    pain_hypothesis: str = Field(description="The specific business pain (MEDDPICC: Identify Pain) the sender solves for this company, grounded in the evidence.")
-    capability_bridge: str = Field(description="Which exact sender capability/service solves that pain, and the differentiation that fits their likely Decision Criteria.")
-    value_proof: str = Field(description="ONE credible proof of value (MEDDPICC: Metrics): a sender proof point, a quantified outcome, or a cost-of-inaction framed as a general pattern ('teams like yours typically…'). NEVER an invented company-specific number.")
-    recipient_play: str = Field(description="How to pitch GIVEN this recipient's role vs the economic buyer/champion: decision-owner -> business outcome + working session; champion/influencer -> forwardable, easy to escalate; adjacent -> ask to be pointed to the owner.")
-    ask: str = Field(description="The single, low-friction call-to-action, calibrated to recipient_play.")
-    strategic_observation: str = Field(description="The core strategic insight powering the email.")
-    tone: str = Field(description="Tone guidance appropriate to the prospect's seniority/role.")
-    # ---- The email (write SECOND, grounded entirely in the plan above) ----
-    subject: str = Field(description="High-impact, specific subject line (no placeholders).")
-    body: str = Field(description="The full email body: greeting + exactly 3 short paragraphs + sign-off, per the RULES.")
+# ---------------------------------------------------------------------------
+# Schema 1: PLAN ONLY (structured output call)
+# Small schema = model reliably fills every field.
+# Dropped from old schema: capability_bridge, value_proof, recipient_play
+#   (all drove the sender-first paragraph that the team rejected).
+# ---------------------------------------------------------------------------
+class PainFirstPlan(BaseModel):
+    primary_pain: str = Field(
+        description="The single most specific, evidenced business pain this company has RIGHT NOW — "
+                    "drawn from pain_hooks, matched_pains, and need_evidence. One concrete statement."
+    )
+    pain_evidence: str = Field(
+        description="2-3 specific facts that PROVE this pain is real for THIS company. "
+                    "Ground every word in research_summary, news_hooks, or growth_hooks."
+    )
+    pain_consequence: str = Field(
+        description="What this pain is costing them. Frame as a recognisable industry pattern; "
+                    "never invent a number about THIS company."
+    )
+    urgency_trigger: str = Field(
+        description="Single growth/news hook making this pain urgent RIGHT NOW. Empty string if none."
+    )
+    sender_relevance: str = Field(
+        description="ONE sentence: how the sender has solved this exact pain before. "
+                    "Use sender_proof or matched_services. Proof, not a pitch."
+    )
+    ask: str = Field(
+        description="Ultra-light CTA. Decision-owner → 'worth a quick chat?'. "
+                    "Champion → 'does this resonate?'. Never ask for a 30-min call."
+    )
+    strategic_observation: str = Field(
+        description="Core strategic insight powering this email. Kept for follow-up continuity."
+    )
+    tone: str = Field(
+        description="C-suite = peer insight; VP/Director = direct, evidence-led; Manager = consultative."
+    )
 
 
 class Critique(BaseModel):
-    """Kept for output-contract compatibility; now produced deterministically."""
+    """Kept for output-contract compatibility with drafting_service."""
     verdict: Literal["pass", "revise"]
     issues: List[str]
     score: int
 
 
-# --------------------------------------------------------------------------- #
-# Graph state                                                                  #
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Graph state
+# ---------------------------------------------------------------------------
 class DraftState(TypedDict, total=False):
-    ctx: dict          # gathered context (sender DNA, target intel, prospect, objective)
-    strategy: dict     # MEDDPICC plan fields (back-compat with drafting_service)
-    draft: dict        # {subject, body}
-    critique: dict     # {verdict, issues, score} — deterministic
+    ctx: dict
+    strategy: dict
+    draft: dict
+    critique: dict
     attempts: int
     max_attempts: int
 
 
-# --------------------------------------------------------------------------- #
-# Single compose prompt — PLAN (MEDDPICC) then WRITE, in one call.              #
-# --------------------------------------------------------------------------- #
-_COMPOSE_PROMPT = ChatPromptTemplate.from_template(
-    """You are an elite B2B outreach strategist AND ghostwriter. In ONE pass you will (A) PLAN a cold email
-using the MEDDPICC framework, then (B) WRITE it. Fill the plan fields first, then the subject and body —
-the email MUST be grounded in your own plan and in the RECIPIENT & TARGET data given at the END. Everything
-must be a REAL fact from that data; never invent.
+# ---------------------------------------------------------------------------
+# Prompt templates
+# ---------------------------------------------------------------------------
+_PLAN_PROMPT = ChatPromptTemplate.from_template(
+    """You are a B2B cold email strategist. Analyse the target company intelligence below and
+fill the strategic PLAN that will drive a pain-first cold email.
+Every field must be grounded in the provided data — never invent facts.
 
-SENDER:
-- Company: {sender_name} | Sender name (sign-off): {user_name}
+SENDER (background only — referenced in sender_relevance field):
+- Company: {sender_name}
 - Services: {sender_services}
-- Capability -> pain map: {sender_map}
-- Proof points / outcomes: {sender_proof}
+- Proof points: {sender_proof}
 - Differentiators: {sender_advantages}
 
-CAMPAIGN OBJECTIVE (the email must serve it): {objective}
-
-PART A — PLAN with MEDDPICC (fill the plan fields), using the RECIPIENT & TARGET data at the end:
-1. IDENTIFY PAIN -> pick the most specific, credible hook (a REAL fact from the intelligence, never generic)
-   and the pain it implies that THIS sender solves.
-2. CAPABILITY + DECISION CRITERIA -> the exact sender capability that bridges to it, leaning on the
-   differentiator most relevant to their likely decision criteria.
-3. METRICS -> one credible value_proof (a sender proof point or a value pattern). If no real number exists,
-   frame it as a general pattern — NEVER invent a company-specific metric.
-4. ECONOMIC BUYER vs CHAMPION -> compare THIS recipient's title/role to the likely economic buyer and
-   champion, and set recipient_play + the ask altitude accordingly.
-
-PART B — WRITE the email from your plan, obeying every RULE:
-- Structure: open with a greeting line — the word "Hi " then the recipient's first name (given below) then
-  a comma (e.g. "Hi Sarah,") — on its own line, a blank line, then EXACTLY 3 short paragraphs — (1) the
-  hook anchored in their reality + the pain it implies, (2) the bridge to {sender_name}'s capability
-  reinforced by the value proof, (3) the single ask exactly as planned.
-- 110-160 words. Senior, direct, insight-led. Zero marketing fluff, zero clichés ("hope this finds you well").
-- GROUNDING: state only facts present in the data/plan. Do NOT invent metrics, momentum, or superlatives.
-  A general-pattern value proof must be phrased as one ("teams like yours typically…"), never as a claim
-  about THIS company's numbers.
-- ABSOLUTELY NO PLACEHOLDERS or bracketed/curly tokens of ANY kind (no [Name], [Company], {{metric}}, <X>).
-  Every value must be a real, spelled-out fact. If you lack a detail, omit it — never bracket it.
-- Do NOT expose framework jargon (MEDDPICC, "economic buyer", "champion") in the email text.
-- LINE BREAKS: each paragraph is ONE continuous line with NO hard breaks inside it; separate the greeting
-  and the 3 paragraphs with a single blank line only.
-- Sign off EXACTLY, blank line after 'Best regards,' and a single line break between name and company:
-  "Best regards,
-
-  {user_name}
-  {sender_name}"
-
-================= THE RECIPIENT & TARGET (the only per-email inputs) =================
-PROSPECT (the recipient):
-- First name: {prospect_first_name} | Title: {prospect_role} | Seniority: {prospect_seniority}
+PROSPECT:
+- Name: {prospect_first_name} | Title: {prospect_role} | Seniority: {prospect_seniority}
 - Company: {target_company}
-- Their role in the buying decision (our assessment): {recipient_role_signal}
+- Role in buying decision: {recipient_role_signal}
 
 TARGET INTELLIGENCE:
 - Research dossier: {research_summary}
+- ICP pain signals: {pain_hooks}
 - Growth hooks: {growth_hooks}
 - News hooks: {news_hooks}
-- Pain hooks: {pain_hooks}
 - Why now: {opportunity_reason}
-
-MEDDPICC READ (from qualification — hypotheses, NOT confirmed facts):
-- Evidenced need / pain: {need_evidence}
+- Evidenced need: {need_evidence}
 - Pains we solve here: {matched_pains}
-- Services that map to them: {matched_services}
-- Value / metrics angle: {metrics}
-- Likely economic buyer (role): {economic_buyer}
-- Likely champion (role): {champion}
-- Likely decision criteria: {decision_criteria}
+- Services that map: {matched_services}
+
+CAMPAIGN OBJECTIVE: {objective}
 
 {refine_block}"""
 )
 
+_WRITE_PROMPT = (
+    "Write a cold email using the plan below. Output ONLY the two labelled blocks.\n\n"
+    "PLAN:\n"
+    "  Primary pain:      {primary_pain}\n"
+    "  Evidence:          {pain_evidence}\n"
+    "  Consequence:       {pain_consequence}\n"
+    "  Urgency trigger:   {urgency_trigger}\n"
+    "  Sender relevance:  {sender_relevance}\n"
+    "  Ask:               {ask}\n"
+    "  Tone:              {tone}\n\n"
+    "EMAIL STRUCTURE — copy this layout exactly, filling in the <placeholders>:\n\n"
+    "SUBJECT: <≤10-word subject line naming their pain or situation — NOT the sender's product>\n\n"
+    "BODY:\n"
+    "Hi {prospect_first_name},\n\n"
+    "<Para 1: 2-3 sentences about the specific pain grounded in their reality. "
+    "DO NOT mention {sender_name}.>\n\n"
+    "<Para 2: 1-2 sentences on the consequence + urgency trigger if any. "
+    "Still NO mention of {sender_name}.>\n\n"
+    "<Para 3: 1 sentence of soft sender relevance. 1 ultra-light ask.>\n\n"
+    "Best regards,\n\n"
+    "{user_name}\n"
+    "{sender_name}\n\n"
+    "RULES (hard constraints):\n"
+    "  - 100-150 words in the BODY total.\n"
+    "  - {sender_name} must NOT appear in Para 1 or Para 2.\n"
+    "  - No placeholders of any kind — fill with real facts or omit.\n"
+    "  - No filler openers (hope this finds you, I am reaching out, etc.).\n"
+    "  - Each paragraph is a single unbroken block of text (no line breaks within a paragraph).\n"
+    "  - Blank line between every section as shown above.\n"
+    "  - No sales jargon in the email text."
+)
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def _reasoning_llm():
-    # Single drafting call now does plan+write, so give it the reasoning model.
-    # Cap tail latency (60s x 1 retry) so a slow provider can't stall a draft.
     return get_chat_llm("reasoning", timeout=60, max_retries=1)
 
 
-# --------------------------------------------------------------------------- #
-# Deterministic validation — replaces the LLM critic (faster + more reliable). #
-# --------------------------------------------------------------------------- #
+def _split_paragraphs(body: str) -> List[str]:
+    """Return content paragraphs (greeting and sign-off stripped)."""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+    return [
+        p for p in paras
+        if not re.match(r"^hi\s+\w+,?\s*$", p, re.I)
+        and not re.match(r"^best\b", p, re.I)
+        and not re.match(r"^regards\b", p, re.I)
+    ]
+
+
+def _parse_write_output(text: str) -> dict:
+    """Extract subject and body from the plain-text write call output."""
+    subject = ""
+    body = ""
+    m_subject = re.search(r"^SUBJECT:\s*(.+)$", text, re.MULTILINE | re.IGNORECASE)
+    if m_subject:
+        subject = m_subject.group(1).strip()
+    m_body = re.search(r"^BODY:[ \t]*([\s\S]+)", text, re.MULTILINE | re.IGNORECASE)
+    if m_body:
+        body = m_body.group(1).strip()
+    return {"subject": subject, "body": body}
+
+
+# ---------------------------------------------------------------------------
+# Deterministic validation — no LLM.
+# ---------------------------------------------------------------------------
 _PLACEHOLDER_RE = re.compile(r"\[[^\]\n]+\]|\{[^}\n]+\}|<[A-Za-z][A-Za-z0-9 _/-]*>")
+
+_PLAN_KEYS = (
+    "primary_pain", "pain_evidence", "pain_consequence", "urgency_trigger",
+    "sender_relevance", "ask", "strategic_observation", "tone",
+)
 
 
 def _deterministic_issues(draft: dict, ctx: dict) -> List[str]:
-    """The two failure modes the LLM critic actually caught — placeholders and
-    obvious ungrounded/format breaks — checked in code. Returns a list of concrete,
-    fixable issues (empty == send-ready)."""
     subject = draft.get("subject", "") or ""
     body = draft.get("body", "") or ""
     blob = f"{subject}\n{body}"
     issues: List[str] = []
 
+    # 1. No placeholders
     ph = _PLACEHOLDER_RE.search(blob)
     if ph:
-        issues.append(f"Remove the placeholder token '{ph.group(0)}' — fill it with a real value or omit it.")
+        issues.append(f"Remove placeholder '{ph.group(0)}' — fill with a real value or omit it.")
 
+    # 2. No banned filler openers
     low = blob.lower()
     for phrase in _BANNED_PHRASES:
         if phrase in low:
-            issues.append(f"Remove the filler/cliché opener containing '{phrase}'.")
+            issues.append(f"Remove the filler opener containing '{phrase}'.")
             break
 
+    # 3. Word count
     words = len(body.split())
     if words < 80:
-        issues.append(f"Body is too short ({words} words); aim for 110-160 words across 3 paragraphs.")
-    elif words > 210:
-        issues.append(f"Body is too long ({words} words); tighten to ~110-160 words.")
+        issues.append(f"Body is too short ({words} words); aim for 100-150 words.")
+    elif words > 200:
+        issues.append(f"Body is too long ({words} words); tighten to 100-150 words.")
 
+    # 4. Greeting format
     first = (ctx.get("prospect_first_name") or "").strip()
-    if first and not re.match(rf"\s*hi\s+{re.escape(first)}\b", body, re.IGNORECASE):
+    if first and not re.search(rf"hi\s+{re.escape(first)}\b", body, re.IGNORECASE):
         issues.append(f"Open with the greeting 'Hi {first},' on its own line.")
 
+    # 5. Sign-off present
     if "best regards" not in low:
-        issues.append("Sign off with 'Best regards,' followed by the sender name and company.")
+        issues.append("Sign off with 'Best regards,' followed by sender name and company.")
+
+    # 6. Sender name must NOT appear in paragraphs 1 or 2 (pain-first rule)
+    sender = (ctx.get("sender_name") or "").strip().lower()
+    if sender:
+        content_paras = _split_paragraphs(body)
+        early_paras = " ".join(content_paras[:2]).lower()
+        if sender in early_paras:
+            issues.append(
+                f"'{ctx['sender_name']}' must not appear in paragraphs 1 or 2. "
+                "Keep paragraphs 1-2 entirely about the prospect's pain."
+            )
+
+    # 7. At least one ICP pain signal must surface in paragraph 1
+    pain_signals = []
+    for field in ("pain_hooks", "matched_pains", "need_evidence"):
+        raw = ctx.get(field) or ""
+        pain_signals.extend(
+            w.strip().lower() for w in re.split(r"[;,]", raw) if len(w.strip()) > 4
+        )
+    if pain_signals:
+        content_paras = _split_paragraphs(body)
+        if content_paras:
+            para1_low = content_paras[0].lower()
+            if not any(sig[:12] in para1_low for sig in pain_signals[:8]):
+                issues.append(
+                    "Paragraph 1 must reference a specific pain from the ICP research "
+                    "(pain_hooks / matched_pains / need_evidence). Ground it in their reality."
+                )
 
     return issues
 
 
-# --------------------------------------------------------------------------- #
-# Nodes                                                                        #
-# --------------------------------------------------------------------------- #
-_PLAN_KEYS = ("hook", "pain_hypothesis", "capability_bridge", "value_proof",
-              "recipient_play", "ask", "strategic_observation", "tone")
-
-
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
 def _node_compose(state: DraftState):
     ctx = state["ctx"]
     attempts = state.get("attempts", 0)
@@ -217,43 +278,60 @@ def _node_compose(state: DraftState):
     refine_block = ""
     critique = state.get("critique")
     if critique and critique.get("issues"):
-        issues = "\n".join(f"- {i}" for i in critique["issues"])
+        issues_text = "\n".join(f"- {i}" for i in critique["issues"])
         refine_block = (
-            "REVISION REQUIRED — your previous draft failed automated checks. Fix EXACTLY these issues "
-            f"while keeping what worked:\n{issues}\n"
+            "REVISION REQUIRED — your previous attempt failed these checks. "
+            f"Fix ALL of them:\n{issues_text}\n"
         )
 
-    chain = _COMPOSE_PROMPT | _reasoning_llm().with_structured_output(MeddpiccDraft)
-    out: MeddpiccDraft = chain.invoke({
-        "sender_name": ctx["sender_name"],
-        "user_name": ctx["user_name"],
-        "sender_services": ctx["sender_services"],
-        "sender_map": ctx["sender_map"],
-        "sender_proof": ctx.get("sender_proof", "N/A"),
-        "sender_advantages": ctx.get("sender_advantages", "N/A"),
-        "prospect_first_name": ctx["prospect_first_name"],
-        "prospect_role": ctx["prospect_role"],
-        "prospect_seniority": ctx["prospect_seniority"],
-        "target_company": ctx["target_company"],
+    llm = _reasoning_llm()
+
+    # ── Call 1: Strategic Plan (structured output, small schema) ──────────
+    plan_chain = _PLAN_PROMPT | llm.with_structured_output(PainFirstPlan)
+    plan: PainFirstPlan = plan_chain.invoke({
+        "sender_name":           ctx["sender_name"],
+        "sender_services":       ctx["sender_services"],
+        "sender_proof":          ctx.get("sender_proof", "N/A"),
+        "sender_advantages":     ctx.get("sender_advantages", "N/A"),
+        "prospect_first_name":   ctx["prospect_first_name"],
+        "prospect_role":         ctx["prospect_role"],
+        "prospect_seniority":    ctx["prospect_seniority"],
+        "target_company":        ctx["target_company"],
         "recipient_role_signal": ctx.get("recipient_role_signal", "N/A"),
-        "research_summary": ctx["research_summary"],
-        "growth_hooks": ctx["growth_hooks"],
-        "news_hooks": ctx["news_hooks"],
-        "pain_hooks": ctx["pain_hooks"],
-        "opportunity_reason": ctx["opportunity_reason"],
-        "need_evidence": ctx.get("need_evidence", "N/A"),
-        "matched_pains": ctx.get("matched_pains", "N/A"),
-        "matched_services": ctx.get("matched_services", "N/A"),
-        "metrics": ctx.get("metrics", "N/A"),
-        "economic_buyer": ctx.get("economic_buyer", "N/A"),
-        "champion": ctx.get("champion", "N/A"),
-        "decision_criteria": ctx.get("decision_criteria", "N/A"),
-        "objective": ctx["objective"],
-        "refine_block": refine_block,
+        "research_summary":      ctx["research_summary"],
+        "growth_hooks":          ctx["growth_hooks"],
+        "news_hooks":            ctx["news_hooks"],
+        "pain_hooks":            ctx["pain_hooks"],
+        "opportunity_reason":    ctx["opportunity_reason"],
+        "need_evidence":         ctx.get("need_evidence", "N/A"),
+        "matched_pains":         ctx.get("matched_pains", "N/A"),
+        "matched_services":      ctx.get("matched_services", "N/A"),
+        "objective":             ctx["objective"],
+        "refine_block":          refine_block,
     })
-    d = out.model_dump()
-    strategy = {k: d.get(k, "") for k in _PLAN_KEYS}
-    draft = {"subject": d.get("subject", ""), "body": d.get("body", "")}
+
+    strategy = {k: getattr(plan, k, "") for k in _PLAN_KEYS}
+
+    # ── Call 2: Write the email (plain text, no schema) ──────────────────
+    write_prompt = _WRITE_PROMPT.format(
+        primary_pain=plan.primary_pain,
+        pain_evidence=plan.pain_evidence,
+        pain_consequence=plan.pain_consequence,
+        urgency_trigger=plan.urgency_trigger or "(none)",
+        sender_relevance=plan.sender_relevance,
+        ask=plan.ask,
+        tone=plan.tone,
+        prospect_first_name=ctx["prospect_first_name"],
+        sender_name=ctx["sender_name"],
+        user_name=ctx["user_name"],
+    )
+    write_messages = [
+        SystemMessage(content="You are an elite B2B cold email ghostwriter. Follow all instructions precisely."),
+        HumanMessage(content=write_prompt),
+    ]
+    write_response = llm.invoke(write_messages)
+    draft = _parse_write_output(write_response.content)
+
     return {"strategy": strategy, "draft": draft, "attempts": attempts + 1}
 
 
@@ -268,7 +346,7 @@ def _route_after_validate(state: DraftState):
     if critique.get("verdict") == "pass":
         return END
     if state.get("attempts", 0) >= state.get("max_attempts", MAX_ATTEMPTS):
-        logger.info("[EMAIL-GRAPH] Max draft attempts reached; accepting best effort.")
+        logger.info("[EMAIL-GRAPH] Max attempts reached; accepting best effort.")
         return END
     return "compose"
 

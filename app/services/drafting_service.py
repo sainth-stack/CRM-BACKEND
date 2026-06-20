@@ -1,4 +1,3 @@
-import json
 import logging
 from app.db import models
 from app.core.resilience import retry_with_backoff
@@ -26,8 +25,7 @@ class DraftingService:
 
             sender_name = user_intel.company_name
             sender_services = user_intel.offerings
-            sender_map = json.dumps(user_intel.v2_intel.get("capability_to_pain_map", [])) if user_intel.v2_intel else "[]"
-            
+
             # Fetch campaign owner name
             user_name = campaign.owner.full_name if campaign.owner else None
             if not user_name:
@@ -44,21 +42,16 @@ class DraftingService:
             opportunity_reason = target_co.opportunity_reason or ""
             objective = campaign.prompt or "Win a discovery call with the right stakeholder."
 
-            # MEDDPICC scorecard (computed at ICP, stored on the company) + the
-            # recipient's stakeholder verdict (buyer / champion / influencer) + the
-            # sender's proof points & differentiators. These drive a MEDDPICC-grounded
-            # draft strategy instead of a generic hook email. All per-company/recipient
-            # — nothing hardcoded.
             def _join(v):
                 if isinstance(v, (list, tuple)):
                     return "; ".join(str(x) for x in v if str(x).strip()) or "N/A"
                 return str(v) if v else "N/A"
 
+            # need_evidence from MEDDPICC scorecard — primary pain input.
+            # Dropped: metrics, economic_buyer, champion, decision_criteria — all drove
+            # the capability-bridge paragraph removed in the pain-first redesign.
+            # Dropped: sender_map (capability_to_pain_map JSON) — no longer in the prompt.
             meddpicc = (target_co.v2_intel or {}).get("meddpicc", {}) if target_co.v2_intel else {}
-            metrics = _join(meddpicc.get("metrics"))
-            economic_buyer = _join(meddpicc.get("economic_buyer"))
-            champion = _join(meddpicc.get("champion"))
-            decision_criteria = _join(meddpicc.get("decision_criteria"))
             need_evidence = _join(meddpicc.get("need_evidence"))
             matched_pains = _join(target_co.matched_pains or meddpicc.get("matched_pains"))
             matched_services = _join(target_co.matched_services or meddpicc.get("matched_services"))
@@ -77,32 +70,26 @@ class DraftingService:
         first_name = prospect_name.split(' ')[0] if prospect_name and ' ' in prospect_name else (prospect_name or "there")
 
         ctx = {
-            "sender_name": sender_name,
-            "sender_services": sender_services,
-            "sender_map": sender_map,
-            "user_name": user_name,
-            "prospect_name": prospect_name,
-            "prospect_first_name": first_name,
-            "target_company": target_company_name,
-            "prospect_role": prospect_role,
-            "prospect_seniority": prospect_seniority,
-            "research_summary": research_summary,
-            "growth_hooks": growth_hooks,
-            "pain_hooks": pain_hooks,
-            "news_hooks": news_hooks,
-            "opportunity_reason": opportunity_reason,
-            "objective": objective,
-            # MEDDPICC strategy inputs
-            "metrics": metrics,
-            "economic_buyer": economic_buyer,
-            "champion": champion,
-            "decision_criteria": decision_criteria,
-            "need_evidence": need_evidence,
-            "matched_pains": matched_pains,
-            "matched_services": matched_services,
+            "sender_name":          sender_name,
+            "sender_services":      sender_services,
+            "user_name":            user_name,
+            "prospect_name":        prospect_name,
+            "prospect_first_name":  first_name,
+            "target_company":       target_company_name,
+            "prospect_role":        prospect_role,
+            "prospect_seniority":   prospect_seniority,
+            "research_summary":     research_summary,
+            "growth_hooks":         growth_hooks,
+            "pain_hooks":           pain_hooks,
+            "news_hooks":           news_hooks,
+            "opportunity_reason":   opportunity_reason,
+            "objective":            objective,
+            "need_evidence":        need_evidence,
+            "matched_pains":        matched_pains,
+            "matched_services":     matched_services,
             "recipient_role_signal": recipient_role_signal,
-            "sender_proof": sender_proof,
-            "sender_advantages": sender_advantages,
+            "sender_proof":         sender_proof,
+            "sender_advantages":    sender_advantages,
         }
 
         try:

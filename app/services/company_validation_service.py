@@ -127,13 +127,16 @@ class ICPMeddpiccJudgment(BaseModel):
         "A professional 2-3 sentence FACTUAL assessment, in polished business English, of this target's "
         "fit for the sender's ICP — written as if briefing a sales team. Ground it in the MEDDPICC read: "
         "name what the company actually does/operates and why that matches (or does not match) the "
-        "sender's target-customer profile. Reason from operations — do NOT comment on whether a pain is "
-        "'evidenced' or note the absence of stated problems. "
-        "Be specific and cite evidenced facts. Do NOT state or imply an accept/reject decision, do NOT "
-        "recommend whether to pursue, and do NOT hedge with 'may not be a fit / needs further "
-        "exploration' — the system decides qualification separately from this text. STRICTLY no internal "
-        "jargon, field names, scores, booleans, verdict labels, or bracketed metadata. Use the exact "
-        "sender name."))
+        "sender's target-customer profile, reasoning ONLY from what the company positively DOES. "
+        "ABSOLUTELY FORBIDDEN — never write any sentence about missing/unstated information. Banned "
+        "phrasings include (and anything like them): 'absence of explicitly stated challenges', 'no "
+        "specific challenges/needs were stated', 'limits the ability to assess', 'limits confidence', "
+        "'despite the absence of', 'no explicit needs', 'not explicitly stated', 'further exploration "
+        "needed', 'may not be a fit'. The marketing website never states problems — treating that as a "
+        "caveat is wrong; simply DO NOT mention it. Write only affirmative, evidence-grounded statements. "
+        "Do NOT state or imply an accept/reject decision and do NOT recommend whether to pursue — the "
+        "system decides qualification separately. STRICTLY no internal jargon, field names, scores, "
+        "booleans, verdict labels, or bracketed metadata. Use the exact sender name."))
     confidence: int = Field(description="0-100 confidence given the quality/quantity of evidence.")
 
 
@@ -246,16 +249,24 @@ Then ground EVERY field in the RESEARCH PROFILE, judged in light of the campaign
   typical customers; the decisive question is whether the target's OPERATIONS match the derived BUYER
   PROFILE.
 
-  PRODUCTION OPERATIONS RULE (applies whenever the sender serves manufacturers / operators):
-  If the research profile shows the company RUNS ITS OWN production lines, assembly operations, or
-  manufacturing machinery — even for simple products (springs, printed materials, food products,
-  consumer goods, building materials, etc.) — it is ALWAYS operator_end_user, NOT out_of_domain.
-  The complexity or glamour of what they make is irrelevant; what matters is that they OPERATE EQUIPMENT
-  that can fail, slow, or go out of specification. Reserve out_of_domain strictly for companies with NO
-  production operations: pure service firms, consultancies, software companies, financial services,
-  resellers/distributors that buy and resell without manufacturing, or companies whose entire value
-  chain is non-physical. A company that BOTH manufactures AND distributes is an operator — the
-  manufacturing side qualifies it.
+  PRODUCTION OPERATIONS RULE — CHECK THIS FIRST, BEFORE EVER CHOOSING out_of_domain
+  (applies whenever the sender serves manufacturers / operators):
+  STEP 1 — Scan the research profile for ANY production signal. The presence of words/phrases such as
+  "manufacturer", "manufactures", "produces", "production", "fabrication", "assembly", "machining",
+  "finishing", "foundry", "mill", "plant", "factory", "facility (sq ft / sqft)", named machines/lines, or
+  a stated product they MAKE = a production signal.
+  STEP 2 — If ANY production signal is present, the company RUNS its own operations and is ALWAYS
+  operator_end_user — NEVER out_of_domain — REGARDLESS of the END MARKET or industry vertical it serves
+  (eye care, dental, aerospace, food, security, agriculture, etc. are all irrelevant). The vertical it
+  sells INTO does not disqualify a company that MAKES physical products; what matters is that it OPERATES
+  EQUIPMENT that can fail, slow, or drift out of spec. (Example: a company that "manufactures and finishes
+  ophthalmic lenses" is an operator — the lens *production* qualifies it; the fact that its customers are
+  eye-care clinics is beside the point.)
+  STEP 3 — Choose out_of_domain ONLY when there is NO production signal at all: pure service firms,
+  consultancies, software/SaaS, financial services, pure resellers/distributors that buy-and-resell
+  without making anything, or companies whose entire value chain is non-physical. A company that BOTH
+  manufactures AND distributes is an operator — the manufacturing side qualifies it. When in doubt between
+  operator and out_of_domain for a company that makes a physical product, choose operator.
 - operational_overlap (0-45, operators only; else 0) — the ONLY fit number you score. Judge how DIRECTLY
   the target's core operations match the BUYER PROFILE and its derived signals, inferred from what the
   company does/makes/serves: 38-45 textbook match to the central signal; 25-37 clear match; 12-24
@@ -284,12 +295,15 @@ only map them to THIS sender.)
 
 Finally: overall_reasoning — a professional, polished 2-3 sentence FACTUAL assessment (use the exact
 sender name {sender_name}) of the target's MEDDPICC fit: what it does/operates and why that matches (or
-does not match) {sender_name}'s target-customer profile. Reason from operations; do NOT comment on
-whether a pain is 'evidenced' or remark on the absence of stated problems. Do NOT state or imply
-accept/reject, do NOT recommend whether to pursue, and do NOT hedge ('may not be a fit', 'needs
-exploration') — qualification is decided
-separately. Write it for a human sales reader — NO scores, field names, booleans, verdict labels, or
-bracketed metadata. Then confidence (0-100).
+does not match) {sender_name}'s target-customer profile, reasoning ONLY from what the company positively
+DOES. ABSOLUTELY FORBIDDEN: any sentence about missing or unstated information. Do NOT write phrases like
+'absence of explicitly stated challenges', 'no specific needs were stated', 'limits the ability to
+assess', 'limits confidence', 'despite the absence of', 'not explicitly stated', or 'further exploration
+needed'. The marketing website never states internal problems, so treating that as a caveat is WRONG —
+simply omit any such remark and write only affirmative, evidence-grounded sentences. Do NOT state or imply
+accept/reject, and do NOT recommend whether to pursue — qualification is decided separately. Write it for
+a human sales reader — NO scores, field names, booleans, verdict labels, or bracketed metadata. Then
+confidence (0-100).
 
 ==================== TARGET RECORD (the ONLY per-company inputs) ====================
 TARGET COMPANY:
@@ -796,6 +810,31 @@ class CompanyValidationService:
                 err["_eval_context"] = rendered[:9000]
             return err
 
+        # Deterministic hedge scrub — strip any "absence of evidence" sentence the LLM
+        # still emits despite the prompt ban (gpt-4o-mini doesn't reliably comply).
+        res.overall_reasoning = self._scrub_hedges(res.overall_reasoning)
+
+        # Production-signal role override — rescue a clear MANUFACTURER the LLM wrongly
+        # gated as out_of_domain (it fixates on the company's end market, e.g. "eye
+        # care" / "semiconductor testing", instead of the fact that it RUNS production).
+        # Double-gated to avoid false accepts: only fires when (a) the SENDER serves
+        # operators/manufacturers AND (b) the research profile shows a production signal.
+        # A conservative operational_overlap baseline is assigned (the LLM gave 0 for the
+        # rejected role), so the final score still depends on the company's real scale +
+        # matched-services breadth rather than auto-passing.
+        if (res.target_role == "out_of_domain"
+                and self._profile_has_production(profile)
+                and self._sender_serves_operators(sender_offerings, sender_customers, sender_capmap)):
+            logger.info(
+                f"[ICP] Production override for {domain}: out_of_domain -> operator_end_user "
+                f"(profile shows production + sender serves operators)."
+            )
+            res.target_role = "operator_end_user"
+            res.role_reason = (res.role_reason or "") + " [System: confirmed production operations.]"
+            # Conservative 'clear match' lower-bound; real differentiation comes from the
+            # computed scale + breadth sub-scores below.
+            res.operational_overlap = max(int(res.operational_overlap or 0), 24)
+
         # operator_fit = LLM operational_overlap (qualitative) + the two DETERMINISTIC
         # sub-scores computed from facts. The LLM number clustered when scored directly;
         # computing scale + breadth from real firmographics/lists restores per-company
@@ -818,6 +857,56 @@ class CompanyValidationService:
         if return_context:
             result["_eval_context"] = rendered[:9000]
         return result
+
+    # Sentence-level hedge phrases gpt-4o-mini keeps emitting in overall_reasoning
+    # despite explicit prompt bans. We strip any sentence mentioning missing/unstated
+    # info deterministically so the sales-facing text never references "absence of
+    # evidence" — the exact failure mode the ICP redesign was meant to eliminate.
+    _HEDGE_RE = re.compile(
+        r"absence of|not (?:explicitly )?stated|no (?:specific|explicit) (?:challenge|need|pain|problem)"
+        r"|limits? (?:the ability|confidence)|despite the absence|further exploration"
+        r"|without explicit|no (?:stated|mentioned) (?:challenge|need|pain)",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _scrub_hedges(cls, text: str) -> str:
+        """Drop any sentence that references missing/unstated information. If every
+        sentence is offending (rare), fall back to the first sentence so the field is
+        never empty."""
+        if not text:
+            return text
+        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+        kept = [s for s in sentences if s.strip() and not cls._HEDGE_RE.search(s)]
+        if not kept:
+            return sentences[0].strip() if sentences else text
+        return " ".join(kept).strip()
+
+    # Lexical detectors for the production-signal role override (Issue: gpt-4o-mini
+    # rejects clear manufacturers as out_of_domain by fixating on their END MARKET).
+    _PRODUCTION_RE = re.compile(
+        r"manufactur|produces|production|fabricat|machining|assembly|foundry|\bmill\b"
+        r"|\bplant\b|factory|injection mold|stamping|casting|extrusion|fabrication",
+        re.IGNORECASE,
+    )
+    _SENDER_OPERATOR_RE = re.compile(
+        r"manufactur|equipment|production|maintenance|operational|asset|downtime|industrial"
+        r"|\bplant\b|machinery|operator|factory|oem|supply chain|logistics",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _profile_has_production(cls, profile: dict) -> bool:
+        blob = " ".join(str(profile.get(k) or "") for k in (
+            "actual_business", "scale_operations")) + " " + \
+            "; ".join(str(v) for v in (profile.get("products_services") or [])) + " " + \
+            "; ".join(str(v) for v in (profile.get("evidenced_signals") or []))
+        return bool(cls._PRODUCTION_RE.search(blob))
+
+    @classmethod
+    def _sender_serves_operators(cls, sender_offerings: str, sender_customers: str, sender_capmap: str) -> bool:
+        return bool(cls._SENDER_OPERATOR_RE.search(
+            f"{sender_offerings} {sender_customers} {sender_capmap}"))
 
     @staticmethod
     def _format_reasoning(m: "ICPMeddpiccJudgment", verdict: str, score: int, threshold: int) -> str:

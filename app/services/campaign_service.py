@@ -87,45 +87,157 @@ class CampaignService:
         finally:
             hb.close()
 
-    def _fetch_judged_icp_domains(self, campaign_id: str) -> set:
-        """Domains already given a terminal ICP verdict for this campaign (any
-        status except ERROR). Used by Stage 3 for resume-awareness so a restart
-        skips already-decided companies. Best-effort: on error, return empty so
-        the stage simply reprocesses (correct, just not optimised)."""
+    def _fetch_resume_state(self, campaign_id: str) -> tuple:
+        """Fetch resume state for Stage 3 two-phase pipeline.
+
+        Returns (screener_done, icp_needed):
+          screener_done: domains already in target_companies with non-ERROR status
+                         → skip screener phase on restart (already written)
+          icp_needed:    subset with status == SCREENER_PASSED
+                         → ICP still has to run (previous run crashed between phases)
+        Best-effort: on DB error returns empty sets so the stage re-runs from scratch.
+        """
         db = SessionLocal()
         try:
             rows = (
-                db.query(models.TargetCompany.domain)
+                db.query(models.TargetCompany.domain, models.TargetCompany.status)
                 .filter(
                     models.TargetCompany.campaign_id == campaign_id,
                     models.TargetCompany.status != "ERROR",
                 )
                 .all()
             )
-            return {r[0] for r in rows if r[0]}
+            screener_done = {r[0] for r in rows if r[0]}
+            icp_needed = {r[0] for r in rows if r[0] and r[1] == "SCREENER_PASSED"}
+            return screener_done, icp_needed
         except Exception:
-            return set()
+            return set(), set()
         finally:
             db.close()
 
+    def _persist_screener_batch(self, campaign_id: str, batch: list, unique_cos: dict) -> None:
+        """Persist screener verdicts for one batch (SCREENER_PASSED or REJECTED).
+
+        Writes company firmographic data + screener status for ALL companies.
+        ICP will UPDATE the SCREENER_PASSED rows later with research + verdict.
+        Idempotent: retries update the existing row instead of raising UniqueViolation.
+        Each row is isolated via SAVEPOINT so one bad row does not sink the batch.
+        """
+        temp_db = SessionLocal()
+        try:
+            for domain, status, screen in batch:
+                try:
+                    with temp_db.begin_nested():
+                        co_extra = strip_null_bytes(unique_cos.get(domain, {}))
+                        reasoning = (
+                            f"[Pre-screened] {screen.summary}"
+                            if screen and screen.final_verdict == "FAIL"
+                            else "Pending ICP qualification."
+                        )
+                        existing = temp_db.query(models.TargetCompany).filter(
+                            models.TargetCompany.campaign_id == campaign_id,
+                            models.TargetCompany.domain == domain,
+                        ).first()
+                        if existing:
+                            existing.status = status
+                            existing.relevance_explanation = reasoning
+                        else:
+                            new_co = models.TargetCompany(
+                                campaign_id=campaign_id,
+                                name=co_extra.get("company_name_cleaned") or co_extra.get("name", domain),
+                                domain=domain,
+                                status=status,
+                                relevance_score=0,
+                                relevance_explanation=reasoning,
+                                location=co_extra.get("location"),
+                                company_type=co_extra.get("industry"),
+                                employee_count=co_extra.get("size"),
+                                revenue_range=co_extra.get("revenue"),
+                                linkedin=co_extra.get("linkedin"),
+                                linkedin_id=co_extra.get("linkedin_id"),
+                                description=co_extra.get("description"),
+                                website=co_extra.get("website"),
+                            )
+                            temp_db.add(new_co)
+                except Exception as row_err:
+                    logger.error(f"[SCREENER PERSIST] Error for {domain}: {row_err}")
+            temp_db.commit()
+        except Exception as e:
+            temp_db.rollback()
+            logger.error(f"[SCREENER PERSIST] Batch commit error: {e}")
+            raise
+        finally:
+            temp_db.close()
+
+    def _update_icp_batch(self, campaign_id: str, batch: list) -> None:
+        """Update existing target_companies rows with ICP verdict + research dossier.
+
+        Firmographic data was already written by _persist_screener_batch. This method
+        patches only the ICP-derived fields: status, score, reasoning, research dossier.
+        Includes a fallback INSERT for the rare case where the screener row is missing.
+        Each row is isolated via SAVEPOINT so one bad row does not sink the batch.
+        """
+        temp_db = SessionLocal()
+        try:
+            for domain, res in batch:
+                try:
+                    with temp_db.begin_nested():
+                        res = strip_null_bytes(res)
+                        co = temp_db.query(models.TargetCompany).filter(
+                            models.TargetCompany.campaign_id == campaign_id,
+                            models.TargetCompany.domain == domain,
+                        ).first()
+                        if co:
+                            co.status = res.get("status", "REJECTED")
+                            co.relevance_score = res.get("relevance_score", 0)
+                            co.relevance_explanation = res.get("reasoning", "")
+                            co.icp_research_context = res.get("icp_context")
+                            self._apply_enrichment(co, res)
+                        else:
+                            # Screener row missing — insert a minimal fallback.
+                            logger.warning(f"[ICP UPDATE] No row for {domain} — inserting fallback.")
+                            new_co = models.TargetCompany(
+                                campaign_id=campaign_id,
+                                name=domain,
+                                domain=domain,
+                                status=res.get("status", "REJECTED"),
+                                relevance_score=res.get("relevance_score", 0),
+                                relevance_explanation=res.get("reasoning", ""),
+                                icp_research_context=res.get("icp_context"),
+                            )
+                            self._apply_enrichment(new_co, res)
+                            temp_db.add(new_co)
+                except Exception as row_err:
+                    logger.error(f"[ICP UPDATE] Error for {domain}: {row_err}")
+            temp_db.commit()
+        except Exception as e:
+            temp_db.rollback()
+            logger.error(f"[ICP UPDATE] Batch commit error: {e}")
+            raise
+        finally:
+            temp_db.close()
+
     async def stage_3_icp_filtering(self, db: Session, campaign_id: str, unique_cos: dict, worker_id: str = None):
         """
-        STAGE 3+4 (MERGED): ICP Qualification + Deep Research in one pass.
+        STAGE 3+4 (MERGED): Pre-screening + ICP Qualification + Deep Research.
 
-        Each company gets a single combined agent call (website-evidence company
-        intel feeding one LLM) that returns the accept/reject
-        verdict AND the full research dossier. The dossier is persisted for EVERY
-        company (accepted or rejected) — only the verdict differs — so there is
-        no separate deep-research stage. This halves the per-company round-trips and
-        removes an entire Celery stage (the t2.medium latency/CPU win).
+        TWO-PHASE PIPELINE:
+          Phase 1 (Screener): CSV-only firmographic pre-filter via LeadFitScreener.
+            ALL companies are evaluated and written to target_companies immediately:
+            - REJECTED       → screener FAIL (location/size/industry mismatch)
+            - SCREENER_PASSED → passed/unknown → queued for Phase 2
+          Phase 2 (ICP): Web crawl + MEDDPICC qualification on SCREENER_PASSED only.
+            Existing rows are UPDATED (not re-inserted) with research + verdict.
+
+        Resume-awareness: on restart, companies already in target_companies with a
+        non-ERROR status are skipped in Phase 1; SCREENER_PASSED rows are re-queued
+        for Phase 2 so a crash between phases is automatically recovered.
         """
         # 1. Fetch the sender profile (short read session).
         temp_db = SessionLocal()
         try:
             campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
             ui_record = campaign.user_intel
-            # Full sender profile so the ICP gate judges against the real sender,
-            # not a hardcoded profile.
             user_intel_dict = {
                 "company_name": ui_record.company_name,
                 "services": json.loads(ui_record.offerings) if ui_record.offerings else [],
@@ -135,9 +247,6 @@ class CampaignService:
                 "proof_points": ui_record.proof_points or [],
                 "deep_research": ui_record.deep_research or "",
             }
-            # All of the user's campaign filters reach the gate (target_industry and
-            # the objective prompt were previously dropped — the industry filter was
-            # silently ignored).
             campaign_metadata = {
                 "target_industry": campaign.target_industry,
                 "target_location": campaign.target_location,
@@ -147,123 +256,143 @@ class CampaignService:
         finally:
             temp_db.close()
 
-        # 2. Run long LLM validation holding ZERO DB connections
         validator = CompanyValidationService()
+        from app.agents.lead_fit_screener import LeadFitScreener
+        screener = LeadFitScreener()
         import asyncio
 
-        STAGE3_COMMIT_BATCH = 10   # companies persisted per DB transaction
-        # Concurrency (companies in flight) is deliberately DECOUPLED from the commit
-        # batch size. A streaming worker pool keeps ICP_CONCURRENCY companies running
-        # at all times: the moment one finishes, the freed slot picks up the next, so a
-        # single slow site / slow LLM call can no longer stall a whole batch (the old
-        # per-chunk `gather` waited for the slowest of 10 before starting the next 10).
-        # Verdicts are identical — only scheduling changes. Tune width via ICP_CONCURRENCY.
-        semaphore = asyncio.Semaphore(settings.ICP_CONCURRENCY)
+        STAGE3_COMMIT_BATCH = 10
 
-        # In-memory circuit flag. We check Redis (circuit_is_open) only at batch
-        # boundaries — NOT once per company — so the per-company path stays free of a
-        # synchronous Redis round-trip that would stall the event loop. validate_one
-        # reads this flag (late-bound) and skips cheaply once it flips.
-        circuit_open = [circuit_is_open(OPENAI_CIRCUIT)[0]]
+        # Resume state: what the screener has already written, and what still needs ICP.
+        screener_done, icp_needed_from_db = self._fetch_resume_state(campaign_id)
 
-        async def validate_one(domain, co_data, research_cache):
-            async with semaphore:
-                # Fail-fast: once the provider circuit is open, drain the remaining
-                # queued companies cheaply instead of burning each one's retry backoff.
-                # They stay unjudged and are resumed on the rescheduled run.
-                if circuit_open[0]:
-                    return domain, {"_circuit_skipped": True}
-                try:
-                    res = await validator.qualify_and_enrich(co_data, user_intel_dict, campaign_metadata, research_cache=research_cache)
-                    return domain, res
-                except Exception as e:
-                    logger.error(f"Qualify+enrich failed for {domain}: {e}")
-                    return domain, {"status": "ERROR", "reasoning": str(e), "_llm_error": True}
+        all_items = list(unique_cos.items())
+        total = len(all_items)
+        # Phase 1 runs only on companies NOT yet in target_companies.
+        screener_items = [(d, co) for d, co in all_items if d not in screener_done]
+        # Phase 2 starts with any SCREENER_PASSED rows from a previous incomplete run.
+        icp_queue: list = list(icp_needed_from_db)
 
-        # 3. Build the work list + resume-awareness: skip companies already given a
-        # terminal ICP verdict for THIS campaign (any status except ERROR) so a
-        # restart/retry/resurrection does not re-pay LLM + crawl for work already done.
-        # ERROR rows are kept so transient failures are re-judged. This changes only
-        # *what is recomputed*, never the qualification result for any company.
-        items = list(unique_cos.items())
-        judged = self._fetch_judged_icp_domains(campaign_id)
-        if judged:
-            before = len(items)
-            items = [(d, data) for d, data in items if d not in judged]
-            logger.info(
-                f"♻️ [STAGE 3] Resume for {campaign_id}: {before - len(items)} already judged, "
-                f"{len(items)} remaining."
-            )
-
-        total = len(items)
         logger.info(
-            f"🚦 [STAGE 3] Filtering {total} companies for {campaign_id} "
-            f"(streaming pool, concurrency={settings.ICP_CONCURRENCY}, commit batch {STAGE3_COMMIT_BATCH})."
+            f"[STAGE 3] Campaign {campaign_id}: {total} total, "
+            f"{len(screener_done)} already in DB ({len(icp_needed_from_db)} need ICP), "
+            f"{len(screener_items)} new for screener."
         )
 
-        # One batched cache read for ALL remaining domains (was once per chunk): any
-        # already-known, still-fresh domain skips crawl + enrich.
-        research_cache = validator.prefetch_icp_research([d for d, _ in items])
+        # ── PHASE 1: Screener (new companies only) ────────────────────────────
+        if screener_items:
+            screen_sem = asyncio.Semaphore(settings.ICP_CONCURRENCY)
 
-        def _commit_batch(batch: list) -> None:
-            """Persist one batch, pulse the lease heartbeat, and run outage detection.
-            A batch where EVERY company hit an LLM/transport error trips the breaker
-            (keyed off the non-persisted `_llm_error` flag, never a legit REJECTED)."""
-            self._persist_stage3_chunk(campaign_id, batch, unique_cos)
-            self._pulse_heartbeat(campaign_id, worker_id)
-            logger.info(f"   ↳ [STAGE 3] Committed {processed}/{total} for {campaign_id}.")
-            if all(r.get("_llm_error") for _, r in batch):
-                record_circuit_failure(OPENAI_CIRCUIT, "Stage 3 batch fully errored")
-            # Refresh the in-memory flag once per batch; once open, remaining queued
-            # companies skip cheaply and we reschedule after the loop.
-            if not circuit_open[0] and circuit_is_open(OPENAI_CIRCUIT)[0]:
-                circuit_open[0] = True
+            async def run_screener(domain, co_data):
+                async with screen_sem:
+                    try:
+                        result = await screener.screen(co_data, campaign_metadata, user_intel_dict)
+                        return domain, result
+                    except Exception as e:
+                        logger.warning(f"[SCREENER] Failed for {domain}, treating as SCREENER_PASSED: {e}")
+                        return domain, None  # error → fall through to ICP
 
-        # 4. Streaming fan-out: every company is launched behind the shared semaphore
-        #    (so at most ICP_CONCURRENCY run at once) and results are handled AS THEY
-        #    COMPLETE, persisted every STAGE3_COMMIT_BATCH. Completed tasks are released
-        #    each loop so only the in-flight working set stays in memory.
-        pending = {
-            asyncio.create_task(validate_one(domain, data, research_cache))
-            for domain, data in items
-        }
-        buffer: list = []
-        processed = 0
-        skipped = 0
-        try:
-            while pending:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for fut in done:
-                    domain, res = fut.result()
-                    if res.get("_circuit_skipped"):
-                        skipped += 1
-                        continue
-                    buffer.append((domain, res))
-                    processed += 1
-                    if len(buffer) >= STAGE3_COMMIT_BATCH:
-                        _commit_batch(buffer)
-                        buffer = []
-                del done
-            if buffer:  # flush the final partial batch
-                _commit_batch(buffer)
-                buffer = []
-        finally:
-            for t in pending:
-                t.cancel()
+            screener_pending = {asyncio.create_task(run_screener(d, co)) for d, co in screener_items}
+            screen_buffer: list = []
 
-        # If the provider circuit opened mid-run we deliberately skipped the remaining
-        # companies; reschedule so the resume-aware filter finishes them next pass.
-        if skipped:
-            logger.warning(
-                f"[STAGE 3] Provider circuit open: {skipped} companies deferred for {campaign_id}. Rescheduling."
+            try:
+                while screener_pending:
+                    done, screener_pending = await asyncio.wait(screener_pending, return_when=asyncio.FIRST_COMPLETED)
+                    for fut in done:
+                        domain, screen = fut.result()
+                        if screen is not None and screen.final_verdict == "FAIL":
+                            status = "REJECTED"
+                            logger.info(f"[SCREENER] {domain} pre-filtered: {screen.summary}")
+                        else:
+                            status = "SCREENER_PASSED"
+                            icp_queue.append(domain)
+                        screen_buffer.append((domain, status, screen))
+                        if len(screen_buffer) >= STAGE3_COMMIT_BATCH:
+                            self._persist_screener_batch(campaign_id, screen_buffer, unique_cos)
+                            self._pulse_heartbeat(campaign_id, worker_id)
+                            screen_buffer = []
+                    del done
+            finally:
+                for t in screener_pending:
+                    t.cancel()
+
+            if screen_buffer:
+                self._persist_screener_batch(campaign_id, screen_buffer, unique_cos)
+                self._pulse_heartbeat(campaign_id, worker_id)
+
+            screened_reject = len(screener_items) - (len(icp_queue) - len(icp_needed_from_db))
+            logger.info(
+                f"[STAGE 3] Phase 1 done: {len(screener_items)} screened, "
+                f"{screened_reject} REJECTED, {len(icp_queue)} queued for ICP."
             )
-            raise CircuitOpenError("OpenAI circuit open during Stage 3 ICP filtering")
 
-        # 4. Mark stage complete once every chunk has landed. Because qualification
-        # AND research happened together, accepted companies are already
-        # RESEARCH_COMPLETE — advance the campaign straight to STAGE_4 so the state
-        # machine routes to stakeholder ranking (the separate deep-research stage is
-        # now a no-op).
+        # ── PHASE 2: ICP (SCREENER_PASSED companies only) ────────────────────
+        icp_items = [(d, unique_cos[d]) for d in icp_queue if d in unique_cos]
+
+        if not icp_items:
+            logger.info(f"[STAGE 3] No companies passed screening for {campaign_id}.")
+        else:
+            logger.info(
+                f"[STAGE 3] Phase 2: ICP on {len(icp_items)} companies "
+                f"(concurrency={settings.ICP_CONCURRENCY}, batch={STAGE3_COMMIT_BATCH})."
+            )
+            research_cache = validator.prefetch_icp_research([d for d, _ in icp_items])
+            circuit_open = [circuit_is_open(OPENAI_CIRCUIT)[0]]
+            icp_sem = asyncio.Semaphore(settings.ICP_CONCURRENCY)
+
+            async def run_icp(domain, co_data):
+                async with icp_sem:
+                    if circuit_open[0]:
+                        return domain, {"_circuit_skipped": True}
+                    try:
+                        res = await validator.qualify_and_enrich(
+                            co_data, user_intel_dict, campaign_metadata,
+                            research_cache=research_cache,
+                        )
+                        return domain, res
+                    except Exception as e:
+                        logger.error(f"[ICP] Failed for {domain}: {e}")
+                        return domain, {"status": "ERROR", "reasoning": str(e), "_llm_error": True}
+
+            icp_pending = {asyncio.create_task(run_icp(d, co)) for d, co in icp_items}
+            icp_buffer: list = []
+            icp_processed = 0
+            skipped = 0
+
+            def _commit_icp(batch: list) -> None:
+                self._update_icp_batch(campaign_id, batch)
+                self._pulse_heartbeat(campaign_id, worker_id)
+                logger.info(f"   [STAGE 3] ICP committed {icp_processed}/{len(icp_items)} for {campaign_id}.")
+                if all(r.get("_llm_error") for _, r in batch):
+                    record_circuit_failure(OPENAI_CIRCUIT, "Stage 3 ICP batch fully errored")
+                if not circuit_open[0] and circuit_is_open(OPENAI_CIRCUIT)[0]:
+                    circuit_open[0] = True
+
+            try:
+                while icp_pending:
+                    done, icp_pending = await asyncio.wait(icp_pending, return_when=asyncio.FIRST_COMPLETED)
+                    for fut in done:
+                        domain, res = fut.result()
+                        if res.get("_circuit_skipped"):
+                            skipped += 1
+                            continue
+                        icp_buffer.append((domain, res))
+                        icp_processed += 1
+                        if len(icp_buffer) >= STAGE3_COMMIT_BATCH:
+                            _commit_icp(icp_buffer)
+                            icp_buffer = []
+                    del done
+                if icp_buffer:
+                    _commit_icp(icp_buffer)
+            finally:
+                for t in icp_pending:
+                    t.cancel()
+
+            if skipped:
+                logger.warning(f"[STAGE 3] Provider circuit open: {skipped} deferred. Rescheduling.")
+                raise CircuitOpenError("OpenAI circuit open during Stage 3 ICP filtering")
+
+        # Mark stage complete.
         temp_db = SessionLocal()
         try:
             campaign = temp_db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
@@ -272,7 +401,14 @@ class CampaignService:
                 temp_db.commit()
         finally:
             temp_db.close()
-        logger.info(f"✅ [STAGE 3+4] Combined ICP Qualification + Research Complete for {campaign_id}")
+
+        icp_count = len(icp_queue)
+        screener_rejected = total - len(screener_done) - icp_count + len(icp_needed_from_db)
+        logger.info(
+            f"[STAGE 3+4] Complete for {campaign_id}: {total} total, "
+            f"{max(0, screener_rejected)} pre-filtered (REJECTED), "
+            f"{icp_count} reached ICP."
+        )
 
     @staticmethod
     def _apply_enrichment(co, res: dict) -> None:

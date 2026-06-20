@@ -69,12 +69,9 @@ class CompanyResearchProfile(BaseModel):
 
 class ICPMeddpiccJudgment(BaseModel):
     """ICP validation verdict (Call 2, reasoning model). Judges the structured research
-    profile + CSV firmographics against the SENDER's ICP using MEDDPICC. Sees the
-    distilled profile, NOT the raw web text."""
-    # ---- Firmographic filters (the campaign's explicit requirements; KEPT) ----
-    industry_match: DimensionVerdict = Field(description="Does the company's ACTUAL business (from the research profile) fall UNDER any campaign target industry (supercategory containment, not exact-label match)?")
-    location_match: DimensionVerdict = Field(description="Company HQ/operating region vs the campaign's target locations.")
-    size_match: DimensionVerdict = Field(description="Company employee size vs the campaign's target size.")
+    profile against the SENDER's ICP using MEDDPICC. Firmographic pre-filtering
+    (industry / location / size) is handled upstream by LeadFitScreener; only
+    SCREENER_PASSED companies reach this stage."""
 
     # ---- MEDDPICC role gate (primary; derived from the sender via BUYER/COMPETITOR profiles) ----
     target_role: Literal["operator_end_user", "solution_vendor_overlap", "out_of_domain"] = Field(
@@ -173,7 +170,11 @@ PREVENT false positives and stay fully grounded. Quote facts from the RESEARCH P
 needs, names, or firmographics. Everything sender-related must be derived from THIS sender — no
 fixed-industry assumptions.
 
-SENDER PROFILE (who is doing the outreach):
+==================== CAMPAIGN-LEVEL INPUTS (identical for every company in this run) ====================
+These inputs are the SAME for every lead in the campaign, so they form the cache-stable prefix; the only
+per-company data is the TARGET RECORD at the very end.
+
+SENDER PROFILE — user company intel (who is doing the outreach):
 - Company: {sender_name}
 - Offerings: {sender_offerings}
 - Sells to (their ICP): {sender_customers}
@@ -182,58 +183,15 @@ SENDER PROFILE (who is doing the outreach):
 - Proof points: {sender_proof}
 - Business summary: {sender_research}
 
-APPROVAL THRESHOLD: {threshold}/100. A company is ACCEPTED when its fit score reaches this threshold and
-no firmographic requirement is violated. Calibrate operator_fit and the evidence floors HONESTLY against
-this bar — never inflate a score to clear it, never deflate a genuine fit.
+CAMPAIGN OBJECTIVE — the user's own words (the target should help satisfy this): {campaign_prompt}
 
-==================== PART A — FIRMOGRAPHIC FILTERS (structural gate) ====================
-Judge these THREE checks STRICTLY against the CSV FIRMOGRAPHIC FIELDS below — compare target industry to
-the CSV Industry, target location to the CSV Location, target size to the CSV Employee size. IGNORE the
-RESEARCH PROFILE entirely for PART A: it may mention a parent company's headcount, extra regions, or
-activities that are NOT this record's firmographics, and using it causes wrong fails. Do NOT use the
-campaign objective here either.
+APPROVAL THRESHOLD: {threshold}/100. A company is ACCEPTED when its fit score reaches this threshold.
+Calibrate operator_fit and the evidence floors HONESTLY against this bar — never inflate a score to clear
+it, never deflate a genuine fit.
 
-USER-SPECIFIED REQUIREMENTS (may contain one or more values each):
-- Target industries: {target_industry}
-- Target locations: {target_loc}
-- Target employee size: {target_size}
-
-The CSV FIRMOGRAPHIC FIELDS (the ONLY source for PART A) are given in the TARGET RECORD at the END of this
-prompt — judge industry_match against the "Industry" line there (ignore the research profile for PART A).
-
-For each, return verdict (pass | fail | unknown) + one-sentence evidence (cite the CSV field):
-1. industry_match (compare the CSV Industry to the target industries): the question is ONLY "does the CSV
-   industry fall UNDER any target industry?" — NOT "does it exactly equal the input". Treat each target
-   industry as a broad SUPERCATEGORY that includes all its sub-sectors, specialisations and verticals. The
-   bar for FAIL is INTENTIONALLY HIGH — FAIL hard-disqualifies, so use it ONLY when the CSV industry is
-   CLEARLY in a different supercategory than EVERY target. When the CSV label is ambiguous, return UNKNOWN
-   (does NOT disqualify), never FAIL. Procedure (judge the CSV industry label only):
-   - If "Any" -> PASS.
-   - If the CSV industry is IDENTICAL to any target -> PASS.
-   - If the CSV industry is a SUB-SECTOR, SPECIALISATION, or VERTICAL inside any target supercategory ->
-     PASS. The illustrative cross-industry examples below show the supercategory→sub-sector relationship —
-     they are NOT a fixed list; derive the inclusion from general knowledge of how the target industry is
-     structured:
-       * "Manufacturing" is satisfied by any sub-sector that makes/produces physical goods — for
-         example: Electronics Manufacturing, Electrical/Electronic Manufacturing, Industrial Automation,
-         Machinery, Mechanical/Industrial Engineering, Materials/Composites, Textiles production,
-         Dairy/Food equipment, Nanotechnology, Consumer Electronics (the makers, not retailers), etc.
-       * "Healthcare" is satisfied by Pharma, Medical Devices, Biotech, Clinical Services, etc.
-       * "Financial Services" is satisfied by Banking, Insurance, Fintech, Asset Management, etc.
-       * "Technology / Software" is satisfied by SaaS, Enterprise Software, Cloud, Cybersecurity, etc.
-   - If the CSV label is AMBIGUOUS between supercategories (e.g. "Consumer Electronics", "Logistics",
-     "Dairy", "Technology") -> UNKNOWN. Do NOT guess; UNKNOWN does not disqualify.
-   - Return FAIL ONLY when the CSV industry is UNAMBIGUOUSLY in a DIFFERENT supercategory than EVERY target
-     (e.g. a recruitment agency, a coffee shop, or a law firm against a "Manufacturing" filter). Against a
-     "Manufacturing" target, ANY label that denotes making / producing / fabricating / engineering physical
-     goods is a PASS, NOT a fail — this explicitly INCLUDES "Textiles", "Industrial", "Industrial
-     Automation", "Machinery", "Electrical/Electronic Manufacturing", "Composites", "Materials", and the
-     like (textile *manufacturing* is manufacturing). Reserve FAIL for pure non-physical services with no
-     production at all. If the label could plausibly involve making physical goods, return UNKNOWN, never
-     FAIL.
-2. location_match and 3. size_match: the SYSTEM validates these two deterministically from the CSV fields
-   AFTER your response, so do NOT spend effort on them — just return verdict "unknown" with evidence
-   "validated separately by the system" for both. (industry_match above IS yours to decide.)
+NOTE: Firmographic pre-filtering (industry / location / employee-size) was handled upstream by
+LeadFitScreener. Only companies that cleared that screen reach you. Do NOT re-evaluate firmographics —
+focus entirely on MEDDPICC qualification and sender-relative enrichment.
 
 ==================== PART B — MEDDPICC ICP QUALIFICATION (sender-fit) ====================
 This is where the CAMPAIGN OBJECTIVE and the RESEARCH PROFILE are used.
@@ -244,9 +202,8 @@ NEVER states the company's internal problems, gaps, or needs. Therefore judge fi
 the company does: if its operations match the sender's buyer profile, it is a fit, REGARDLESS of whether
 any pain is spelled out. The ABSENCE of a stated need or problem is NOT evidence against fit and must NOT
 lower the fit grade. Reserve low fit grades for companies whose operations genuinely do not match the
-buyer profile — not for companies that simply did not advertise a weakness.
-
-CAMPAIGN OBJECTIVE (the user's own words — the target should help satisfy this): {campaign_prompt}
+buyer profile — not for companies that simply did not advertise a weakness. Judge fit in light of the
+CAMPAIGN OBJECTIVE stated in the campaign-level inputs above.
 
 The TARGET COMPANY name and its RESEARCH PROFILE (distilled from the company's own website) are given in
 the TARGET RECORD at the END of this prompt. Treat that RESEARCH PROFILE as THE evidence — quote from it
@@ -288,6 +245,17 @@ Then ground EVERY field in the RESEARCH PROFILE, judged in light of the campaign
   Do NOT default to out_of_domain just because the target's product category differs from the sender's
   typical customers; the decisive question is whether the target's OPERATIONS match the derived BUYER
   PROFILE.
+
+  PRODUCTION OPERATIONS RULE (applies whenever the sender serves manufacturers / operators):
+  If the research profile shows the company RUNS ITS OWN production lines, assembly operations, or
+  manufacturing machinery — even for simple products (springs, printed materials, food products,
+  consumer goods, building materials, etc.) — it is ALWAYS operator_end_user, NOT out_of_domain.
+  The complexity or glamour of what they make is irrelevant; what matters is that they OPERATE EQUIPMENT
+  that can fail, slow, or go out of specification. Reserve out_of_domain strictly for companies with NO
+  production operations: pure service firms, consultancies, software companies, financial services,
+  resellers/distributors that buy and resell without manufacturing, or companies whose entire value
+  chain is non-physical. A company that BOTH manufactures AND distributes is an operator — the
+  manufacturing side qualifies it.
 - operational_overlap (0-45, operators only; else 0) — the ONLY fit number you score. Judge how DIRECTLY
   the target's core operations match the BUYER PROFILE and its derived signals, inferred from what the
   company does/makes/serves: 38-45 textbook match to the central signal; 25-37 clear match; 12-24
@@ -324,11 +292,6 @@ separately. Write it for a human sales reader — NO scores, field names, boolea
 bracketed metadata. Then confidence (0-100).
 
 ==================== TARGET RECORD (the ONLY per-company inputs) ====================
-CSV FIRMOGRAPHIC FIELDS (for PART A):
-- Industry: {csv_industry}
-- Location: {csv_loc}
-- Employee size: {csv_size}
-
 TARGET COMPANY:
 - Name: {name}
 - RESEARCH PROFILE (THE evidence — quote from it):
@@ -753,20 +716,7 @@ class CompanyValidationService:
         domain = company_data.get("domain") or company_data.get("website")
         name = company_data.get("name")
 
-        # Prefer the structured country for deterministic location matching; the free
-        # location string remains the prompt-facing label.
-        csv_loc = company_data.get("location") or "N/A"
-        csv_country = company_data.get("country") or csv_loc
-        csv_size = company_data.get("size") or "N/A"
-        csv_industry = company_data.get("industry") or "N/A"
-        csv_sic = company_data.get("sic_code") or ""
-        csv_naics = company_data.get("naics_code") or ""
         csv_desc = company_data.get("description") or ""
-
-        # Campaign requirements (the user's explicit filters for THIS campaign).
-        target_industry = self._as_text(campaign_metadata.get("target_industry"))
-        target_loc = self._as_text(campaign_metadata.get("target_location"))
-        target_size = self._as_text(campaign_metadata.get("target_employee_count"))
         campaign_prompt = self._as_text(campaign_metadata.get("prompt"), empty="(no specific objective provided)")
 
         # Sender profile (built dynamically — no hardcoded values).
@@ -821,12 +771,6 @@ class CompanyValidationService:
                 "sender_proof": sender_proof,
                 "sender_research": (sender_research or "N/A")[:3000],
                 "threshold": settings.ICP_ACCEPT_THRESHOLD,
-                "target_industry": target_industry,
-                "target_loc": target_loc,
-                "target_size": target_size,
-                "csv_industry": csv_industry,
-                "csv_loc": csv_loc,
-                "csv_size": csv_size,
                 "campaign_prompt": campaign_prompt[:1500],
                 "name": name,
                 "profile": rendered[:8000],
@@ -870,54 +814,13 @@ class CompanyValidationService:
             res.signal_breadth = 0
             res.operator_fit = 0
 
-        # Location + size are validated deterministically against the CSV fields ONLY
-        # (overriding the model, which wavered between the CSV field and headcounts/
-        # locations mentioned in the research profile). Location uses the structured
-        # country when present (cleaner than the free-text blob).
-        lv, le = self._match_location(csv_country, target_loc)
-        sv, se = self._match_size(csv_size, target_size)
-        res.location_match = DimensionVerdict(verdict=lv, evidence=le)
-        res.size_match = DimensionVerdict(verdict=sv, evidence=se)
-
-        # Deterministic industry PASS from SIC/NAICS codes (precise, positive-only). When
-        # the company's official code falls under a target industry, trust it over the
-        # LLM's label-guessing — this is what makes "Textiles" (NAICS 313) correctly read
-        # as Manufacturing instead of being hard-failed. Never forces a FAIL.
-        matched_cat = self._deterministic_industry_pass(csv_sic, csv_naics, target_industry)
-        if matched_cat:
-            res.industry_match = DimensionVerdict(
-                verdict="pass",
-                evidence=(f"SIC/NAICS code ({csv_sic or csv_naics}) classifies this company under "
-                          f"{matched_cat}, which falls within the target industry."),
-            )
-
-        # Industry-gate safety net: the model sometimes hard-FAILS a CSV industry that is
-        # really a manufacturing sub-sector (e.g. "Textiles", "Industrial") while ALSO
-        # classifying the company as a genuine operator that runs the operations the sender
-        # serves. Those two judgments are contradictory: a clear different-supercategory
-        # company could not be an operator_end_user for this sender. When they conflict,
-        # trust the role read and soften the FAIL to UNKNOWN (which does not disqualify) so
-        # a true manufacturer is not silently dropped on a mislabelled industry string.
-        if res.industry_match.verdict == "fail" and res.target_role == "operator_end_user":
-            logger.info(
-                f"[ICP] Softening industry FAIL->UNKNOWN for {domain}: model classified it as "
-                f"operator_end_user, so the CSV industry '{csv_industry}' is not a clear "
-                f"different-supercategory mismatch."
-            )
-            res.industry_match = DimensionVerdict(
-                verdict="unknown",
-                evidence=(f"CSV industry '{csv_industry}' is ambiguous against the target, but the "
-                          f"company operates as a genuine end-user in the sender's domain."),
-            )
-
         result = self._decide(res, profile)
         if return_context:
             result["_eval_context"] = rendered[:9000]
         return result
 
     @staticmethod
-    def _format_reasoning(m: "ICPMeddpiccJudgment", verdict: str, score: int,
-                          threshold: int, firmo_fail: bool) -> str:
+    def _format_reasoning(m: "ICPMeddpiccJudgment", verdict: str, score: int, threshold: int) -> str:
         """Assemble the user-facing decision rationale as clean, professional prose.
 
         Combines the LLM's analyst assessment (overall_reasoning) with a deterministic,
@@ -933,20 +836,7 @@ class CompanyValidationService:
             if m.has_evidenced_need and (m.need_evidence or "").strip().lower() not in ("", "none evidenced"):
                 note += f" A relevant need is evidenced: {m.need_evidence.strip()}"
         else:
-            if firmo_fail:
-                fails = [
-                    (label, dim) for label, dim in (
-                        ("industry", m.industry_match),
-                        ("location", m.location_match),
-                        ("size", m.size_match),
-                    ) if dim.verdict == "fail"
-                ]
-                detail = "; ".join(dim.evidence.strip() for _, dim in fails if (dim.evidence or '').strip())
-                crit = ", ".join(label for label, _ in fails)
-                note = f"It does not qualify: it falls outside the campaign's {crit} requirement."
-                if detail:
-                    note += f" {detail}"
-            elif m.target_role == "solution_vendor_overlap":
+            if m.target_role == "solution_vendor_overlap":
                 note = ("It does not qualify: the company appears to sell a solution that competes with the "
                         "sender's, rather than being a prospective customer.")
             elif m.target_role == "out_of_domain":
@@ -975,24 +865,18 @@ class CompanyValidationService:
         ov = self._overall_score(m)  # int for operators, None for gated roles
         score = ov if ov is not None else 0
 
-        firmo_fail = (
-            m.industry_match.verdict == "fail"
-            or m.location_match.verdict == "fail"
-            or m.size_match.verdict == "fail"
-        )
-
-        # Binary verdict — no REVIEW band. A company is ACCEPTED iff it clears the
-        # ICP threshold and has no explicit firmographic violation; everything else
-        # is REJECTED. Gated roles (out_of_domain / solution_vendor_overlap) score 0
-        # via _overall_score, so they fall below threshold and reject naturally.
-        if not firmo_fail and score >= threshold:
+        # Binary verdict — no REVIEW band. Firmographic pre-filtering was done upstream
+        # by LeadFitScreener. A company is ACCEPTED iff it clears the ICP threshold.
+        # Gated roles (out_of_domain / solution_vendor_overlap) score 0 via _overall_score
+        # and fall below threshold naturally.
+        if score >= threshold:
             verdict = "ACCEPT"
         else:
             verdict = "REJECT"
 
         status = {"ACCEPT": "ACCEPTED", "REJECT": "REJECTED"}[verdict]
 
-        reasoning = self._format_reasoning(m, verdict, score, threshold, firmo_fail)
+        reasoning = self._format_reasoning(m, verdict, score, threshold)
 
         # Research fields come from the Call-1 profile (company facts); sender-relative
         # fields come from the Call-2 judgment.

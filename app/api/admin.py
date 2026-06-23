@@ -761,3 +761,70 @@ def revoke_session(
     db.commit()
     revoke_sessions(s.user_id)
     return {"message": "Session revoked and user sessions terminated."}
+
+
+# --------------------------------------------------------------------------- #
+# LLM Cost Report                                                              #
+# --------------------------------------------------------------------------- #
+
+@router.get("/cost-report/{campaign_id}", summary="Per-agent per-company LLM cost breakdown")
+def get_campaign_cost_report(
+    campaign_id: str,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns a detailed LLM cost breakdown for a campaign, split by company (domain)
+    and by agent. Requires Admin or Super Admin role.
+
+    Response shape:
+      campaign:  { usd, tokens }              — campaign totals
+      companies: [ { domain, usd, tokens,
+                     agents: { agent_name: { usd, tokens } } } ]  — sorted by cost desc
+      agents:    [ { agent, usd, tokens } ]   — sorted by cost desc
+      missing:   bool                         — true when Redis has no data yet
+    """
+    require_permission(current_user, "admin:read")
+
+    # Verify the campaign belongs to this user's tenant (non-super-admins only).
+    scope = _require_tenant_scope(current_user)
+    if scope is not None:
+        campaign = db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found.")
+        owner = db.query(models.User).filter(models.User.id == campaign.user_id).first()
+        if not owner or owner.tenant_id != scope:
+            raise HTTPException(status_code=403, detail="Campaign is outside your tenant.")
+
+    from app.core.cost import get_cost_report
+    return get_cost_report(campaign_id)
+
+
+@router.get("/cost-report", summary="Daily LLM cost summary across all campaigns")
+def get_daily_cost_summary(
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Returns today's global LLM spend from Redis aggregate keys.
+    Super Admin only.
+    """
+    require_system_role(current_user, SUPER)
+
+    try:
+        from app.core.security import _get_redis
+        r = _get_redis()
+        if not r:
+            return {"missing": True, "reason": "Redis unavailable"}
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
+        daily_usd    = float(r.get(f"llm_cost:{today}") or 0.0)
+        total_usd    = float(r.get("llm_cost_total") or 0.0)
+        total_tokens = int(r.get("llm_tokens_total") or 0)
+        return {
+            "date":         today,
+            "daily_usd":    round(daily_usd, 6),
+            "total_usd":    round(total_usd, 6),
+            "total_tokens": total_tokens,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

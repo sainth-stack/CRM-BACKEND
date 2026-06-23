@@ -3,8 +3,10 @@ import sys
 import os
 import contextvars
 
-# Global Contextual Trace Identifier: Thread/Async-safe campaign tracking
-campaign_id_var = contextvars.ContextVar("campaign_id", default=None)
+# Global Contextual Trace Identifiers: Thread/Async-safe campaign + per-call tracking
+campaign_id_var    = contextvars.ContextVar("campaign_id",    default=None)
+company_domain_var = contextvars.ContextVar("company_domain", default=None)
+agent_label_var    = contextvars.ContextVar("agent_label",    default=None)
 
 class CampaignFilter(logging.Filter):
     """

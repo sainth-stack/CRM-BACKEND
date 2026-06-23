@@ -7,6 +7,48 @@ import logging
 
 logger = logging.getLogger("CSVTrimmingEngine")
 
+# Phone fields that may arrive as Excel-style floats (e.g. 2.12221E+12 → "2122210000").
+_PHONE_FIELDS = {
+    "contact_mobile_phone", "company_phone_1",
+}
+
+def _normalise_phone(val) -> str | None:
+    """Convert a phone value to a clean string.
+
+    Excel exports large phone numbers as floats in scientific notation
+    (e.g. "2.12221E+12"). We convert to an integer string, but only when
+    the result is a plausible phone number (≤15 digits — E.164 max length).
+    Numbers with more digits have lost precision in Excel and cannot be
+    recovered reliably, so we return None rather than store a corrupt value.
+    Returns None for blank/NaN values.
+    """
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return None
+    # Detect scientific notation (e.g. "2.12221E+12", "4.80783E+13")
+    if "e" in s.lower() and ("e+" in s.lower() or "e-" in s.lower()):
+        try:
+            converted = str(int(float(s)))
+            # US numbers: 10 digits (local) or 11 with country code.
+            # International E.164: up to 15 digits. Anything beyond 15 is clearly
+            # a precision-lost float from Excel — discard it.
+            # Additionally, numbers with 13-15 digits that end in many zeros are
+            # also likely precision-corrupted (e.g. "2122210000000" for "2122214700").
+            n = len(converted)
+            if n > 15:
+                return None
+            if n > 12 and converted.endswith("000"):
+                return None  # trailing zeros reveal float precision loss
+            return converted
+        except (ValueError, OverflowError):
+            return None
+    # Remove trailing ".0" that pandas adds when it reads phone columns as float
+    if re.fullmatch(r"\d+\.0", s):
+        return s[:-2]
+    return s
+
 def get_fuzzy_map(cols):
     """Fuzzy-match raw CSV headers to the canonical field names."""
     f_map = {}
@@ -31,7 +73,9 @@ def get_fuzzy_map(cols):
         'company_staff_count_range': r'company\s*staff\s*count\s*range',
         'time_in_role': r'time\s*in\s*role',
         'time_at_company': r'time\s*at\s*company',
-        'contact_mobile_phone': r'contact\s*mobile\s*phone$',
+        # Matches "Contact Mobile Phone" (Seamless/Apollo) OR "Contact Phone 1"
+        # (alternate data-provider alias) — both map to the same canonical slot.
+        'contact_mobile_phone': r'(?:contact\s*mobile\s*phone|contact\s*phone\s*1)$',
         'company_phone_1': r'company\s*phone\s*1',
         # Richer firmographics (high fill-rate; drive deterministic ICP scoring).
         # Patterns are END-ANCHORED where a near-duplicate sibling header exists
@@ -69,7 +113,11 @@ class CSVProcessingService:
     SELECTED_COLUMNS = [
         "Contact Full Name", "Title", "Seniority", "Department", "Company Name - Cleaned", "Website",
         "Primary Email", "Contact LI Profile URL",
-        "Contact Phone 1", "Company Phone 1", "Contact Location", "Company Location",
+        # "Contact Mobile Phone" is the actual column in Seamless/Apollo exports.
+        # "Contact Phone 1" is a fallback alias used by some data providers.
+        # Both are included so either format is preserved through the trim.
+        "Contact Mobile Phone", "Contact Phone 1", "Company Phone 1",
+        "Contact Location", "Company Location",
         "Company Description", "Company Website Domain", "Company Industry",
         "Company LI Profile Url", "Company LinkedIn ID", "Company Revenue Range",
         "Company Staff Count Range", "Time in Role", "Time at Company",
@@ -178,7 +226,15 @@ class CSVProcessingService:
                     prospect = row.to_dict()
                     # Clean up: remove NaNs and keep only relevant fields
                     prospect = {k: v for k, v in prospect.items() if pd.notna(v)}
-                    
+
+                    # Normalise phone fields — Excel exports large numbers in
+                    # scientific notation (e.g. 2.12221E+12); convert to digit strings.
+                    for _pf in _PHONE_FIELDS:
+                        if _pf in prospect:
+                            prospect[_pf] = _normalise_phone(prospect[_pf])
+                            if prospect[_pf] is None:
+                                prospect.pop(_pf)
+
                     # Ensure a primary email exists for basic identification.
                     if not prospect.get('primary_email'):
                         continue

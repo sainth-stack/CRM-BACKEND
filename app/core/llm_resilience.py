@@ -185,7 +185,7 @@ def run_openai_guarded(operation_name: str, action, fallback=None):
     def execute_with_tracking():
         with get_openai_callback() as cb:
             result = action()
-            
+
             # Record Token Consumption Metrics
             if cb.total_tokens > 0:
                 logger.info(
@@ -196,12 +196,19 @@ def run_openai_guarded(operation_name: str, action, fallback=None):
                     try:
                         r.incrbyfloat(f"llm_cost:{today}", cb.total_cost)
                         r.expire(f"llm_cost:{today}", 172800) # Keep day's cost for 48h
-                        
+
                         # Increment Prometheus/Telemetry aggregate counters
                         r.incrby(f"llm_tokens_total", cb.total_tokens)
                         r.incrbyfloat(f"llm_cost_total", cb.total_cost)
                     except Exception as metric_err:
                         logger.warning(f"Failed to update cost metrics: {metric_err}")
+
+                # Per-agent-per-company granular write (same Redis hashes as CostGuard).
+                try:
+                    from app.core.cost import record_guarded_cost
+                    record_guarded_cost(operation_name, cb.total_cost, cb.total_tokens)
+                except Exception:
+                    pass
             
             # --- 4. Cache Insertion ---
             if r and result and settings.LLM_CACHE_ENABLED:

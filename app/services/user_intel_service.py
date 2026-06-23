@@ -25,7 +25,7 @@ class UserIntelService:
         return {
             "exact_company_name": research_data.get("exact_company_name"),
             "website": research_data.get("website"),
-            "motto": research_data.get("moto"),
+            "motto": research_data.get("motto"),
             "core_offerings": research_data.get("core_offerings"),
             "deep_research": research_data.get("deep_research"),
             "target_customers": research_data.get("target_customers"),

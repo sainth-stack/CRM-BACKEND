@@ -92,6 +92,10 @@ class DraftingService:
             "sender_advantages":    sender_advantages,
         }
 
+        from app.core.logging_config import agent_label_var, company_domain_var
+        _dom = target_co.domain if target_co and hasattr(target_co, "domain") else None
+        _dom_tok = company_domain_var.set(_dom or target_company_name)
+        _ag_tok  = agent_label_var.set("email_draft")
         try:
             with ObservabilityService.track_latency("gpt_draft_generation"):
                 final_state = await get_email_graph().ainvoke(
@@ -131,3 +135,6 @@ class DraftingService:
         except Exception as e:
             logger.error(f"Drafting error for {target_company_name}: {e}")
             return None
+        finally:
+            agent_label_var.reset(_ag_tok)
+            company_domain_var.reset(_dom_tok)

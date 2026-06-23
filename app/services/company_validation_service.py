@@ -1,25 +1,25 @@
-"""ICP qualification + deep-research (merged Stage 3+4).
+"""ICP qualification + deep-research — MEDDPICC engine with enrichment_v2 support.
 
-Evidence comes from the company's OWN website via the bounded
-curl_cffi + trafilatura extractor (`app.integrations.site_extractor.extract_site`).
-Qualification follows the stabilized MEDDPICC engine from the root ICP tool:
+Evidence comes from enrichment_v2 (6-source multi-layer pipeline) or from a site
+crawl + enrichment LLM call (eval/legacy path, via precomputed_context).
 
-  * ROLE GATE  — operator_end_user (genuine buyer) | solution_vendor_overlap
-                 (competitor/partner) | out_of_domain (unrelated). Only genuine
-                 operators can ACCEPT.
-  * TWO EVIDENCE FLOORS — an evidenced NEED the sender solves AND an evidenced
-                 PRECONDITION that makes the sender's solution usable. Both derived
-                 from the sender profile (sender/industry-agnostic). Matching the
-                 buyer profile alone is NOT enough.
-  * FIRMOGRAPHIC FILTERS — the campaign's explicit industry / location / employee-
-                 size requirements are KEPT as hard disqualifiers (as before).
+Architecture:
+  Pre-filter  — LeadFitScreener (upstream, CSV-only; not called here).
+  Call 1      — enrichment_v2.enrich_company()  → CompanyEnrichment (v2 schema)
+                OR legacy: site crawl → _enrich() → CompanyResearchProfile (v1).
+  Call 2      — Reasoning model validates the profile against sender + campaign:
+                ICPMeddpiccJudgment (MEDDPICC role gate + operational_overlap LLM,
+                scale_readiness + signal_breadth computed deterministically).
+  Decision    — _decide(): binary ACCEPTED / REJECTED vs ICP_ACCEPT_THRESHOLD.
 
-A single LLM call returns the verdict AND the research dossier (hooks/summary)
-for EVERY company — the dossier is grounded in the same web evidence regardless of
-verdict, so both accepted and rejected rows are displayable. The verdict is binary
-(ACCEPTED when the score clears the ICP threshold, else REJECTED). Accepted companies
-flow straight into stakeholder ranking; there is no separate research stage.
+Globally unbiased:
+  - No hardcoded industry, geography, or sector rubric.
+  - All scoring is relative to the sender's actual profile.
+  - operational_overlap is the only LLM-graded number; scale + breadth are
+    computed from firmographics/lists to give consistent per-company spread.
 """
+from __future__ import annotations
+
 import json
 import re
 import logging
@@ -30,119 +30,166 @@ from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.llm import get_chat_llm
-from app.integrations.site_extractor import extract_site
 
 logger = logging.getLogger("CompanyValidationService")
 
 
-# --------------------------------------------------------------------------- #
-# Structured output                                                            #
-# --------------------------------------------------------------------------- #
-class DimensionVerdict(BaseModel):
-    verdict: Literal["pass", "fail", "unknown"] = Field(
-        description="pass = clearly satisfies the requirement; fail = clearly contradicts it; unknown = insufficient evidence."
-    )
-    evidence: str = Field(description="One sentence citing the specific evidence behind the verdict.")
-
+# ===========================================================================
+# Pydantic schemas
+# ===========================================================================
 
 class CompanyResearchProfile(BaseModel):
-    """Structured company research distilled from the raw website crawl (ICP Call 1,
-    enrichment model). SENDER-AGNOSTIC — pure facts about the target — so it can be
-    cached and reused across campaigns/senders. The raw crawl is dropped right after
-    this object is produced; only this structured profile is stored and reused."""
-    actual_business: str = Field(description="One sentence: the company's ACTUAL primary business — what it makes / does / operates — read from the evidence, independent of any supplied industry label.")
-    products_services: List[str] = Field(default_factory=list, description="The company's core products and/or services as named in the evidence.")
-    markets_served: List[str] = Field(default_factory=list, description="Industries, customer types, and regions the company serves, per the evidence.")
-    scale_operations: str = Field(description="Operational scale from the evidence: facilities, locations, headcount, revenue, certifications, named technologies/equipment, production capabilities. 'Not stated' if absent.")
-    evidenced_signals: List[str] = Field(default_factory=list, description="3-8 SPECIFIC facts quoted/closely paraphrased from the evidence (what they make/operate/serve, scale, customers, named tech). Not generic.")
-    growth_hooks: List[str] = Field(default_factory=list, description="Concrete VERIFIABLE facts about the company (products, sectors/markets, scale, named tech, expansion). [] if the evidence is empty.")
-    pain_hooks: List[str] = Field(default_factory=list, description="ONLY challenges/problems/needs the evidence EXPLICITLY states about this company. Do NOT infer from what they do. [] if none stated.")
-    news_hooks: List[str] = Field(default_factory=list, description="ONLY recent items in the evidence explicitly about this company. [] if none.")
-    executive_summary: str = Field(description=(
-        "A focused research dossier (aim for 3-4 tight paragraphs / 900-1600 chars when the evidence "
-        "supports it) where EVERY claim traces to the provided evidence. Cover, in prose: (1) what the "
-        "company makes/does and its core products/services; (2) the markets, industries, and customer "
-        "types it serves; (3) scale and operations — facilities, locations, headcount, revenue, "
-        "certifications, named technologies; (4) any recent developments or notable operational traits. "
-        "Be concise and concrete — do NOT pad. If evidence is thin, write only what is grounded and say so."))
+    """Sender-agnostic research profile — produced by the eval/legacy enrichment path
+    (raw site crawl → LLM). Only `executive_summary` distinguishes v1 from v2."""
+    actual_business: str = Field(description="One sentence: the company's primary business.")
+    products_services: List[str] = Field(default_factory=list)
+    markets_served: List[str] = Field(default_factory=list)
+    scale_operations: str = Field(description="Operational scale from the evidence.")
+    evidenced_signals: List[str] = Field(default_factory=list)
+    growth_hooks: List[str] = Field(default_factory=list)
+    pain_hooks: List[str] = Field(default_factory=list)
+    news_hooks: List[str] = Field(default_factory=list)
+    executive_summary: str = Field(description="3-4 paragraphs grounded in evidence.")
 
 
 class ICPMeddpiccJudgment(BaseModel):
-    """ICP validation verdict (Call 2, reasoning model). Judges the structured research
-    profile against the SENDER's ICP using MEDDPICC. Firmographic pre-filtering
-    (industry / location / size) is handled upstream by LeadFitScreener; only
-    SCREENER_PASSED companies reach this stage."""
+    """Reasoning-model output — MEDDPICC ICP qualification against THIS sender.
 
-    # ---- MEDDPICC role gate (primary; derived from the sender via BUYER/COMPETITOR profiles) ----
+    operator_fit is SYSTEM-COMPUTED from the LLM's operational_overlap plus two
+    deterministic sub-scores (scale_readiness, signal_breadth). The LLM MUST output
+    0 for scale_readiness, signal_breadth, and operator_fit — the system fills them.
+    """
+
+    # ── Role gate ────────────────────────────────────────────────────────────
     target_role: Literal["operator_end_user", "solution_vendor_overlap", "out_of_domain"] = Field(
         description=(
-            "Classify the target against the BUYER PROFILE and COMPETITOR PROFILE you derived from the SENDER "
-            "PROFILE. The category names below illustrate the GENERAL CONCEPT across industries — they are not a "
-            "fixed list of allowed categories; the actual buyer/competitor profiles come ENTIRELY from THIS sender. "
-            "'operator_end_user' = the target matches the derived BUYER PROFILE — it RUNS the kind of operations "
-            "the sender's offering acts on (illustrative cross-industry examples of what counts as 'runs "
-            "operations': manufactures physical goods of ANY kind, runs production lines or equipment fleets, "
-            "operates clinics or hospital networks, operates retail stores or distribution, runs financial-services "
-            "back-office processes, etc.). A company that MAKES physical products of any category is an operator "
-            "even if its product looks unrelated to the sender at first glance — what matters is whether its "
-            "operations match the derived buyer profile, NOT whether its product category equals the sender's. "
-            "'solution_vendor_overlap' = the target's OWN core product matches the derived COMPETITOR PROFILE — it "
-            "sells a directly-competing solution in the SAME category the sender sells. Companies that merely make "
-            "or operate in an adjacent vertical are NOT competitors — they are operators. "
-            "'out_of_domain' = the target matches NEITHER profile."))
-    role_reason: str = Field(description="One sentence: what the target does, and why that role relative to the sender.")
-    # ---- Operator fit, scored as THREE independent sub-factors (operators only; else 0). ----
-    # These are summed by the system into operator_fit (0-100). Scoring three separate
-    # axes forces real differentiation between companies instead of stamping a single
-    # round default — a large multi-site OEM matching many signals should clearly outscore
-    # a small single-process shop. INFER each from what the company does; never require a
-    # stated problem.
-    operational_overlap: int = Field(description="0-45 (operators only; else 0): how DIRECTLY the target's core operations match the sender's buyer profile and derived operational signals. 38-45 = textbook match to the central signal; 25-37 = clear match; 12-24 = partial/adjacent overlap; 1-11 = loose. Spread this — do NOT default to a round number; two different companies should rarely get the same value.")
-    scale_readiness: int = Field(default=0, description="SYSTEM-COMPUTED from firmographics — do NOT score this, just output 0.")
-    signal_breadth: int = Field(default=0, description="SYSTEM-COMPUTED from matched pains/services — do NOT score this, just output 0.")
-    operator_fit: int = Field(default=0, description="SYSTEM-COMPUTED (operational_overlap + computed scale + computed breadth) — output 0; the system fills it.")
+            "Classify the target against the BUYER PROFILE and COMPETITOR PROFILE derived from "
+            "the SENDER PROFILE. "
+            "'operator_end_user' = the target RUNS the kind of operations the sender's offering "
+            "serves — it is a genuine buyer candidate. Illustrative examples of 'runs operations': "
+            "manufactures physical goods of ANY kind, operates production lines or equipment fleets, "
+            "runs clinics/hospitals, operates retail stores or distribution, runs financial back-office "
+            "processes. A company that MAKES physical products of any category is an operator even if "
+            "its product looks unrelated to the sender — what matters is whether its OPERATIONS match "
+            "the derived BUYER PROFILE. When evidence is genuinely ambiguous, lean operator_end_user. "
+            "'solution_vendor_overlap' = the target's OWN core product matches the derived COMPETITOR "
+            "PROFILE — it sells a directly-competing solution in the SAME category the sender sells. "
+            "Companies that merely make physical equipment in an adjacent vertical are NOT competitors. "
+            "'out_of_domain' = the target matches NEITHER profile — pure service firms, consultancies, "
+            "pure SaaS/software, pure financial services, pure resellers/distributors that buy-and-resell "
+            "without making anything, or companies whose entire value chain is non-physical. Choose "
+            "out_of_domain ONLY when there is NO production signal at all. When in doubt between "
+            "operator and out_of_domain, choose operator."
+        )
+    )
+    role_reason: str = Field(description="One sentence: what the target does and why that role.")
 
-    # ---- Corroborating evidence signals (BONUS only — absence is neutral) ----
-    has_evidenced_need: bool = Field(description="True if the research profile shows a problem/need/initiative the SENDER'S offering addresses (derive from the sender's capability->pain map). A POSITIVE BONUS signal only — when false the score is NOT penalised (websites rarely state needs). Do not force it true: 'uses technology' alone is not a need.")
-    need_evidence: str = Field(description="The exact evidenced need (quote/paraphrase from the profile). 'None evidenced' when has_evidenced_need is false.")
-    has_evidenced_precondition: bool = Field(description="True if the profile shows the PRECONDITION that makes the sender's solution usable (the operations, assets, data, scale, or context the offering requires). A POSITIVE BONUS signal only — when false the score is NOT penalised. Derive from the sender's offering.")
-    precondition_evidence: str = Field(description="The exact evidenced precondition (quote/paraphrase). 'None evidenced' when has_evidenced_precondition is false.")
-    evidence_confidence: int = Field(description="0-100: share of the assessment read from EXPLICIT profile facts vs inference.")
+    # ── Operational fit — ONLY operational_overlap is LLM-scored ────────────
+    operational_overlap: int = Field(
+        description=(
+            "0-45 (operators only; 0 for other roles): how DIRECTLY the target's core operations "
+            "match the sender's buyer profile and its derived operational signals, inferred from "
+            "what the company does/makes/serves. "
+            "38-45 = textbook match to the central signal; "
+            "25-37 = clear match; 12-24 = partial/adjacent overlap; 1-11 = loose. "
+            "DIFFERENTIATE — avoid round-number defaults; two companies should rarely tie. "
+            "Never lower this score because pain is not explicitly stated in the profile."
+        )
+    )
+    scale_readiness: int = Field(
+        default=0,
+        description="SYSTEM-COMPUTED from firmographics — output 0; the system fills this."
+    )
+    signal_breadth: int = Field(
+        default=0,
+        description="SYSTEM-COMPUTED from matched pains/services — output 0; the system fills this."
+    )
+    operator_fit: int = Field(
+        default=0,
+        description="SYSTEM-COMPUTED (operational_overlap + scale_readiness + signal_breadth) — output 0."
+    )
 
-    # ---- MEDDPICC informational ----
-    metrics: str = Field(description="A value hypothesis tied to the evidenced need (or 'unclear — no evidenced need').")
-    economic_buyer: str = Field(description="A budget-owner ROLE/TITLE appropriate to the derived BUYER PROFILE and the campaign objective for this target — derive the function from the sender's offering and the target's operations, do NOT default to a fixed role. NEVER a named individual unless that exact name is in the evidence.")
-    champion: str = Field(description="A likely internal CHAMPION role (not a person unless named in evidence).")
+    # ── Corroborating evidence (bonus signals — absence is NEUTRAL, never a penalty) ─
+    has_evidenced_need: bool = Field(
+        description=(
+            "True ONLY if the research profile explicitly shows a problem/need/initiative the "
+            "SENDER'S offering addresses (derive from sender's capability->pain map). "
+            "A POSITIVE BONUS only — when false the score is NOT penalised (marketing websites "
+            "describe capabilities, not problems). Do NOT force it true."
+        )
+    )
+    need_evidence: str = Field(
+        description="The exact evidenced need (quote/paraphrase). 'None evidenced' when false."
+    )
+    has_evidenced_precondition: bool = Field(
+        description=(
+            "True ONLY if the profile shows the PRECONDITION making the sender's solution usable "
+            "(the operations, assets, data, or scale the offering requires). POSITIVE BONUS only — "
+            "absence is neutral, never a penalty."
+        )
+    )
+    precondition_evidence: str = Field(
+        description="The exact evidenced precondition (quote/paraphrase). 'None evidenced' when false."
+    )
+    evidence_confidence: int = Field(description="0-100: share of assessment from EXPLICIT profile facts.")
+
+    # ── MEDDPICC informational fields ────────────────────────────────────────
+    metrics: str = Field(
+        description="Value hypothesis tied to the evidenced need, or 'unclear — no evidenced need'."
+    )
+    economic_buyer: str = Field(
+        description=(
+            "Budget-owner ROLE/TITLE appropriate to the buyer profile and campaign objective. "
+            "Derive from the sender's offering and the target's operations. "
+            "NEVER a named individual unless that exact name is in the evidence."
+        )
+    )
+    champion: str = Field(description="Likely internal CHAMPION role (not a person unless named).")
     decision_criteria: str = Field(description="Likely evaluation criteria.")
-    decision_process: str = Field(description="Start with 'NEEDS DISCOVERY:' then a concrete one-line note.")
-    paper_process: str = Field(description="Start with 'NEEDS DISCOVERY:' then a concrete one-line note.")
-    discovery_checklist: List[str] = Field(default_factory=list, description="3-5 specific things to confirm on the first call.")
+    decision_process: str = Field(description="Start with 'NEEDS DISCOVERY:' then a concrete note.")
+    paper_process: str = Field(description="Start with 'NEEDS DISCOVERY:' then a concrete note.")
+    discovery_checklist: List[str] = Field(
+        default_factory=list,
+        description="3-5 specific things to confirm on the first call."
+    )
 
-    # ---- Sender-relative enrichment (for draft generation) ----
-    business_opportunity_reason: str = Field(description="The 'why now', anchored to ONE specific fact from the profile. State plainly if none found.")
-    matched_pains: List[str] = Field(default_factory=list, description="Specific target pains the sender solves (grounded in the profile).")
-    matched_services: List[str] = Field(default_factory=list, description="Sender services that map to those pains.")
-
-    overall_reasoning: str = Field(description=(
-        "A professional 2-3 sentence FACTUAL assessment, in polished business English, of this target's "
-        "fit for the sender's ICP — written as if briefing a sales team. Ground it in the MEDDPICC read: "
-        "name what the company actually does/operates and why that matches (or does not match) the "
-        "sender's target-customer profile, reasoning ONLY from what the company positively DOES. "
-        "ABSOLUTELY FORBIDDEN — never write any sentence about missing/unstated information. Banned "
-        "phrasings include (and anything like them): 'absence of explicitly stated challenges', 'no "
-        "specific challenges/needs were stated', 'limits the ability to assess', 'limits confidence', "
-        "'despite the absence of', 'no explicit needs', 'not explicitly stated', 'further exploration "
-        "needed', 'may not be a fit'. The marketing website never states problems — treating that as a "
-        "caveat is wrong; simply DO NOT mention it. Write only affirmative, evidence-grounded statements. "
-        "Do NOT state or imply an accept/reject decision and do NOT recommend whether to pursue — the "
-        "system decides qualification separately. STRICTLY no internal jargon, field names, scores, "
-        "booleans, verdict labels, or bracketed metadata. Use the exact sender name."))
+    # ── Sender-relative enrichment (for cold email drafting) ─────────────────
+    business_opportunity_reason: str = Field(
+        description=(
+            "The 'why now', anchored to ONE specific fact from the profile. "
+            "State plainly if no concrete trigger was found."
+        )
+    )
+    matched_pains: List[str] = Field(
+        default_factory=list,
+        description="Specific target pains the sender solves (grounded in the profile)."
+    )
+    matched_services: List[str] = Field(
+        default_factory=list,
+        description="Sender services that map to those pains."
+    )
+    overall_reasoning: str = Field(
+        description=(
+            "A professional 2-3 sentence FACTUAL assessment for a sales team. "
+            "Ground it in what the company actually does/operates and why that matches (or does "
+            "not match) the sender's target-customer profile. "
+            "FORBIDDEN: any sentence referencing missing or unstated information. Never write "
+            "phrases like 'absence of challenges', 'no specific needs were stated', 'limits "
+            "confidence', 'despite the absence', 'not explicitly stated', 'further exploration "
+            "needed', or 'may not be a fit'. Marketing websites describe capabilities, not "
+            "problems — treating absence of stated problems as a caveat is WRONG. "
+            "Write only affirmative, evidence-grounded sentences. "
+            "Do NOT state or imply accept/reject. Use the exact sender name."
+        )
+    )
     confidence: int = Field(description="0-100 confidence given the quality/quantity of evidence.")
 
 
-# --------------------------------------------------------------------------- #
-# Call 1 — ENRICHMENT: raw web content -> structured, sender-agnostic profile   #
-# --------------------------------------------------------------------------- #
+# ===========================================================================
+# Prompts
+# ===========================================================================
+
+# Call 1 (eval/legacy path only): raw web text → sender-agnostic profile (v1).
 _ENRICH_PROMPT = ChatPromptTemplate.from_template(
     """You are a meticulous B2B research analyst. Read the RAW website content for a company and distil it
 into a STRUCTURED, FACTUAL research profile. Use ONLY what is present in the evidence — never invent,
@@ -158,15 +205,13 @@ RAW WEBSITE EVIDENCE (the company's own site):
 
 Ground EVERY field strictly in the evidence above. BANNED hedge words: may, might, could, likely,
 potential, possibly. Lists must contain specific, verifiable items drawn from the evidence (or [] if
-none). If the evidence is thin, capture only what is grounded and say so in the summary — do NOT pad with
-invented facts. `actual_business` must reflect what the evidence shows the company does, independent of
-any provided label."""
+none). If the evidence is thin, capture only what is grounded and say so in the summary."""
 )
 
 
-# --------------------------------------------------------------------------- #
-# Call 2 — VALIDATION: structured profile + sender + filters -> MEDDPICC verdict#
-# --------------------------------------------------------------------------- #
+# Call 2 (per company): MEDDPICC validation against sender profile + campaign.
+# The static campaign-level block is IDENTICAL across all companies in a run —
+# OpenAI caches this prefix; only the TARGET RECORD at the end is per-company.
 _VALIDATE_PROMPT = ChatPromptTemplate.from_template(
     """You are a STRICT B2B ICP analyst qualifying an OUTBOUND lead before any contact. Your #1 job is to
 PREVENT false positives and stay fully grounded. Quote facts from the RESEARCH PROFILE; never invent
@@ -174,138 +219,94 @@ needs, names, or firmographics. Everything sender-related must be derived from T
 fixed-industry assumptions.
 
 ==================== CAMPAIGN-LEVEL INPUTS (identical for every company in this run) ====================
-These inputs are the SAME for every lead in the campaign, so they form the cache-stable prefix; the only
+These inputs are the SAME for every lead in the campaign. They form the cache-stable prefix; the only
 per-company data is the TARGET RECORD at the very end.
 
-SENDER PROFILE — user company intel (who is doing the outreach):
+SENDER PROFILE — who is doing the outreach:
 - Company: {sender_name}
 - Offerings: {sender_offerings}
 - Sells to (their ICP): {sender_customers}
 - Differentiators: {sender_advantages}
-- Capability -> customer-pain map: {sender_capmap}
+- Capability → customer-pain map: {sender_capmap}
 - Proof points: {sender_proof}
 - Business summary: {sender_research}
 
-CAMPAIGN OBJECTIVE — the user's own words (the target should help satisfy this): {campaign_prompt}
+CAMPAIGN OBJECTIVE — the user's own words: {campaign_prompt}
 
 APPROVAL THRESHOLD: {threshold}/100. A company is ACCEPTED when its fit score reaches this threshold.
-Calibrate operator_fit and the evidence floors HONESTLY against this bar — never inflate a score to clear
-it, never deflate a genuine fit.
+Calibrate operational_overlap HONESTLY against this bar — never inflate to clear it, never deflate a
+genuine fit.
 
 NOTE: Firmographic pre-filtering (industry / location / employee-size) was handled upstream by
 LeadFitScreener. Only companies that cleared that screen reach you. Do NOT re-evaluate firmographics —
 focus entirely on MEDDPICC qualification and sender-relative enrichment.
 
-==================== PART B — MEDDPICC ICP QUALIFICATION (sender-fit) ====================
-This is where the CAMPAIGN OBJECTIVE and the RESEARCH PROFILE are used.
-
-HOW TO READ THE EVIDENCE (critical): the RESEARCH PROFILE is distilled from the target's own MARKETING
-website, which describes what the company DOES, MAKES, SELLS, and SERVES — its capabilities — and almost
-NEVER states the company's internal problems, gaps, or needs. Therefore judge fit by INFERENCE from what
-the company does: if its operations match the sender's buyer profile, it is a fit, REGARDLESS of whether
-any pain is spelled out. The ABSENCE of a stated need or problem is NOT evidence against fit and must NOT
-lower the fit grade. Reserve low fit grades for companies whose operations genuinely do not match the
-buyer profile — not for companies that simply did not advertise a weakness. Judge fit in light of the
-CAMPAIGN OBJECTIVE stated in the campaign-level inputs above.
-
-The TARGET COMPANY name and its RESEARCH PROFILE (distilled from the company's own website) are given in
-the TARGET RECORD at the END of this prompt. Treat that RESEARCH PROFILE as THE evidence — quote from it
-for every field below.
-
-First, from the SENDER PROFILE ONLY, define:
-  (i)   BUYER PROFILE — a genuine end-user customer of this sender;
+==================== PART A — DERIVE SENDER CONTEXT ====================
+From the SENDER PROFILE only, define:
+  (i)   BUYER PROFILE     — a genuine end-user customer of this sender;
   (ii)  COMPETITOR PROFILE — a company selling a directly-overlapping solution;
-  (iii) THE NEED — the specific problem(s) the sender's offering solves (from the capability->pain map);
-  (iv)  THE PRECONDITION — what a company must have/do for the sender's solution to be USABLE.
+  (iii) THE NEED          — the specific problem(s) the sender's offering solves;
+  (iv)  THE PRECONDITION  — what a company must have/do for the sender's solution to be USABLE.
 
-Then UNPACK the BUYER PROFILE into 3-5 concrete OPERATIONAL SIGNALS derived from THIS sender's offerings
-and capability->pain map (signals come ENTIRELY from the sender data — do NOT use any fixed industry/
-product list). Each signal is one specific operational characteristic a company would have to make the
-sender's offering applicable — e.g. a specific kind of asset operated, a specific kind of data
-generated, a specific kind of process run, a specific kind of customer served — written in the sender's
-own terms. Treat these signals as the practical checklist for what counts as the BUYER PROFILE.
+Then UNPACK the BUYER PROFILE into 3-5 concrete OPERATIONAL SIGNALS derived ENTIRELY from THIS sender's
+offerings and capability→pain map (not from any fixed industry list). Each signal is one specific
+operational characteristic a company would have to make the sender's offering applicable.
 
-A target qualifies as operator_end_user when the research profile shows it matches AT LEAST ONE of those
-derived signals — even if its headline product category looks unrelated to the sender at first glance.
-Then ground EVERY field in the RESEARCH PROFILE, judged in light of the campaign objective:
-- target_role — classify against the BUYER PROFILE (i) and COMPETITOR PROFILE (ii) you derived above
-  from THIS sender (+ role_reason). The cross-industry examples below illustrate the GENERAL CONCEPT —
-  they are not a fixed list; the actual profiles come ENTIRELY from this sender's data:
-  * operator_end_user: the target matches the derived BUYER PROFILE — it RUNS the kind of operations
-    the sender's offering acts on (illustrative cross-industry examples of what 'runs operations' looks
-    like: manufactures physical goods of ANY kind — electronics, batteries, machinery, robots, vehicles,
-    materials, safety equipment, medical devices, food/dairy equipment, textiles, plasma tools, etc.;
-    operates clinics/hospitals; runs retail stores or distribution networks; operates financial-services
-    back-office processes; etc.). A company that MAKES physical products of any category is an operator
-    even if its product looks unrelated to the sender — what matters is whether its OPERATIONS match the
-    derived buyer profile, NOT whether its product category equals the sender's customers.
-  * solution_vendor_overlap: the target's OWN core product matches the derived COMPETITOR PROFILE — it
-    sells a directly-competing solution in the SAME category the sender sells to the SAME buyers. A
-    company that merely makes physical equipment in an adjacent vertical is NOT a competitor — it is an
-    operator.
-  * out_of_domain: the target matches NEITHER profile — its operations do not match the BUYER PROFILE
-    AND its product does not match the COMPETITOR PROFILE.
-  Do NOT default to out_of_domain just because the target's product category differs from the sender's
-  typical customers; the decisive question is whether the target's OPERATIONS match the derived BUYER
-  PROFILE.
+A target qualifies as operator_end_user when the profile shows it matches AT LEAST ONE derived signal —
+even if its headline product category looks unrelated to the sender at first glance.
 
-  PRODUCTION OPERATIONS RULE — CHECK THIS FIRST, BEFORE EVER CHOOSING out_of_domain
-  (applies whenever the sender serves manufacturers / operators):
-  STEP 1 — Scan the research profile for ANY production signal. The presence of words/phrases such as
-  "manufacturer", "manufactures", "produces", "production", "fabrication", "assembly", "machining",
-  "finishing", "foundry", "mill", "plant", "factory", "facility (sq ft / sqft)", named machines/lines, or
-  a stated product they MAKE = a production signal.
-  STEP 2 — If ANY production signal is present, the company RUNS its own operations and is ALWAYS
-  operator_end_user — NEVER out_of_domain — REGARDLESS of the END MARKET or industry vertical it serves
-  (eye care, dental, aerospace, food, security, agriculture, etc. are all irrelevant). The vertical it
-  sells INTO does not disqualify a company that MAKES physical products; what matters is that it OPERATES
-  EQUIPMENT that can fail, slow, or drift out of spec. (Example: a company that "manufactures and finishes
-  ophthalmic lenses" is an operator — the lens *production* qualifies it; the fact that its customers are
-  eye-care clinics is beside the point.)
-  STEP 3 — Choose out_of_domain ONLY when there is NO production signal at all: pure service firms,
-  consultancies, software/SaaS, financial services, pure resellers/distributors that buy-and-resell
-  without making anything, or companies whose entire value chain is non-physical. A company that BOTH
-  manufactures AND distributes is an operator — the manufacturing side qualifies it. When in doubt between
-  operator and out_of_domain for a company that makes a physical product, choose operator.
-- operational_overlap (0-45, operators only; else 0) — the ONLY fit number you score. Judge how DIRECTLY
-  the target's core operations match the BUYER PROFILE and its derived signals, inferred from what the
-  company does/makes/serves: 38-45 textbook match to the central signal; 25-37 clear match; 12-24
-  partial/adjacent overlap; 1-11 loose. DIFFERENTIATE — avoid round-number defaults; two different
-  companies should rarely get the same value. Never lower it because no pain is stated.
-  (scale_readiness, signal_breadth and operator_fit are computed by the system from firmographics and the
-  matched pains/services — output 0 for all three.)
-- has_evidenced_need + need_evidence: a CORROBORATING BONUS only. TRUE if THE NEED (iii) happens to be
-  explicit in the profile; otherwise false + 'None evidenced'. Setting it false does NOT reduce the score
-  — it just means no bonus. Do NOT force it true, and do NOT downgrade operator_fit when it is false.
-- has_evidenced_precondition + precondition_evidence: a CORROBORATING BONUS only, same rule — TRUE if THE
-  PRECONDITION (iv) is explicit; false otherwise, with no penalty.
-- evidence_confidence (0-100). metrics (value hypothesis tied to the evidenced need, else 'unclear — no
-  evidenced need'). economic_buyer / champion: a ROLE/TITLE only — NEVER a named person unless that exact
-  name is in the evidence. decision_criteria. decision_process / paper_process: each start 'NEEDS
-  DISCOVERY:' + a concrete note. discovery_checklist (3-5).
+==================== PART B — MEDDPICC QUALIFICATION ====================
+HOW TO READ THE EVIDENCE: the RESEARCH PROFILE is distilled from the target's own MARKETING website
+(and supplementary sources), which describes what the company DOES, MAKES, SELLS, and SERVES — its
+capabilities — and almost NEVER states internal problems or gaps. Judge fit by INFERENCE from what the
+company does: if its operations match the derived BUYER PROFILE, it is a fit, REGARDLESS of whether any
+pain is spelled out. The ABSENCE of stated need/problem is NOT evidence against fit and must NOT lower
+the fit grade.
 
-==================== PART C — SENDER-RELATIVE ENRICHMENT (for the cold email) ====================
-CRITICAL GROUNDING: the opportunity reason and matched pains/services MUST trace to a SPECIFIC fact in
-the RESEARCH PROFILE; never generic, assumed, or invented. BANNED hedge words: may, might, could, likely,
-potential, possibly, "can lead to". (Company facts/hooks are already captured in the profile — here you
-only map them to THIS sender.)
-- business_opportunity_reason: the 'why now' anchored to ONE specific fact in the profile, or state
-  plainly that no concrete trigger was found.
-- matched_pains / matched_services: the sender pains/services that apply to what the profile shows.
+PRODUCTION OPERATIONS RULE — APPLY THIS BEFORE CLASSIFYING ROLE:
+STEP 1 — Look for a production signal in TWO places:
+  A) In the text: "manufacturer", "manufactures", "produces", "production", "fabrication",
+     "assembly", "machining", "finishing", "foundry", "mill", "plant", "factory", "welding",
+     "casting", "extrusion", "designs and builds", "designs and manufactures".
+  B) In the PRODUCTS LIST: if the company's listed products are TANGIBLE PHYSICAL ITEMS —
+     devices, components, instruments, hardware, sensors, systems that are shipped, installed,
+     and maintained (as opposed to software, services, or consulting) — then the company MAKES
+     those physical products and therefore RUNS production operations.
+     HOW TO APPLY STEP 1B: ask "Can these products be held in one's hand, shipped in a box,
+     installed on a wall or machine, and physically fail or wear out?" If YES → physical product
+     → production signal present. If the products are clearly intangible (software, platforms,
+     APIs, consulting deliverables) → no production signal from this step.
+STEP 2 — If ANY production signal (from STEP 1A or 1B) is present, the company RUNS its own
+operations and is ALWAYS operator_end_user — NEVER out_of_domain — regardless of end market.
+The sector the hardware serves (security, medical, aerospace, agriculture, etc.) does NOT change
+this classification. A company making physical security sensors is the same kind of operator as
+a company making industrial components.
+STEP 3 — Choose out_of_domain ONLY when there is NO production signal from EITHER step: pure
+service firms, consultancies, SaaS/software, financial services, or pure resellers that resell
+without making anything of their own.
 
-Finally: overall_reasoning — a professional, polished 2-3 sentence FACTUAL assessment (use the exact
-sender name {sender_name}) of the target's MEDDPICC fit: what it does/operates and why that matches (or
-does not match) {sender_name}'s target-customer profile, reasoning ONLY from what the company positively
-DOES. ABSOLUTELY FORBIDDEN: any sentence about missing or unstated information. Do NOT write phrases like
-'absence of explicitly stated challenges', 'no specific needs were stated', 'limits the ability to
-assess', 'limits confidence', 'despite the absence of', 'not explicitly stated', or 'further exploration
-needed'. The marketing website never states internal problems, so treating that as a caveat is WRONG —
-simply omit any such remark and write only affirmative, evidence-grounded sentences. Do NOT state or imply
-accept/reject, and do NOT recommend whether to pursue — qualification is decided separately. Write it for
-a human sales reader — NO scores, field names, booleans, verdict labels, or bracketed metadata. Then
-confidence (0-100).
+Score target_role, role_reason, and operational_overlap using the company's RESEARCH PROFILE judged in
+light of the campaign objective. Fill scale_readiness, signal_breadth, operator_fit with 0 — system
+computes them.
 
-==================== TARGET RECORD (the ONLY per-company inputs) ====================
+has_evidenced_need + need_evidence: TRUE only if THE NEED (iii) happens to be EXPLICIT in the profile.
+Setting it false does NOT reduce the score. Do NOT force it true.
+has_evidenced_precondition + precondition_evidence: TRUE only if THE PRECONDITION (iv) is EXPLICIT.
+Same rule — absence is neutral, never a penalty.
+
+evidence_confidence, metrics, economic_buyer, champion, decision_criteria, decision_process,
+paper_process, discovery_checklist: fill these from the profile + sender context.
+
+==================== PART C — SENDER-RELATIVE ENRICHMENT ====================
+business_opportunity_reason: the 'why now' anchored to ONE specific fact in the profile. State plainly
+if no concrete trigger was found.
+matched_pains / matched_services: the sender pains/services that apply to what the profile shows.
+overall_reasoning: professional 2-3 sentence FACTUAL assessment using the exact sender name
+{sender_name}. Ground in what the company DOES. FORBIDDEN: any sentence about missing/unstated
+information. No scores, field names, booleans, or verdict labels. No accept/reject recommendation.
+confidence: 0-100.
+
+==================== TARGET RECORD (the ONLY per-company input) ====================
 TARGET COMPANY:
 - Name: {name}
 - RESEARCH PROFILE (THE evidence — quote from it):
@@ -313,27 +314,30 @@ TARGET COMPANY:
 )
 
 
-class CompanyValidationService:
-    """ICP qualification + deep-research (MEDDPICC, website-evidence only).
+# ===========================================================================
+# Service
+# ===========================================================================
 
-    Judges each target against the sender's actual profile and the campaign's own
-    requirements (industry / location / size / objective).
-    No hardcoded sender profile or industry rubric, no paid search API.
+class CompanyValidationService:
+    """ICP qualification via MEDDPICC + enrichment_v2.
+
+    Call 1: enrichment_v2.enrich_company() → v2 profile (or legacy site crawl → v1).
+    Call 2: reasoning model → ICPMeddpiccJudgment.
+    Decision: deterministic _decide() → ACCEPTED / REJECTED.
+
+    Globally unbiased — all scoring is relative to the sender's actual profile.
+    No hardcoded industry, geography, or sector rules.
     """
 
     def __init__(self):
-        # Call 1 (enrichment): cheap/fast model distils the raw crawl into a profile.
         self.enrichment_llm = get_chat_llm("enrichment", timeout=120)
-        # Call 2 (ICP validation): quality-critical judgment on the reasoning model.
-        self.reasoning_llm = get_chat_llm("reasoning", timeout=60)
+        self.reasoning_llm  = get_chat_llm("reasoning",  timeout=60)
 
-    # ----------------------------------------------------------------------- #
-    # Helpers                                                                  #
-    # ----------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    # Utilities                                                           #
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _as_text(value, empty="Any") -> str:
-        """Render a list/str field for the prompt; '' / None / [] -> 'Any'.
-        Comma/semicolon/newline-separated strings are normalised to a ', '-joined list."""
         if value is None:
             return empty
         if isinstance(value, (list, tuple)):
@@ -345,29 +349,23 @@ class CompanyValidationService:
         parts = [p.strip() for p in re.split(r"[,;\n]+", text) if p.strip()]
         return ", ".join(parts) if parts else empty
 
-    # Max chars of raw crawl fed to the enrichment model. Trimmed 24K -> 12K to cut
-    # input tokens (TPM is the latency governor): a marketing site's identity — what
-    # it makes/does/serves, its scale and markets — lives in the homepage/about/
-    # products pages, which the extractor ranks first and which fit well under 12K.
-    # The trimmed tail is blog/case-study filler that does not change the structured
-    # profile (and therefore does not change the ICP verdict or score).
     _ENRICH_INPUT_CHARS = 12000
 
+    # ------------------------------------------------------------------ #
+    # Profile cache                                                       #
+    # ------------------------------------------------------------------ #
     def prefetch_icp_research(self, domains: list[str]) -> dict[str, dict]:
-        """Batch-load cached STRUCTURED research profiles for many domains in ONE query
-        (removes the per-company N+1 and lets a known domain skip crawl + enrichment).
-        Returns {domain: profile_dict}. Raw web text is never stored, so only parsable
-        structured profiles are returned."""
-        import json
+        """Batch-load cached research profiles (removes per-company N+1 DB queries).
+
+        Accepts both v2 profiles (_schema="v2" + overview) and legacy v1 profiles
+        (executive_summary). Returns {domain: profile_dict}."""
+        import datetime as _dt
         from app.db.database import SessionLocal
         from app.db import models
 
         domains = [d for d in {d for d in domains if d}]
         if not domains:
             return {}
-        # Freshness window: only reuse a profile refreshed within N days; older ones
-        # are excluded so the domain gets re-crawled + re-enriched (never permanently stale).
-        import datetime as _dt
         cutoff = _dt.datetime.utcnow() - _dt.timedelta(days=settings.ICP_PROFILE_FRESHNESS_DAYS)
         out: dict[str, dict] = {}
         db = SessionLocal()
@@ -387,59 +385,60 @@ class CompanyValidationService:
                     continue
                 try:
                     obj = json.loads(ctx)
-                    if isinstance(obj, dict) and obj.get("executive_summary"):
-                        out[d] = obj  # latest valid structured profile (rows desc by updated_at)
+                    if not isinstance(obj, dict):
+                        continue
+                    # Accept v2 schema
+                    if obj.get("_schema") == "v2" and obj.get("overview"):
+                        out[d] = obj
+                    # Accept legacy v1 schema
+                    elif obj.get("executive_summary"):
+                        out[d] = obj
                 except (ValueError, TypeError):
-                    continue  # legacy raw-text context -> ignore; will re-enrich
+                    continue
         finally:
             db.close()
         return out
 
-    async def _gather_raw_evidence(self, domain: str) -> str:
-        """Crawl the company's OWN site (homepage + high-value pages), bounded. Returns
-        the raw combined text — used ONCE by enrichment, then dropped (never stored)."""
-        site_text = ""
-        if domain:
-            try:
-                ext = await extract_site(domain, max_pages=5, per_page_chars=7000)
-                if ext.ok and ext.combined_text.strip():
-                    site_text = ext.combined_text
-                else:
-                    logger.warning(f"[ICP-RESEARCH] No website content for {domain}: {ext.error}")
-            except Exception as e:
-                logger.warning(f"[ICP-RESEARCH] Extraction failed for {domain}: {e}")
-        return site_text
-
-    async def _enrich(self, name: str, csv_desc: str, raw_evidence: str) -> dict:
-        """CALL 1 — distil raw web text into a structured, sender-agnostic profile dict.
-        The raw text is passed in and dropped by the caller right after this returns."""
-        blob = (
-            f"CSV DESCRIPTION: {csv_desc or 'N/A'}\n\n"
-            f"COMPANY WEBSITE TEXT:\n{raw_evidence or 'No website content retrieved.'}"
-        )
-        chain = _ENRICH_PROMPT | self.enrichment_llm.with_structured_output(CompanyResearchProfile)
-        profile: CompanyResearchProfile = await chain.ainvoke({
-            "name": name or "the company",
-            "csv_desc": (csv_desc or "")[:1500],
-            "raw_evidence": blob[: self._ENRICH_INPUT_CHARS],
-        })
-        return profile.model_dump()
+    # ------------------------------------------------------------------ #
+    # Profile schema detection + rendering                                #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _profile_is_v2(profile: dict) -> bool:
+        return isinstance(profile, dict) and profile.get("_schema") == "v2"
 
     @staticmethod
-    def _render_profile(profile: dict, summary_chars: int = 600) -> str:
-        """Render a structured profile dict into readable text for the validation prompt.
+    def _synthesize_summary_v2(profile: dict) -> str:
+        """Build a research_summary string from v2 fields (v2 has no executive_summary)."""
+        parts: list[str] = []
+        overview = (profile.get("overview") or "").strip()
+        if overview and overview.lower() != "unknown":
+            parts.append(overview)
+        ps = profile.get("products_services") or []
+        if ps:
+            parts.append("Products/services: " + "; ".join(str(v) for v in ps[:5]))
+        tc = (profile.get("target_customers") or "").strip()
+        if tc and tc.lower() not in ("unknown", "not stated", ""):
+            parts.append(f"Customers: {tc}")
+        gs = profile.get("growth_signals") or []
+        if gs:
+            parts.append("Growth: " + "; ".join(str(v) for v in gs[:3]))
+        re_ = profile.get("recent_events") or []
+        if re_:
+            parts.append("Recent: " + "; ".join(str(v) for v in re_[:3]))
+        ki = profile.get("key_initiatives") or []
+        if ki:
+            parts.append("Initiatives: " + "; ".join(str(v) for v in ki[:2]))
+        return "\n".join(parts) if parts else "N/A"
 
-        The ICP verdict + score are driven by the STRUCTURED facts below (actual
-        business, products, markets, scale, signals, pains) — NOT by the prose
-        dossier. So the long `executive_summary` is truncated to `summary_chars` for
-        the validation LLM to cut input tokens, while the FULL summary is still stored
-        and used by the drafting stage. Pass summary_chars<=0 to omit it entirely."""
+    @staticmethod
+    def _render_profile_v1(profile: dict, summary_chars: int = 600) -> str:
+        """Render a v1 CompanyResearchProfile dict for the validation prompt."""
         def _lst(key):
             vals = profile.get(key) or []
             return "; ".join(str(v) for v in vals) if vals else "None stated"
         summary = (profile.get("executive_summary") or "").strip()
         if summary_chars and len(summary) > summary_chars:
-            summary = summary[:summary_chars].rsplit(" ", 1)[0] + " …"
+            summary = summary[:summary_chars].rsplit(" ", 1)[0] + " ..."
         summary_block = f"\nSummary (excerpt):\n{summary}" if summary_chars and summary else ""
         return (
             f"Actual business: {profile.get('actual_business') or 'Unknown'}\n"
@@ -452,18 +451,65 @@ class CompanyValidationService:
             f"{summary_block}"
         )
 
-    # ----------------------------------------------------------------------- #
-    # MEDDPICC scoring (from the stabilized root ICP engine)                   #
-    # ----------------------------------------------------------------------- #
-    # ---- Deterministic sub-scores (option A): computed from hard facts, not LLM grades. --- #
-    # gpt-class judges cannot reliably produce DIFFERENTIATED 0-N numbers — they stamp a
-    # "safe middle" on every company (observed: scale=20 for a single-site shop AND an
-    # $11B multinational). So the two objective axes are computed in code from facts the
-    # LLM is good at EXTRACTING (revenue, headcount, markets, products, matched pains/
-    # services). Only operational_overlap (a genuine qualitative judgment) stays on the LLM.
+    @staticmethod
+    def _render_profile_v2(profile: dict, csv_desc: str = "") -> str:
+        """Render a v2 CompanyEnrichment dict for the validation prompt.
+
+        All 13 enrichment_v2 fields are surfaced so the reasoning model can ground
+        every dimension of the MEDDPICC judgment in factual evidence.
+
+        The CSV description is ALWAYS appended (not only when enrichment is thin)
+        because it often contains production/manufacturing language that the company's
+        marketing website omits or buries in vague "provider of solutions" phrasing.
+        The model uses it as supplementary context alongside the enrichment data.
+        """
+        def _lst(key: str) -> str:
+            vals = profile.get(key) or []
+            if isinstance(vals, list):
+                return "; ".join(str(v) for v in vals) if vals else "None stated"
+            return str(vals) if vals else "None stated"
+
+        overview = (profile.get("overview") or "").strip()
+
+        lines = [
+            f"Overview: {overview or 'Unknown'}",
+            f"Products/services: {_lst('products_services')}",
+            f"Target customers: {profile.get('target_customers') or 'Not stated'}",
+            f"Notable clients/partners: {_lst('notable_customers_partners')}",
+            f"Technologies in use: {_lst('technologies')}",
+            f"Certifications: {_lst('certifications')}",
+            f"Company history: {_lst('company_history')}",
+            f"Key initiatives: {_lst('key_initiatives')}",
+            f"Growth signals: {_lst('growth_signals')}",
+            f"Recent events: {_lst('recent_events')}",
+            f"Hiring signals: {_lst('hiring_signals')}",
+            f"Awards/recognition: {_lst('awards_recognition')}",
+            f"Pain points/challenges: {_lst('pain_points')}",
+        ]
+
+        # Always include CSV description — web enrichment often uses vague "provider/
+        # solutions" language even for clear manufacturers; the CSV description from the
+        # data provider tends to be more direct about what the company actually produces.
+        if csv_desc and csv_desc.strip():
+            lines.append(
+                f"\nCSV DESCRIPTION (direct data-provider summary — use when the above "
+                f"is vague or contradicts this):\n{csv_desc.strip()[:600]}"
+            )
+
+        return "\n".join(lines)
+
+    def _render_profile(self, profile: dict, csv_desc: str = "") -> str:
+        """Dispatch to v1 or v2 renderer."""
+        if self._profile_is_v2(profile):
+            return self._render_profile_v2(profile, csv_desc=csv_desc)
+        return self._render_profile_v1(profile)
+
+    # ------------------------------------------------------------------ #
+    # Deterministic sub-scores                                            #
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _revenue_score(revenue: str) -> int:
-        """0-12 from a revenue-range string (uses the UPPER bound). Blank -> neutral 3."""
+        """0-12 from a revenue-range string (uses UPPER bound). Blank → neutral 3."""
         t = (revenue or "").lower().replace(",", "").replace("$", "")
         if not t.strip():
             return 3
@@ -483,7 +529,7 @@ class CompanyValidationService:
 
     @classmethod
     def _headcount_score(cls, size: str) -> int:
-        """0-8 from an employee-size string (uses the UPPER bound). Blank -> neutral 2."""
+        """0-8 from an employee-size string (uses UPPER bound). Blank → neutral 2."""
         ranges = cls._parse_ranges(size or "")
         if not ranges:
             return 2
@@ -495,7 +541,7 @@ class CompanyValidationService:
 
     @staticmethod
     def _age_score(founded_year: str) -> int:
-        """0-3 company-maturity score from a founded year/date. Blank -> neutral 1."""
+        """0-3 company-maturity score from a founded year/date. Blank → neutral 1."""
         if not founded_year:
             return 1
         m = re.search(r"(19|20)\d{2}", str(founded_year))
@@ -508,151 +554,9 @@ class CompanyValidationService:
                 return sc
         return 1
 
-    @classmethod
-    def _compute_scale_readiness(cls, company_data: dict, profile: dict) -> int:
-        """0-30 from real firmographic + profile facts. Prefers the EXACT headcount /
-        revenue figures (continuous -> finer spread) and falls back to the coarse bands
-        when the exact fields are absent. Spreads naturally because these facts genuinely
-        differ company to company.
-
-          revenue 0-12 + headcount 0-8 + markets 0-4 + products 0-3 + age 0-3 = 30."""
-        score = cls._revenue_score(company_data.get("annual_revenue") or company_data.get("revenue"))
-        score += cls._headcount_score(company_data.get("staff_count") or company_data.get("size"))
-        score += min(4, len(profile.get("markets_served") or []))
-        score += min(3, len(profile.get("products_services") or []))
-        score += cls._age_score(company_data.get("founded_year"))
-        return max(0, min(30, score))
-
-    # ---- Deterministic industry classification from SIC / NAICS codes ---------- #
-    # Code -> canonical supercategory + the keywords a user's target-industry string
-    # might use for it. A code match forces industry_match=PASS (a precise, positive
-    # override of the LLM's label-guessing); it NEVER forces a FAIL, so it can only add
-    # precision, not new false negatives.
-    _SUPERCATEGORY_KEYWORDS = {
-        "Manufacturing": ("manufactur", "industrial", "factory", "production", "oem", "fabricat"),
-        "Healthcare": ("health", "medical", "pharma", "clinical", "biotech", "life science"),
-        "Financial Services": ("financ", "bank", "insurance", "fintech", "asset manage", "capital"),
-        "Technology": ("tech", "software", "saas", "it ", "information", "computer", "digital", "internet"),
-        "Construction": ("construct", "building", "engineering & construction"),
-        "Retail": ("retail", "ecommerce", "e-commerce", "consumer goods"),
-        "Wholesale": ("wholesale", "distribut"),
-        "Transportation": ("transport", "logistics", "freight", "supply chain"),
-        "Energy": ("energy", "oil", "gas", "utilit", "power"),
-        "Agriculture": ("agricultur", "farming", "forestry"),
-    }
-
-    @staticmethod
-    def _sic_supercategory(sic: str) -> str | None:
-        m = re.match(r"\s*(\d{2})", str(sic or ""))
-        if not m:
-            return None
-        d = int(m.group(1))
-        if 1 <= d <= 9:   return "Agriculture"
-        if 10 <= d <= 14: return "Energy"
-        if 15 <= d <= 17: return "Construction"
-        if 20 <= d <= 39: return "Manufacturing"
-        if 40 <= d <= 49: return "Transportation"
-        if 50 <= d <= 51: return "Wholesale"
-        if 52 <= d <= 59: return "Retail"
-        if 60 <= d <= 67: return "Financial Services"
-        return None
-
-    @staticmethod
-    def _naics_supercategory(naics: str) -> str | None:
-        m = re.match(r"\s*(\d{2})", str(naics or ""))
-        if not m:
-            return None
-        d = int(m.group(1))
-        return {
-            11: "Agriculture", 21: "Energy", 22: "Energy", 23: "Construction",
-            31: "Manufacturing", 32: "Manufacturing", 33: "Manufacturing",
-            42: "Wholesale", 44: "Retail", 45: "Retail", 48: "Transportation",
-            49: "Transportation", 51: "Technology", 52: "Financial Services",
-            53: "Financial Services", 54: "Technology", 62: "Healthcare",
-        }.get(d)
-
-    @classmethod
-    def _deterministic_industry_pass(cls, sic: str, naics: str, target_industry: str) -> str | None:
-        """Return the matched supercategory when the company's SIC/NAICS code falls under
-        a target industry; else None. Positive-only (never fails a company)."""
-        target = (target_industry or "").lower()
-        if not target or target == "any":
-            return None
-        for cat in (cls._naics_supercategory(naics), cls._sic_supercategory(sic)):
-            if not cat:
-                continue
-            kws = cls._SUPERCATEGORY_KEYWORDS.get(cat, ())
-            if cat.lower() in target or any(k.strip() in target for k in kws):
-                return cat
-        return None
-
-    @staticmethod
-    def _compute_signal_breadth(m: "ICPMeddpiccJudgment") -> int:
-        """0-25 from how many sender pains/services the target matched. These LLM LISTS
-        vary per company (the LLM is reliable at producing them), so the derived number
-        spreads where a direct 0-25 grade collapsed."""
-        n = len(m.matched_pains or []) + len(m.matched_services or [])
-        return max(0, min(25, n * 4))
-
-    # Bonus added when an explicit need / precondition IS stated in the evidence.
-    # These are POSITIVE signals only — their absence is neutral, never a penalty,
-    # because marketing websites describe capabilities, not internal problems, so a
-    # company rarely "confesses" a need or precondition even when it is a perfect fit.
-    _NEED_BONUS = 8
-    _PRECONDITION_BONUS = 7
-
-    @classmethod
-    def _overall_score(cls, m: ICPMeddpiccJudgment):
-        """Continuous 0-100 fit score for genuine operators, or None for role-gated
-        companies (vendors / out-of-domain) where a fit score is meaningless.
-
-        The score is the LLM's graded `operator_fit` — an INFERENCE of how well the
-        target's actual operations match THIS sender's ideal-customer profile, read
-        from what the company does/makes/serves (the only thing a marketing site
-        reliably exposes). An explicitly stated need or precondition then ADDS a small
-        bonus on top (a positive corroborating signal); their ABSENCE is neutral and
-        never discounts the score. This is the key fix for the old multiplicative
-        floors, which pinned almost every company to ~0.70 of its fit (websites never
-        state pains) and clustered all scores in a narrow band at the threshold."""
-        if m.target_role != "operator_end_user":
-            return None
-        base = max(0, min(100, int(m.operator_fit or 0)))
-        bonus = 0
-        if m.has_evidenced_need:
-            bonus += cls._NEED_BONUS
-        if m.has_evidenced_precondition:
-            bonus += cls._PRECONDITION_BONUS
-        return min(100, base + bonus)
-
-    # ----------------------------------------------------------------------- #
-    # Deterministic firmographic matching — LOCATION + SIZE (CSV fields only)   #
-    #                                                                          #
-    # These two are validated in code against the campaign targets vs the       #
-    # company's CSV fields ONLY, never the research profile. The model could     #
-    # not reliably ignore headcounts/locations that appear in the research text, #
-    # which caused same-size companies to fail. This is a parameterised          #
-    # comparison driven entirely by the inputs — no fixed company/industry       #
-    # outcome is baked in. (industry stays on the model: supercategory reasoning #
-    # like "Machinery is Manufacturing" can't be coded without a hardcoded       #
-    # taxonomy, which is disallowed.) Country-name variants below are the only   #
-    # reference data, used purely to normalise spelling.                         #
-    # ----------------------------------------------------------------------- #
-    _COUNTRY_ALIASES = (
-        {"usa", "us", "united states", "united states of america", "america"},
-        {"uk", "united kingdom", "great britain", "britain", "england", "scotland",
-         "wales", "northern ireland", "gb", "gbr"},
-        {"uae", "united arab emirates"},
-        {"south korea", "korea", "republic of korea"},
-        {"czechia", "czech republic"},
-    )
-
-    @staticmethod
-    def _blank(v: str) -> bool:
-        return (v or "").strip().lower() in ("", "n/a", "na", "none", "null", "unknown", "any")
-
     @staticmethod
     def _parse_ranges(text: str):
-        """Numeric employee ranges from a free-text size string -> [(low, high)]; high=inf for '5000+'."""
+        """Parse employee-count ranges from free text → [(low, high)]; high=inf for '5000+'."""
         if not text:
             return []
         t = text.lower().replace(",", "")
@@ -671,222 +575,77 @@ class CompanyValidationService:
         return ranges
 
     @classmethod
-    def _match_size(cls, csv_size: str, target_size: str):
-        """('pass'|'fail'|'unknown', evidence) — numeric range overlap on the CSV field."""
-        if cls._blank(target_size):
-            return "pass", "No employee-size requirement was specified."
-        if cls._blank(csv_size):
-            return "unknown", "The CSV employee size is not stated."
-        comp = cls._parse_ranges(csv_size)
-        tgt = []
-        for part in re.split(r"[,/;|]| or ", target_size.lower()):
-            tgt += cls._parse_ranges(part)
-        if not comp:
-            return "unknown", f"CSV employee size '{csv_size}' could not be read as a number."
-        if not tgt:
-            return "unknown", f"Target size '{target_size}' could not be read as a range."
-        for cl, ch in comp:
-            for tl, th in tgt:
-                if cl <= th and tl <= ch:
-                    return "pass", f"CSV size ({csv_size}) falls within the target band ({target_size})."
-        return "fail", f"CSV size ({csv_size}) is outside the target band ({target_size})."
+    def _compute_scale_readiness(cls, company_data: dict, profile: dict) -> int:
+        """0-30 from real firmographic + profile facts.
 
-    @classmethod
-    def _loc_groups(cls, text: str):
-        t = " " + re.sub(r"[^a-z ]", " ", (text or "").lower()) + " "
-        t = re.sub(r"\s+", " ", t)
-        return ({i for i, al in enumerate(cls._COUNTRY_ALIASES) if any(f" {a} " in t for a in al)}, t)
+        revenue (0-12) + headcount (0-8) + market_breadth (0-4)
+        + products (0-3) + age (0-3) = 30.
 
-    @classmethod
-    def _match_location(cls, csv_loc: str, target_loc: str):
-        """('pass'|'fail'|'unknown', evidence) — country containment on the CSV field."""
-        if cls._blank(target_loc):
-            return "pass", "No location requirement was specified."
-        if cls._blank(csv_loc):
-            return "unknown", "The CSV location is not stated."
-        comp_g, comp_t = cls._loc_groups(csv_loc)
-        tgt_g, _ = cls._loc_groups(target_loc)
-        if comp_g & tgt_g:
-            return "pass", f"CSV location ({csv_loc}) is within the target region ({target_loc})."
-        for part in re.split(r"[,/;|]| or ", target_loc.lower()):
-            p = re.sub(r"[^a-z ]", " ", part).strip()
-            if len(p) >= 3 and f" {p} " in comp_t:
-                return "pass", f"CSV location ({csv_loc}) matches the target ({part.strip()})."
-        if tgt_g or comp_g:
-            return "fail", f"CSV location ({csv_loc}) is outside the target region ({target_loc})."
-        return "unknown", f"Could not place CSV location ({csv_loc}) against the target ({target_loc})."
+        For v2 profiles, target_customers (string) is parsed for market breadth;
+        products_services list is used for product count.
+        For v1 profiles, markets_served list is used directly.
+        """
+        score = cls._revenue_score(
+            company_data.get("annual_revenue") or company_data.get("revenue")
+        )
+        score += cls._headcount_score(
+            company_data.get("staff_count") or company_data.get("size")
+        )
 
-    # ----------------------------------------------------------------------- #
-    # Combined ICP-qualification + deep-research agent (single stage)          #
-    # ----------------------------------------------------------------------- #
-    async def qualify_and_enrich(self, company_data: dict, user_intel: dict,
-                                 campaign_metadata: dict = None, research_cache: dict | None = None,
-                                 return_context: bool = False,
-                                 precomputed_context=None) -> dict:
-        """Single-pass ICP qualification (MEDDPICC, firmographic filters) + research
-        enrichment. The enrichment dossier is returned for every verdict; the status
-        field carries the verdict ('ACCEPTED' when the score clears the threshold, else 'REJECTED')."""
-        campaign_metadata = campaign_metadata or {}
-        domain = company_data.get("domain") or company_data.get("website")
-        name = company_data.get("name")
-
-        csv_desc = company_data.get("description") or ""
-        campaign_prompt = self._as_text(campaign_metadata.get("prompt"), empty="(no specific objective provided)")
-
-        # Sender profile (built dynamically — no hardcoded values).
-        sender_name = user_intel.get("company_name") or user_intel.get("name") or "the sender"
-        sender_offerings = self._as_text(user_intel.get("services") or user_intel.get("offerings") or user_intel.get("core_offerings"))
-        sender_customers = self._as_text(user_intel.get("target_customers"))
-        sender_advantages = self._as_text(user_intel.get("competitive_advantages"))
-        sender_capmap = str(user_intel.get("capability_to_pain_map") or [])[:2000]
-        sender_proof = str(user_intel.get("proof_points") or [])[:1000]
-        sender_research = self._as_text(user_intel.get("deep_research"), empty="N/A")
-
-        # ---- CALL 1: structured research profile (reuse cache, else crawl + enrich) ----
-        profile = research_cache.get(domain) if research_cache else None
-        if profile:
-            logger.info(f"[ICP-CACHE] Reusing structured research profile for {domain}.")
+        if CompanyValidationService._profile_is_v2(profile):
+            # Parse target_customers string for market breadth (split by comma/semicolon)
+            tc_raw = (profile.get("target_customers") or "").strip()
+            if tc_raw and tc_raw.lower() not in ("unknown", "not stated", "n/a", ""):
+                tc_parts = [p.strip() for p in re.split(r"[,;]", tc_raw) if p.strip()]
+                score += min(4, len(tc_parts)) if tc_parts else 1
         else:
-            if precomputed_context is not None:
-                # Eval/iteration hook: caller supplied raw evidence text to enrich.
-                raw = precomputed_context[0] if isinstance(precomputed_context, (tuple, list)) else precomputed_context
-            else:
-                raw = await self._gather_raw_evidence(domain)
-            try:
-                profile = await self._enrich(name, csv_desc, raw)
-            except Exception as e:
-                logger.error(f"[ICP] Enrichment (Call 1) failed for {domain}: {e}")
-                profile = None
-            raw = None  # raw web text dropped from RAM here; never persisted.
+            score += min(4, len(profile.get("markets_served") or []))
 
-        if not profile:
-            err = {
-                "status": "REJECTED",
-                "relevance_score": 0,
-                "reasoning": "No usable website research could be gathered for this company.",
-                "icp_context": None,
-                "_llm_error": True,
-            }
-            if return_context:
-                err["_eval_context"] = ""
-            return err
+        score += min(3, len(profile.get("products_services") or []))
+        score += cls._age_score(company_data.get("founded_year"))
+        return max(0, min(30, score))
 
-        rendered = self._render_profile(profile)
+    @staticmethod
+    def _compute_signal_breadth(m: ICPMeddpiccJudgment) -> int:
+        """0-25 from how many sender pains/services the target matched.
 
-        # ---- CALL 2: ICP MEDDPICC validation on the structured profile ----
-        chain = _VALIDATE_PROMPT | self.reasoning_llm.with_structured_output(ICPMeddpiccJudgment)
-        try:
-            res: ICPMeddpiccJudgment = await chain.ainvoke({
-                "sender_name": sender_name,
-                "sender_offerings": sender_offerings,
-                "sender_customers": sender_customers,
-                "sender_advantages": sender_advantages,
-                "sender_capmap": sender_capmap,
-                "sender_proof": sender_proof,
-                "sender_research": (sender_research or "N/A")[:3000],
-                "threshold": settings.ICP_ACCEPT_THRESHOLD,
-                "campaign_prompt": campaign_prompt[:1500],
-                "name": name,
-                "profile": rendered[:8000],
-            })
-        except Exception as e:
-            # Fail-closed: a failed judgment is REJECTED. `_llm_error` is the transient,
-            # non-persisted signal used only by Stage 3's provider-outage detector. The
-            # profile is still persisted so the research isn't lost.
-            logger.error(f"[ICP] Validation (Call 2) failed for {domain}: {e}")
-            err = {
-                "status": "REJECTED",
-                "relevance_score": 0,
-                "reasoning": f"ICP evaluation error: {e}",
-                "icp_context": json.dumps(profile),
-                "research_summary": profile.get("executive_summary", ""),
-                "growth_hooks": profile.get("growth_hooks", []),
-                "pain_hooks": profile.get("pain_hooks", []),
-                "news_hooks": profile.get("news_hooks", []),
-                "hooks": {"research_profile": profile},
-                "_llm_error": True,
-            }
-            if return_context:
-                err["_eval_context"] = rendered[:9000]
-            return err
+        LLM lists vary per company (reliable extraction), so the derived count
+        spreads naturally where a direct 0-25 grade would cluster.
+        """
+        n = len(m.matched_pains or []) + len(m.matched_services or [])
+        return max(0, min(25, n * 4))
 
-        # Deterministic hedge scrub — strip any "absence of evidence" sentence the LLM
-        # still emits despite the prompt ban (gpt-4o-mini doesn't reliably comply).
-        res.overall_reasoning = self._scrub_hedges(res.overall_reasoning)
-
-        # Production-signal role override — rescue a clear MANUFACTURER the LLM wrongly
-        # gated as out_of_domain (it fixates on the company's end market, e.g. "eye
-        # care" / "semiconductor testing", instead of the fact that it RUNS production).
-        # Double-gated to avoid false accepts: only fires when (a) the SENDER serves
-        # operators/manufacturers AND (b) the research profile shows a production signal.
-        # A conservative operational_overlap baseline is assigned (the LLM gave 0 for the
-        # rejected role), so the final score still depends on the company's real scale +
-        # matched-services breadth rather than auto-passing.
-        if (res.target_role == "out_of_domain"
-                and self._profile_has_production(profile)
-                and self._sender_serves_operators(sender_offerings, sender_customers, sender_capmap)):
-            logger.info(
-                f"[ICP] Production override for {domain}: out_of_domain -> operator_end_user "
-                f"(profile shows production + sender serves operators)."
-            )
-            res.target_role = "operator_end_user"
-            res.role_reason = (res.role_reason or "") + " [System: confirmed production operations.]"
-            # Conservative 'clear match' lower-bound; real differentiation comes from the
-            # computed scale + breadth sub-scores below.
-            res.operational_overlap = max(int(res.operational_overlap or 0), 24)
-
-        # operator_fit = LLM operational_overlap (qualitative) + the two DETERMINISTIC
-        # sub-scores computed from facts. The LLM number clustered when scored directly;
-        # computing scale + breadth from real firmographics/lists restores per-company
-        # spread. Operators only; gated roles score 0.
-        if res.target_role == "operator_end_user":
-            res.scale_readiness = self._compute_scale_readiness(company_data, profile)
-            res.signal_breadth = self._compute_signal_breadth(res)
-            res.operator_fit = (
-                max(0, min(45, int(res.operational_overlap or 0)))
-                + res.scale_readiness
-                + res.signal_breadth
-            )
-        else:
-            res.operational_overlap = 0
-            res.scale_readiness = 0
-            res.signal_breadth = 0
-            res.operator_fit = 0
-
-        result = self._decide(res, profile)
-        if return_context:
-            result["_eval_context"] = rendered[:9000]
-        return result
-
-    # Sentence-level hedge phrases gpt-4o-mini keeps emitting in overall_reasoning
-    # despite explicit prompt bans. We strip any sentence mentioning missing/unstated
-    # info deterministically so the sales-facing text never references "absence of
-    # evidence" — the exact failure mode the ICP redesign was meant to eliminate.
-    _HEDGE_RE = re.compile(
-        r"absence of|not (?:explicitly )?stated|no (?:specific|explicit) (?:challenge|need|pain|problem)"
-        r"|limits? (?:the ability|confidence)|despite the absence|further exploration"
-        r"|without explicit|no (?:stated|mentioned) (?:challenge|need|pain)",
-        re.IGNORECASE,
-    )
+    # ── Bonus for corroborating evidence (positive signals only) ─────────────
+    _NEED_BONUS        = 8
+    _PRECONDITION_BONUS = 7
 
     @classmethod
-    def _scrub_hedges(cls, text: str) -> str:
-        """Drop any sentence that references missing/unstated information. If every
-        sentence is offending (rare), fall back to the first sentence so the field is
-        never empty."""
-        if not text:
-            return text
-        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-        kept = [s for s in sentences if s.strip() and not cls._HEDGE_RE.search(s)]
-        if not kept:
-            return sentences[0].strip() if sentences else text
-        return " ".join(kept).strip()
+    def _overall_score(cls, m: ICPMeddpiccJudgment) -> int | None:
+        """Continuous 0-100 fit score for genuine operators, or None for gated roles.
 
-    # Lexical detectors for the production-signal role override (Issue: gpt-4o-mini
-    # rejects clear manufacturers as out_of_domain by fixating on their END MARKET).
+        Base = operator_fit (computed by system: operational_overlap + scale + breadth).
+        Bonus = +8 for evidenced need, +7 for evidenced precondition (positive only).
+        Absence of evidenced need/precondition is NEUTRAL — never penalised.
+        """
+        if m.target_role != "operator_end_user":
+            return None
+        base = max(0, min(100, int(m.operator_fit or 0)))
+        bonus = 0
+        if m.has_evidenced_need:
+            bonus += cls._NEED_BONUS
+        if m.has_evidenced_precondition:
+            bonus += cls._PRECONDITION_BONUS
+        return min(100, base + bonus)
+
+    # ------------------------------------------------------------------ #
+    # Production-signal role override                                     #
+    # ------------------------------------------------------------------ #
     _PRODUCTION_RE = re.compile(
-        r"manufactur|produces|production|fabricat|machining|assembly|foundry|\bmill\b"
-        r"|\bplant\b|factory|injection mold|stamping|casting|extrusion|fabrication",
+        # Production action verbs and operational nouns
+        r"manufactur|produces|production|fabricat|machining|\bassembly\b|\bassembles\b"
+        r"|foundry|\bmill\b|\bplant\b|factory|injection mold|stamping|casting|extrusion"
+        r"|fabrication|\bwelding\b|\bmoulding\b|designs and builds|engineers and manufactur"
+        r"|builds and ships|designs and manufactur",
         re.IGNORECASE,
     )
     _SENDER_OPERATOR_RE = re.compile(
@@ -896,108 +655,404 @@ class CompanyValidationService:
     )
 
     @classmethod
-    def _profile_has_production(cls, profile: dict) -> bool:
-        blob = " ".join(str(profile.get(k) or "") for k in (
-            "actual_business", "scale_operations")) + " " + \
-            "; ".join(str(v) for v in (profile.get("products_services") or [])) + " " + \
-            "; ".join(str(v) for v in (profile.get("evidenced_signals") or []))
+    def _profile_has_production(cls, profile: dict, csv_desc: str = "") -> bool:
+        """True when the profile or CSV description contains a production signal.
+
+        Checks all available text fields because enrichment_v2 often captures the
+        marketing-site framing ("provider of solutions") rather than the operational
+        framing ("manufactures X"). The CSV description from the data provider is
+        typically more direct and is included as a fallback signal source.
+        """
+        if cls._profile_is_v2(profile):
+            blob = (
+                (profile.get("overview") or "") + " " +
+                "; ".join(str(v) for v in (profile.get("products_services") or [])) + " " +
+                "; ".join(str(v) for v in (profile.get("company_history") or [])) + " " +
+                "; ".join(str(v) for v in (profile.get("key_initiatives") or []))
+            )
+        else:
+            blob = (
+                " ".join(str(profile.get(k) or "") for k in ("actual_business", "scale_operations"))
+                + " "
+                + "; ".join(str(v) for v in (profile.get("products_services") or []))
+                + " "
+                + "; ".join(str(v) for v in (profile.get("evidenced_signals") or []))
+            )
+        # Always include CSV description — it often has plainer manufacturing language
+        if csv_desc:
+            blob += " " + csv_desc
         return bool(cls._PRODUCTION_RE.search(blob))
 
     @classmethod
     def _sender_serves_operators(cls, sender_offerings: str, sender_customers: str, sender_capmap: str) -> bool:
         return bool(cls._SENDER_OPERATOR_RE.search(
-            f"{sender_offerings} {sender_customers} {sender_capmap}"))
+            f"{sender_offerings} {sender_customers} {sender_capmap}"
+        ))
 
+    # ------------------------------------------------------------------ #
+    # Hedge scrubber                                                      #
+    # ------------------------------------------------------------------ #
+    _HEDGE_RE = re.compile(
+        r"absence of|not (?:explicitly )?stated"
+        r"|no (?:specific|explicit) (?:challenge|need|pain|problem)"
+        r"|limits? (?:the ability|confidence)|despite the absence|further exploration"
+        r"|without explicit|no (?:stated|mentioned) (?:challenge|need|pain)",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _scrub_hedges(cls, text: str) -> str:
+        if not text:
+            return text
+        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+        kept = [s for s in sentences if s.strip() and not cls._HEDGE_RE.search(s)]
+        if not kept:
+            return sentences[0].strip() if sentences else text
+        return " ".join(kept).strip()
+
+    # ------------------------------------------------------------------ #
+    # Decision + result builder                                           #
+    # ------------------------------------------------------------------ #
     @staticmethod
-    def _format_reasoning(m: "ICPMeddpiccJudgment", verdict: str, score: int, threshold: int) -> str:
-        """Assemble the user-facing decision rationale as clean, professional prose.
-
-        Combines the LLM's analyst assessment (overall_reasoning) with a deterministic,
-        plain-English statement of WHY the company was accepted/rejected, derived from
-        the structured verdict — no debug syntax, scores-as-jargon, or field dumps. The
-        raw scorecard lives in `meddpicc` (internal) for audit, never in this string."""
+    def _format_reasoning(m: ICPMeddpiccJudgment, verdict: str) -> str:
         base = (m.overall_reasoning or "").strip()
         if base and base[-1] not in ".!?":
             base += "."
-
         if verdict == "ACCEPT":
             note = "On balance the company qualifies for outreach as a genuine operational fit for the sender's offering."
             if m.has_evidenced_need and (m.need_evidence or "").strip().lower() not in ("", "none evidenced"):
                 note += f" A relevant need is evidenced: {m.need_evidence.strip()}"
         else:
             if m.target_role == "solution_vendor_overlap":
-                note = ("It does not qualify: the company appears to sell a solution that competes with the "
-                        "sender's, rather than being a prospective customer.")
+                note = (
+                    "It does not qualify: the company appears to sell a solution that competes with "
+                    "the sender's, rather than being a prospective customer."
+                )
             elif m.target_role == "out_of_domain":
-                note = ("It does not qualify: its operations fall outside the domain the sender's offering "
-                        "serves.")
+                note = (
+                    "It does not qualify: its operations fall outside the domain the sender's "
+                    "offering serves."
+                )
             else:
-                note = ("It does not qualify: its operations are too weak a match for the sender's "
-                        "target-customer profile to meet the qualification bar for this sender.")
-
+                note = (
+                    "It does not qualify: its operations are too weak a match for the sender's "
+                    "target-customer profile to meet the qualification bar."
+                )
         return f"{base} {note}".strip()
 
     def _decide(self, m: ICPMeddpiccJudgment, profile: dict) -> dict:
-        """Programmatic, hallucination-free binary decision + enrichment payload.
+        """Deterministic binary verdict + enrichment payload.
 
-        Faithful to the root MEDDPICC tool, with the campaign's firmographic filters
-        kept as hard disqualifiers:
-          * ACCEPT  — genuine operator whose score (need+precondition floor applied)
-                      is >= the ICP threshold AND no firmographic fail.
-          * REJECT  — everything else: a firmographic violation, a gated role
-                      (out_of_domain / solution_vendor_overlap, which score 0), or a
-                      sub-threshold operator.
-        Statuses map: ACCEPT -> ACCEPTED (proceeds to stakeholder ranking + drafting),
-        REJECT -> REJECTED. The research dossier is attached to both.
+        ACCEPTED when score >= ICP_ACCEPT_THRESHOLD and role is operator_end_user.
+        All other cases: REJECTED.
+        Research dossier is attached to every verdict.
         """
         threshold = settings.ICP_ACCEPT_THRESHOLD
-        ov = self._overall_score(m)  # int for operators, None for gated roles
+        ov = self._overall_score(m)
         score = ov if ov is not None else 0
 
-        # Binary verdict — no REVIEW band. Firmographic pre-filtering was done upstream
-        # by LeadFitScreener. A company is ACCEPTED iff it clears the ICP threshold.
-        # Gated roles (out_of_domain / solution_vendor_overlap) score 0 via _overall_score
-        # and fall below threshold naturally.
-        if score >= threshold:
-            verdict = "ACCEPT"
+        verdict = "ACCEPT" if score >= threshold else "REJECT"
+        status  = "ACCEPTED" if verdict == "ACCEPT" else "REJECTED"
+        reasoning = self._format_reasoning(m, verdict)
+
+        # Map profile fields → canonical output keys (v2 and v1 both produce same keys)
+        if self._profile_is_v2(profile):
+            growth_hooks     = list(profile.get("growth_signals") or [])
+            pain_hooks       = list(profile.get("pain_points") or [])
+            news_hooks       = (
+                list(profile.get("recent_events") or [])
+                + list(profile.get("awards_recognition") or [])
+                + list(profile.get("key_initiatives") or [])
+            )
+            research_summary = self._synthesize_summary_v2(profile)
         else:
-            verdict = "REJECT"
+            growth_hooks     = list(profile.get("growth_hooks") or [])
+            pain_hooks       = list(profile.get("pain_hooks") or [])
+            news_hooks       = list(profile.get("news_hooks") or [])
+            research_summary = profile.get("executive_summary", "")
 
-        status = {"ACCEPT": "ACCEPTED", "REJECT": "REJECTED"}[verdict]
-
-        reasoning = self._format_reasoning(m, verdict, score, threshold)
-
-        # Research fields come from the Call-1 profile (company facts); sender-relative
-        # fields come from the Call-2 judgment.
         hooks = {
-            "relevance_score": score,
-            "reasoning": m.overall_reasoning,
+            "relevance_score":             score,
+            "reasoning":                   m.overall_reasoning,
             "business_opportunity_reason": m.business_opportunity_reason,
-            "matched_pains": m.matched_pains,
-            "matched_services": m.matched_services,
-            "growth_hooks": profile.get("growth_hooks", []),
-            "pain_hooks": profile.get("pain_hooks", []),
-            "news_hooks": profile.get("news_hooks", []),
-            "executive_summary": profile.get("executive_summary", ""),
-            "research_profile": profile,
-            # MEDDPICC scorecard (useful for the UI / human review of borderline leads).
-            "meddpicc": m.model_dump(),
+            "matched_pains":               m.matched_pains,
+            "matched_services":            m.matched_services,
+            "growth_hooks":                growth_hooks,
+            "pain_hooks":                  pain_hooks,
+            "news_hooks":                  news_hooks,
+            "executive_summary":           research_summary,
+            "research_profile":            profile,
+            "meddpicc":                    m.model_dump(),
         }
 
         return {
-            "status": status,
-            "relevance_score": score,
-            "reasoning": reasoning[:800],
-            # Structured research profile (JSON) — this is what gets stored; raw web
-            # text is never persisted.
-            "icp_context": json.dumps(profile),
-            # Enrichment fields (persisted for every verdict).
+            "status":                      status,
+            "relevance_score":             score,
+            "reasoning":                   reasoning[:900],
+            "icp_context":                 json.dumps(profile),
             "business_opportunity_reason": m.business_opportunity_reason,
-            "matched_pains": m.matched_pains,
-            "matched_services": m.matched_services,
-            "growth_hooks": profile.get("growth_hooks", []),
-            "pain_hooks": profile.get("pain_hooks", []),
-            "news_hooks": profile.get("news_hooks", []),
-            "research_summary": profile.get("executive_summary", ""),
-            "hooks": hooks,
+            "matched_pains":               m.matched_pains,
+            "matched_services":            m.matched_services,
+            "growth_hooks":                growth_hooks,
+            "pain_hooks":                  pain_hooks,
+            "news_hooks":                  news_hooks,
+            "research_summary":            research_summary,
+            "hooks":                       hooks,
         }
+
+    # ------------------------------------------------------------------ #
+    # Call 1 — legacy/eval path: site crawl → v1 profile                 #
+    # ------------------------------------------------------------------ #
+    async def _gather_raw_evidence(self, domain: str) -> str:
+        from app.integrations.site_extractor import extract_site
+        if not domain:
+            return ""
+        try:
+            ext = await extract_site(domain, max_pages=5, per_page_chars=7000)
+            if ext.ok and ext.combined_text.strip():
+                return ext.combined_text
+            logger.warning(f"[ICP-RESEARCH] No site content for {domain}: {ext.error}")
+        except Exception as e:
+            logger.warning(f"[ICP-RESEARCH] Extraction failed for {domain}: {e}")
+        return ""
+
+    async def _enrich(self, name: str, csv_desc: str, raw_evidence: str) -> dict:
+        """Call 1 (eval/legacy path) — distil raw web text into a v1 profile dict."""
+        from app.core.logging_config import agent_label_var
+        blob = (
+            f"CSV DESCRIPTION: {csv_desc or 'N/A'}\n\n"
+            f"COMPANY WEBSITE TEXT:\n{raw_evidence or 'No website content retrieved.'}"
+        )
+        chain = _ENRICH_PROMPT | self.enrichment_llm.with_structured_output(CompanyResearchProfile)
+        _ag_tok = agent_label_var.set("icp_enrich")
+        try:
+            profile: CompanyResearchProfile = await chain.ainvoke({
+                "name":         name or "the company",
+                "csv_desc":     (csv_desc or "")[:1500],
+                "raw_evidence": blob[: self._ENRICH_INPUT_CHARS],
+            })
+        finally:
+            agent_label_var.reset(_ag_tok)
+        return profile.model_dump()
+
+    # ------------------------------------------------------------------ #
+    # Call 2 — MEDDPICC validation (reasoning model)                     #
+    # ------------------------------------------------------------------ #
+    async def _validate(
+        self,
+        name: str,
+        rendered_profile: str,
+        sender_name: str,
+        sender_offerings: str,
+        sender_customers: str,
+        sender_advantages: str,
+        sender_capmap: str,
+        sender_proof: str,
+        sender_research: str,
+        campaign_prompt: str,
+    ) -> ICPMeddpiccJudgment:
+        from app.core.logging_config import agent_label_var
+        chain = _VALIDATE_PROMPT | self.reasoning_llm.with_structured_output(ICPMeddpiccJudgment)
+        _ag_tok = agent_label_var.set("icp_validate")
+        try:
+            result: ICPMeddpiccJudgment = await chain.ainvoke({
+                "sender_name":      sender_name,
+                "sender_offerings": sender_offerings,
+                "sender_customers": sender_customers,
+                "sender_advantages":sender_advantages,
+                "sender_capmap":    sender_capmap,
+                "sender_proof":     sender_proof,
+                "sender_research":  (sender_research or "N/A")[:3000],
+                "threshold":        settings.ICP_ACCEPT_THRESHOLD,
+                "campaign_prompt":  campaign_prompt[:1500],
+                "name":             name,
+                "profile":          rendered_profile[:8000],
+            })
+        finally:
+            agent_label_var.reset(_ag_tok)
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Main entry point                                                    #
+    # ------------------------------------------------------------------ #
+    async def qualify_and_enrich(
+        self,
+        company_data: dict,
+        user_intel: dict,
+        campaign_metadata: dict = None,
+        research_cache: dict | None = None,
+        return_context: bool = False,
+        precomputed_context=None,
+        client=None,
+        search_hints: list[str] | None = None,
+    ) -> dict:
+        """Single-pass ICP qualification + enrichment for one target company.
+
+        Returns a dict with: status, relevance_score, reasoning, icp_context,
+        and enrichment hooks for the email drafting stage.
+        Dossier is attached to every verdict — both accepted and rejected rows
+        are fully displayable in the UI.
+        """
+        from app.core.logging_config import company_domain_var
+
+        campaign_metadata = campaign_metadata or {}
+        domain = company_data.get("domain") or company_data.get("website")
+        name   = company_data.get("name")
+        _dom_tok = company_domain_var.set(domain or "unknown")
+
+        csv_desc        = company_data.get("description") or ""
+        campaign_prompt = self._as_text(
+            campaign_metadata.get("prompt"), empty="(no specific objective provided)"
+        )
+
+        sender_name      = user_intel.get("company_name") or user_intel.get("name") or "the sender"
+        sender_offerings = self._as_text(
+            user_intel.get("services") or user_intel.get("offerings") or user_intel.get("core_offerings")
+        )
+        sender_customers  = self._as_text(user_intel.get("target_customers"))
+        sender_advantages = self._as_text(user_intel.get("competitive_advantages"))
+        sender_capmap     = str(user_intel.get("capability_to_pain_map") or [])[:2000]
+        sender_proof      = str(user_intel.get("proof_points") or [])[:1000]
+        sender_research   = self._as_text(user_intel.get("deep_research"), empty="N/A")
+
+        # ── Enrichment ────────────────────────────────────────────────────────
+        profile = research_cache.get(domain) if research_cache else None
+        if profile:
+            logger.info(f"[ICP-CACHE] Reusing profile for {domain}.")
+        else:
+            if precomputed_context is not None:
+                # Eval/iteration hook: caller supplies raw site text → v1 enrich.
+                raw = (
+                    precomputed_context[0]
+                    if isinstance(precomputed_context, (tuple, list))
+                    else precomputed_context
+                )
+                try:
+                    profile = await self._enrich(name, csv_desc, raw)
+                except Exception as e:
+                    logger.error(f"[ICP] Enrichment (Call 1) failed for {domain}: {e}")
+                    profile = None
+                raw = None
+            else:
+                # Production path: enrichment_v2 multi-layer pipeline.
+                try:
+                    from app.integrations.enrichment_v2 import enrich_company as _enrich_v2
+                    profile = await _enrich_v2(
+                        name, domain, client=client, search_hints=search_hints or []
+                    )
+                    if profile:
+                        logger.info(
+                            f"[ICP] V2 enrichment OK for {domain} "
+                            f"(status={profile.get('_status')})"
+                        )
+                    else:
+                        logger.warning(f"[ICP] V2 enrichment returned no profile for {domain}.")
+                except Exception as e:
+                    logger.warning(f"[ICP] V2 enrichment error for {domain}: {e}")
+                    profile = None
+
+        if not profile:
+            company_domain_var.reset(_dom_tok)
+            err = {
+                "status": "REJECTED",
+                "relevance_score": 0,
+                "operational_fit": 0,
+                "readiness": 0,
+                "reasoning": "No usable research could be gathered for this company.",
+                "icp_context": None,
+                "_llm_error": True,
+            }
+            if return_context:
+                err["_eval_context"] = ""
+            return err
+
+        rendered = self._render_profile(profile, csv_desc=csv_desc)
+
+        # ── MEDDPICC validation (Call 2) ─────────────────────────────────────
+        try:
+            m: ICPMeddpiccJudgment = await self._validate(
+                name=name,
+                rendered_profile=rendered,
+                sender_name=sender_name,
+                sender_offerings=sender_offerings,
+                sender_customers=sender_customers,
+                sender_advantages=sender_advantages,
+                sender_capmap=sender_capmap,
+                sender_proof=sender_proof,
+                sender_research=sender_research,
+                campaign_prompt=campaign_prompt,
+            )
+        except Exception as e:
+            company_domain_var.reset(_dom_tok)
+            logger.error(f"[ICP] Validation (Call 2) failed for {domain}: {e}")
+            # Map profile fields to canonical output keys even on error
+            if self._profile_is_v2(profile):
+                _rs = self._synthesize_summary_v2(profile)
+                _gh = list(profile.get("growth_signals") or [])
+                _ph = list(profile.get("pain_points") or [])
+                _nh = list(profile.get("recent_events") or [])
+            else:
+                _rs = profile.get("executive_summary", "")
+                _gh = list(profile.get("growth_hooks") or [])
+                _ph = list(profile.get("pain_hooks") or [])
+                _nh = list(profile.get("news_hooks") or [])
+            err = {
+                "status": "REJECTED",
+                "relevance_score": 0,
+                "reasoning": f"ICP evaluation error: {e}",
+                "icp_context": json.dumps(profile),
+                "research_summary": _rs,
+                "growth_hooks": _gh,
+                "pain_hooks": _ph,
+                "news_hooks": _nh,
+                "hooks": {"research_profile": profile},
+                "_llm_error": True,
+            }
+            if return_context:
+                err["_eval_context"] = rendered[:9000]
+            return err
+
+        m.overall_reasoning = self._scrub_hedges(m.overall_reasoning)
+
+        # ── Production-signal role rescue ─────────────────────────────────────
+        # Corrects the common mis-classification where the LLM picks out_of_domain
+        # because the company's END MARKET (e.g. "eye care", "agriculture") looks
+        # unrelated to the sender, but the company itself RUNS production operations.
+        # Double-gated to avoid false accepts: only fires when BOTH the profile shows
+        # production signals AND the sender serves operators.
+        if (
+            m.target_role == "out_of_domain"
+            and self._profile_has_production(profile, csv_desc=csv_desc)
+            and self._sender_serves_operators(sender_offerings, sender_customers, sender_capmap)
+        ):
+            logger.info(
+                f"[ICP] Production override for {domain}: out_of_domain → operator_end_user "
+                f"(profile shows production + sender serves operators)."
+            )
+            m.target_role = "operator_end_user"
+            m.role_reason = (m.role_reason or "") + " [System: confirmed production operations.]"
+            # Conservative 'clear match' baseline; real differentiation still comes
+            # from the computed scale + breadth sub-scores.
+            m.operational_overlap = max(int(m.operational_overlap or 0), 24)
+
+        # ── Compute deterministic sub-scores ─────────────────────────────────
+        if m.target_role == "operator_end_user":
+            m.scale_readiness = self._compute_scale_readiness(company_data, profile)
+            m.signal_breadth  = self._compute_signal_breadth(m)
+            m.operator_fit    = (
+                max(0, min(45, int(m.operational_overlap or 0)))
+                + m.scale_readiness
+                + m.signal_breadth
+            )
+        else:
+            m.operational_overlap = 0
+            m.scale_readiness     = 0
+            m.signal_breadth      = 0
+            m.operator_fit        = 0
+
+        company_domain_var.reset(_dom_tok)
+
+        result = self._decide(m, profile)
+        if return_context:
+            result["_eval_context"] = rendered[:9000]
+        return result

@@ -16,6 +16,7 @@ from app.core.llm_resilience import OPENAI_CIRCUIT
 from app.services.company_validation_service import CompanyValidationService
 from app.services.stakeholder_service import StakeholderRankingService
 from app.services.user_intel_service import UserIntelService
+from app.services.search_hints import derive_search_hints
 from app.db.database import SessionLocal
 
 # Bounded DNS Executor for Vitality Audits
@@ -337,24 +338,52 @@ class CampaignService:
                 f"(concurrency={settings.ICP_CONCURRENCY}, batch={STAGE3_COMMIT_BATCH})."
             )
             research_cache = validator.prefetch_icp_research([d for d, _ in icp_items])
+            # Derive search hints once per campaign (sender pain map + campaign prompt).
+            # Passed to qualify_and_enrich so enrichment_v2 L6 uses THIS sender's
+            # vocabulary — no hardcoded domain terms anywhere.
+            _search_hints = derive_search_hints(
+                user_intel_dict,
+                campaign_metadata.get("prompt", ""),
+            )
+            logger.info(f"[STAGE 3] Search hints ({len(_search_hints)}): {_search_hints}")
             circuit_open = [circuit_is_open(OPENAI_CIRCUIT)[0]]
             icp_sem = asyncio.Semaphore(settings.ICP_CONCURRENCY)
 
-            async def run_icp(domain, co_data):
+            # ONE shared curl_cffi session for the WHOLE Phase-2 batch. This is the
+            # primary RAM control: the v2 enrichment opens many parallel sub-fetches
+            # per company (site + press + RSS + news + hiring + wiki). A per-company
+            # session would multiply connection-pool memory by ICP_CONCURRENCY and blow
+            # the worker's 350 MB envelope; one shared session keeps peak RSS low even
+            # at concurrency 20. max_clients sits a little above the concurrency so each
+            # in-flight company still has spare sockets for its parallel sub-fetches.
+            from curl_cffi.requests import AsyncSession
+            # curl handles are cheap (~hundreds of KB each); 2× the concurrency gives
+            # each in-flight company a couple of sockets for its parallel sub-fetches
+            # without meaningfully moving RAM. The news/ddgs/trafilatura global
+            # semaphores in enrichment_v2 cap the truly heavy work independently.
+            _max_clients = max(40, settings.ICP_CONCURRENCY * 2)
+
+            async def run_icp(domain, co_data, client):
                 async with icp_sem:
                     if circuit_open[0]:
                         return domain, {"_circuit_skipped": True}
                     try:
                         res = await validator.qualify_and_enrich(
                             co_data, user_intel_dict, campaign_metadata,
-                            research_cache=research_cache,
+                            research_cache=research_cache, client=client,
+                            search_hints=_search_hints,
                         )
                         return domain, res
                     except Exception as e:
                         logger.error(f"[ICP] Failed for {domain}: {e}")
-                        return domain, {"status": "ERROR", "reasoning": str(e), "_llm_error": True}
+                        # Use REJECTED so the company has a final verdict — ERROR is a
+                        # transient DB marker that the sweeper can retry; REJECTED is
+                        # the user-visible state when enrichment genuinely fails.
+                        return domain, {"status": "REJECTED",
+                                        "relevance_score": 0,
+                                        "reasoning": f"Enrichment/scoring failed: {e}",
+                                        "_llm_error": True}
 
-            icp_pending = {asyncio.create_task(run_icp(d, co)) for d, co in icp_items}
             icp_buffer: list = []
             icp_processed = 0
             skipped = 0
@@ -368,25 +397,29 @@ class CampaignService:
                 if not circuit_open[0] and circuit_is_open(OPENAI_CIRCUIT)[0]:
                     circuit_open[0] = True
 
-            try:
-                while icp_pending:
-                    done, icp_pending = await asyncio.wait(icp_pending, return_when=asyncio.FIRST_COMPLETED)
-                    for fut in done:
-                        domain, res = fut.result()
-                        if res.get("_circuit_skipped"):
-                            skipped += 1
-                            continue
-                        icp_buffer.append((domain, res))
-                        icp_processed += 1
-                        if len(icp_buffer) >= STAGE3_COMMIT_BATCH:
-                            _commit_icp(icp_buffer)
-                            icp_buffer = []
-                    del done
-                if icp_buffer:
-                    _commit_icp(icp_buffer)
-            finally:
-                for t in icp_pending:
-                    t.cancel()
+            async with AsyncSession(impersonate="chrome", max_clients=_max_clients) as shared_client:
+                icp_pending = {
+                    asyncio.create_task(run_icp(d, co, shared_client)) for d, co in icp_items
+                }
+                try:
+                    while icp_pending:
+                        done, icp_pending = await asyncio.wait(icp_pending, return_when=asyncio.FIRST_COMPLETED)
+                        for fut in done:
+                            domain, res = fut.result()
+                            if res.get("_circuit_skipped"):
+                                skipped += 1
+                                continue
+                            icp_buffer.append((domain, res))
+                            icp_processed += 1
+                            if len(icp_buffer) >= STAGE3_COMMIT_BATCH:
+                                _commit_icp(icp_buffer)
+                                icp_buffer = []
+                        del done
+                    if icp_buffer:
+                        _commit_icp(icp_buffer)
+                finally:
+                    for t in icp_pending:
+                        t.cancel()
 
             if skipped:
                 logger.warning(f"[STAGE 3] Provider circuit open: {skipped} deferred. Rescheduling.")

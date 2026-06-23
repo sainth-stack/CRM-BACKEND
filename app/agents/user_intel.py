@@ -44,7 +44,7 @@ INPUT DATA:
 REQUIRED OUTPUT ARCHITECTURE:
 - exact_company_name: The formal legal or trade name.
 - website: Cleaned and verified official URL.
-- moto: Primary tagline or mission snippet.
+- motto: Primary tagline or mission snippet.
 - core_offerings: List of 4-6 high-impact products/services.
 - target_customers: Primary types of companies or industries they serve.
 - competitive_advantages: Why they win (experience, unique tech, market position).
@@ -64,7 +64,7 @@ class CapabilityPainMap(BaseModel):
 class UserIntelResponse(BaseModel):
     exact_company_name: str = Field(description="The formal and verified name of the company")
     website: str = Field(description="The verified official website URL")
-    moto: str = Field(description="The formal motto or tagline, or N/A")
+    motto: str = Field(description="The formal motto or tagline, or N/A")
     core_offerings: List[str] = Field(description="List of 4-6 high-impact products or services")
     target_customers: List[str] = Field(description="Primary types of companies or roles they serve")
     competitive_advantages: List[str] = Field(description="Specific reasons why they win against competitors")
@@ -127,7 +127,7 @@ def research_user_company(company_url: str, campaign_prompt: str = "", return_co
     fallback = {
         "exact_company_name": domain.split('.')[0].capitalize(),
         "website": company_url,
-        "moto": "N/A",
+        "motto": "N/A",
         "core_offerings": ["Digital Solutions"],
         "deep_research": "Identity verified through site architecture.",
     }

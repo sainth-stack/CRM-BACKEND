@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Literal
 
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
@@ -8,54 +8,85 @@ from app.core.llm import get_chat_llm
 
 logger = logging.getLogger("StakeholderRanking")
 
-# Safety cap on how many contacts go into a single batched scoring call (guards the
-# prompt size for a pathologically large contact list). Effectively "all" for normal
-# companies. NOT a quality shortlist — every contact within this cap is AI-scored.
 MAX_CONTACTS_PER_CALL = 60
+
+_COMPANY_FIT_CEILING = {"strong": 100, "partial": 65, "weak": 30}
+
+
+def _apply_ceiling(raw_scores: dict[int, dict], ceiling: int) -> dict[int, dict]:
+    """Apply a company-fit ceiling while preserving relative spread.
+
+    Simple clamp (min(ceiling, score)) collapses all contacts to the ceiling value
+    whenever they all score above it — destroying the ordering. Instead we
+    proportionally scale the full range [0 → max_raw] → [0 → ceiling], so the
+    relative differences between contacts are always preserved.
+    """
+    if not raw_scores:
+        return raw_scores
+    max_raw = max(v["role_fit"] for v in raw_scores.values())
+    if max_raw <= 0:
+        return {k: {**v, "role_fit": 0} for k, v in raw_scores.items()}
+    if max_raw <= ceiling:
+        # All scores already within the ceiling — just clamp negatives.
+        return {k: {**v, "role_fit": max(0, v["role_fit"])} for k, v in raw_scores.items()}
+    # Proportional scaling: score * (ceiling / max_raw), rounded to nearest int.
+    factor = ceiling / max_raw
+    return {
+        k: {**v, "role_fit": max(0, round(v["role_fit"] * factor))}
+        for k, v in raw_scores.items()
+    }
 
 
 class RankedContact(BaseModel):
     index: int = Field(description="The contact's index number from the provided list.")
-    role_fit: int = Field(description="0-100: likelihood this person is a decision-maker/economic buyer/champion for the sender's solution.")
+    role_fit: int = Field(
+        description=(
+            "0-100 score BEFORE the company-fit ceiling is applied. Score each person purely "
+            "on how well their function and seniority match the economic buyer / champion / "
+            "influencer profile for this deal. The system enforces the ceiling in code — you "
+            "do NOT need to cap scores yourself here. Spread scores — never the same value twice."
+        )
+    )
     reasoning: str = Field(
         description=(
-            "ONE professional, customer-facing sentence on the engagement decision for THIS person — "
-            "grounded in their actual title/function and the deal context. Speak about the PERSON and the "
-            "decision (whether/how to engage them, what influence they have, who would be a better entry "
-            "point if any), NEVER recite the rubric, the buying-committee functions, the seniority bands, "
-            "or any internal scoring framework. Do NOT use phrases like 'irrelevant function', 'aligns with "
-            "key functions', 'does not align with', 'matched to committee', or quoted department names like "
-            "'Other'. Write as if explaining to a sales rep, in natural business language."
+            "ONE professional, forward-facing sentence about THIS person — what they do, "
+            "what influence they likely have over this purchase, and how to engage them "
+            "(or why they are not the primary target). Write for a salesperson in natural "
+            "business language. NEVER use internal scoring terms: no 'pillar', 'ceiling', "
+            "'cap', 'viability', 'function fit', 'irrelevant function', 'aligns with', "
+            "'does not align', 'buying committee', 'STEP', or quoted rubric labels."
         )
     )
 
 
 class StakeholderRanking(BaseModel):
+    company_fit: Literal["strong", "partial", "weak"] = Field(
+        description=(
+            "Company-offer fit verdict from STEP B. "
+            "'strong' = company clearly operates in the domain the sender's offering addresses. "
+            "'partial' = company has some but not all ideal-customer characteristics. "
+            "'weak'   = company core activities don't align with what the sender solves."
+        )
+    )
     rankings: List[RankedContact] = Field(description="A ranking entry for EVERY contact index provided.")
 
 
 class StakeholderRankingService:
-    """Selects the strongest stakeholders per company.
+    """Ranks the strongest stakeholders per company for a given campaign.
 
-    Phase 3: ranks the FULL contact set (not the first 15 by CSV order), scores
-    reachability by whether a Primary Email exists, and judges role/persona fit
-    against the sender DNA + deep research + campaign objective in a single batched
-    LLM call (cheap model). Returns the full list sorted best-first; the caller
-    takes the top N.
+    Reachability (primary email present) is the only deterministic filter.
+    All scoring is fully dynamic — derived from sender profile, campaign objective,
+    and per-company context. No hardcoded industry or offer-type rubrics.
     """
 
     def __init__(self):
-        # Cap tail latency (60s x 1 retry): one batched call per company, run
-        # concurrently across the chunk — a slow provider must not stall the stage.
         self.llm = get_chat_llm("cheap", timeout=60, max_retries=1)
 
     # ------------------------------------------------------------------ #
-    # Deterministic signals                                              #
+    # Reachability                                                         #
     # ------------------------------------------------------------------ #
     @staticmethod
     def _best_email(p: Dict[str, Any]) -> tuple[str | None, bool]:
-        """Return (primary_email, exists). Reachability is decided solely by the
-        presence of a Primary Email — the per-slot validation columns were removed."""
         primary = p.get("primary_email")
         if primary:
             return str(primary), True
@@ -67,7 +98,7 @@ class StakeholderRankingService:
         return 100 if email else 0
 
     # ------------------------------------------------------------------ #
-    # Main entry                                                          #
+    # Main entry                                                           #
     # ------------------------------------------------------------------ #
     async def rank_stakeholders_with_ai(
         self,
@@ -77,27 +108,22 @@ class StakeholderRankingService:
         objective: str = "",
         industry: str = "",
     ) -> List[Dict[str, Any]]:
-        """Rank ALL reachable prospects for a company, best-first. Each returned dict
-        gains `strategic_score` (0-100) and `strategic_reasoning`.
+        """Rank all reachable prospects for a company, best-first.
 
-        Two stages:
-          STAGE 1 (deterministic) — drop anyone without a Primary Email.
-          STAGE 2 (fully dynamic, agent-decided) — the LLM scores EVERY remaining
-            prospect 0-100 from the campaign objective + the target industry + that
-            prospect's own title/seniority/department/tenure. No hardcoded seniority
-            table, no shortlist, no reachability blend; the agent's score IS the
-            strategic score, so it varies per prompt + industry + person."""
+        STAGE 1 (deterministic) — drop anyone without a Primary Email.
+        STAGE 2 (fully dynamic) — LLM scores every remaining contact 0-100
+          from sender profile, campaign objective, company research, and
+          per-contact title/seniority/department/tenure. No hardcoded rubric.
+        """
         if not prospects:
             return []
 
-        # STAGE 1 — reachability filter (the ONLY deterministic step).
         candidates = [p for p in prospects if self._reachability(p) == 100]
         for p in candidates:
             p["reachability"] = 100
         if not candidates:
             return []
 
-        # STAGE 2 — dynamic AI scoring of every reachable prospect (one batched call).
         scored = candidates[:MAX_CONTACTS_PER_CALL]
         role_fits = await self._score_role_fit(scored, user_intel, research_context, objective, industry)
 
@@ -107,12 +133,9 @@ class StakeholderRankingService:
                 p["strategic_score"] = fit["role_fit"]
                 p["strategic_reasoning"] = fit["reasoning"]
             else:
-                # AI-unavailable fallback: neutral score so the prospect stays
-                # selectable — never a hardcoded seniority ranking.
                 p["strategic_score"] = 50
                 p["strategic_reasoning"] = "Scored neutrally — automated assessment was unavailable."
 
-        # Any overflow beyond the per-call cap (rare) also gets the neutral fallback.
         for p in candidates[MAX_CONTACTS_PER_CALL:]:
             p["strategic_score"] = 50
             p["strategic_reasoning"] = "Scored neutrally — beyond the per-company scoring batch."
@@ -120,6 +143,9 @@ class StakeholderRankingService:
         candidates.sort(key=lambda c: c["strategic_score"], reverse=True)
         return candidates
 
+    # ------------------------------------------------------------------ #
+    # Scoring prompt                                                       #
+    # ------------------------------------------------------------------ #
     async def _score_role_fit(
         self, shortlist, user_intel, research_context, objective, industry=""
     ) -> Dict[int, dict]:
@@ -139,72 +165,116 @@ class StakeholderRankingService:
         contacts_block = "\n".join(contact_lines)
 
         prompt = ChatPromptTemplate.from_template(
-            """You are a B2B sales strategist deciding WHO to contact at a target account. Produce a
-SPREAD of scores that reflects how decisive each person is FOR THIS SPECIFIC deal — never a generic
-seniority ranking, and never the same number for everyone.
+            """You are a B2B sales strategist deciding WHO to contact at a target account.
+Score each contact 0-100 on how well they fit as the ECONOMIC BUYER, CHAMPION, or
+key INFLUENCER for what this sender is offering. Every score must be earned from
+the evidence — derive everything from the sender profile and company context below.
 
-SENDER'S IDEAL BUYER PROFILES: {target_profiles}
-PAINS THE SENDER SOLVES: {pains_solved}
-CAMPAIGN OBJECTIVE (the user's goal): {objective}
-(The per-company TARGET COMPANY INDUSTRY, RESEARCH, and CONTACTS are provided at the
-very END, after these instructions — they are the only inputs that change per company.)
+════════════════════════════════════════════════════════
+SENDER PROFILE
+════════════════════════════════════════════════════════
+Ideal buyer profiles:  {target_profiles}
+Pains the sender solves: {pains_solved}
+Campaign objective:    {objective}
 
-STEP 1 — Define the BUYING COMMITTEE for THIS deal. From the CAMPAIGN OBJECTIVE and the TARGET COMPANY
-INDUSTRY (shown below), work out which functions/departments own the budget, the decision, and the internal-champion
-role for THIS specific solution in THIS specific industry. The right functions CHANGE with the objective
-and the industry — derive them, do not assume a fixed list. Examples (illustrative, not exhaustive):
-  • predictive-maintenance / industrial-data offering to a MANUFACTURER -> Operations, Plant,
-    Maintenance, Engineering, Production lead the committee; Marketing/HR are irrelevant.
-  • marketing-analytics offering to a RETAILER -> Marketing, Growth, E-commerce, Merchandising lead;
-    Plant/Maintenance are irrelevant.
-  • compliance/security offering to a BANK -> Risk, Compliance, CISO/Security, IT lead.
+════════════════════════════════════════════════════════
+SCORING METHODOLOGY — apply all three in order
+════════════════════════════════════════════════════════
 
-STEP 2 — Score EVERY contact's role_fit (0-100). The score is a DYNAMIC judgement from THREE inputs, and
-it must change with the objective, the industry, AND the individual person:
-  (a) FUNCTION match — does their TITLE + DEPARTMENT sit in the committee you derived for THIS
-      objective+industry? This is the primary driver.
-  (b) SENIORITY — within the right function, more authority (Director/VP/Head/C-level) scores higher than
-      a manager or individual contributor; a senior person in an IRRELEVANT function still scores LOW
-      (seniority never rescues a wrong function).
-  (c) TENURE — within the same function and seniority, longer time-in-role / time-at-company indicates
-      deeper authority and influence and scores higher; a brand-new hire scores lower.
-Bands (apply after weighing a+b+c):
-  • 85-100 : right function AND senior decision-owner for this exact solution (the primary buyer here).
-  • 60-84  : right function, strong influence/champion (senior but not the owner, or owner-adjacent).
-  • 30-59  : adjacent/influencer function, or junior within the right function — loop in, does not own it.
-  • 0-29   : clearly irrelevant function for THIS objective+industry.
-SPREAD the scores — do NOT cluster everyone near one number; two people with different functions,
-seniority, or tenure should get visibly different scores.
+STEP A — DERIVE THE DECISION-MAKER PROFILE FOR THIS DEAL
+From the campaign objective and sender profile, work out:
+  (i)  Who OWNS the budget for this type of purchase?
+  (ii) Who will CHAMPION it internally (drives evaluation, builds the business case)?
+  (iii) Who are strong INFLUENCERS (consulted, but don't own the final call)?
 
-`reasoning` field — STRICT (this is shown to a salesperson in the UI):
-  • Write ONE professional, customer-facing sentence about THIS PERSON and the engagement decision —
-    speak to their actual title/function and what to do with them (engage them directly as the buyer,
-    use as champion/influencer, consider as budget-approver only, look for a better entry point in
-    function X instead, etc.).
-  • Use NATURAL business language a sales rep would use. NEVER recite the rubric or framework you used.
-  • BANNED phrasing (do NOT use these or anything similar — they expose internal logic):
-       "irrelevant function", "aligns with the key functions", "does not align with", "matched to
-       committee function", "the committee", "buying committee", "key functions of X, Y, or Z",
-       department/value quotes like 'Other'/'Marketing'/'Operations' in scare-quotes, "role_fit",
-       "scoring rubric", any mention of band names (e.g. "primary buyer band").
-  • GOOD examples (cross-industry, illustrative tone — do not copy verbatim):
-       "Operations Director — primary buyer for maintenance and uptime decisions; lead with the
-        downtime-reduction angle."
-       "Managing Director with broad oversight; can sponsor a pilot but typically delegates the
-        technical evaluation to the operations or engineering lead."
-       "Marketing leadership; not the buyer for this kind of operational tooling — better entry point
-        would be the head of operations or plant management."
-       "Junior maintenance engineer — useful internal champion to validate technical fit, but not the
-        decision-maker."
+Do this derivation first — DO NOT assume fixed answers. The economic buyer for a
+maintenance-software deal at a manufacturer is different from the economic buyer for
+the same software at a logistics firm. Derive from what this specific company does.
 
-================= THIS TARGET COMPANY (the only per-company inputs) =================
-TARGET COMPANY INDUSTRY: {industry}
-TARGET COMPANY RESEARCH: {research_context}
+STEP B — COMPANY-OFFER FIT
+Determine how closely the sender's offering maps to this company's actual operations.
+Base this entirely on the campaign objective + company industry + research.
 
-CONTACTS (score EVERY index):
+Output ONE of these three verdicts in the `company_fit` field:
+  "strong" — the company clearly operates in the domain the sender's offering addresses.
+  "partial" — the company has some but not all ideal-customer characteristics.
+  "weak"   — the company's core activities don't align with what the sender solves.
+
+The system code enforces the score ceiling automatically based on your verdict:
+  strong → 100 max  |  partial → 65 max  |  weak → 30 max
+You do NOT need to cap scores in the role_fit field — score each person 0-100 based
+purely on their function and seniority, and the ceiling is applied in code after.
+
+State your fit verdict in the `company_fit` field, then score contacts in `rankings`.
+
+STEP C — SCORE EACH CONTACT INDIVIDUALLY (primary driver: function, then seniority)
+Score 0-100 for each contact based purely on function + seniority fit for this deal.
+The system applies the company-fit ceiling from STEP B in code — you do not cap here.
+
+Function-fit categories:
+  ECONOMIC BUYER — this person owns the budget/decision for this purchase:   75-100
+  CHAMPION       — right function, strong internal influence, not final owner: 50-74
+  INFLUENCER     — adjacent function, will be consulted, doesn't own it:      25-49
+  PERIPHERAL     — function clearly doesn't touch this decision here:          0-24
+
+TITLE INTERPRETATION RULES (context is everything — never read a title in isolation):
+  • Interpret every title in the context of what THIS company actually does.
+  • "Director of Operations" means production/plant at a manufacturer, engineering
+    delivery at a software firm, project delivery at a consulting firm, store/supply
+    chain at retail — derive from company type, don't assume.
+  • "Sales Operations" is about sales process (CRM, pipeline tools) — low fit for
+    offers that target production, finance, or engineering functions.
+  • "Engineering" at a manufacturer is ADJACENT (not peripheral): at a machinery or
+    equipment maker, engineering owns product design and often co-owns tooling and
+    production readiness decisions — score as INFLUENCER (25-49) unless the campaign
+    is specifically about engineering tools, in which case they may be economic buyer.
+  • Functions like HR, Legal, Finance, Marketing score PERIPHERAL for operational
+    tools unless the campaign explicitly targets those functions.
+  • A senior title in the WRONG function scores LOW — seniority rescues nothing
+    when the function is peripheral to this purchase.
+
+Seniority modifier (applied within the correct function only):
+  C-suite (CEO/COO/CFO/CTO/etc.) → +15
+  VP / SVP / EVP                 → +12
+  Director / Senior Director     → +8
+  Manager / Senior Manager       → +4
+  Individual Contributor         → +0
+  NEW in role (<12 months)       → additional +5 (active buying-window signal)
+
+CALIBRATION:
+  85-100 = Economic buyer, clear budget authority, right function, senior.
+  65-84  = Strong champion or VP-level influencer in the right function.
+  40-64  = Influencer or director-level adjacent function; worth a CC or warm intro.
+  0-39   = Function peripheral to this decision, or company fit too weak to prioritise.
+
+SPREAD REQUIREMENT: scores across the contact list MUST spread. Never assign the same
+score to two contacts unless every relevant dimension (function, seniority, tenure, fit)
+is truly identical. Two contacts with different titles or departments must score
+differently — even if the gap is small.
+
+════════════════════════════════════════════════════════
+REASONING RULES
+════════════════════════════════════════════════════════
+Write ONE professional, forward-facing sentence per contact. State what this person
+actually does, what influence they likely have over this specific purchase, and the
+best engagement angle — OR why they are not the primary target and who would be better.
+
+Write for a salesperson, in natural business language.
+BANNED phrases (expose the rubric — never write these):
+  "irrelevant function", "aligns with", "does not align with", "buying committee",
+  "key functions", "viability", "not viable", "pillar", "ceiling", "cap", "STEP",
+  "function fit", "economic buyer profile", "scoring rubric", "band", "score".
+
+════════════════════════════════════════════════════════
+TARGET COMPANY (the only per-company inputs)
+════════════════════════════════════════════════════════
+Industry: {industry}
+Research: {research_context}
+
+CONTACTS — score EVERY index 0-100 (the system applies the ceiling from STEP B in code):
 {contacts_block}
 
-Return a ranking entry for EVERY index above."""
+First output the `company_fit` verdict, then a ranking entry for EVERY index."""
         )
 
         structured = self.llm.with_structured_output(StakeholderRanking)
@@ -218,10 +288,13 @@ Return a ranking entry for EVERY index above."""
                 "research_context": (research_context or "N/A")[:2000],
                 "contacts_block": contacts_block,
             })
-            return {
-                r.index: {"role_fit": max(0, min(100, r.role_fit)), "reasoning": r.reasoning}
+            ceiling = _COMPANY_FIT_CEILING.get(result.company_fit, 100)
+            logger.info(f"[STAKEHOLDER] company_fit={result.company_fit} ceiling={ceiling}")
+            raw = {
+                r.index: {"role_fit": max(0, r.role_fit), "reasoning": r.reasoning}
                 for r in result.rankings
             }
+            return _apply_ceiling(raw, ceiling)
         except Exception as e:
             logger.error(f"[STAKEHOLDER] Batched role-fit scoring failed: {e}")
             return {}

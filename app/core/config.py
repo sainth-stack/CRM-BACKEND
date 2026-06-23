@@ -18,32 +18,34 @@ class Settings:
     # process realistic uploads while protecting the t2.medium box from OOM.
     MAX_CSV_ROWS = int(os.getenv("MAX_CSV_ROWS", "2000"))
 
-    # Pipeline in-stage concurrency (latency vs memory tradeoff). Defaults match
-    # the previous hardcoded values so behaviour is unchanged out of the box; raise
-    # these on a larger instance to cut wall-clock time for big campaigns.
-    # Merged ICP-qualify + research stage. This is I/O-bound (per-company website
-    # crawl + one LLM call), NOT CPU-bound, so it can safely run much wider than the
-    # old min(stage3, stage4)=3 cap that throttled it. Raise for faster big runs;
-    # lower only if the box shows network/socket pressure.
-    # GOVERNOR IS OpenAI TPM, NOT RAM/CPU. Measured: ICP at concurrency 40 peaks at
-    # ~400 MB RAM (safe) but instantly saturates a 200K-TPM (Tier-1) account and 429s.
-    # Each ICP company ≈ 10K tokens, so ~19 companies/min is the Tier-1 ceiling and
-    # concurrency ~20 already saturates it — going higher only causes 429s. Stages run
-    # sequentially, so each gets the full TPM budget. Right-size to YOUR tier:
-    #   Tier 1 (200K TPM): ~20  |  Tier 2 (2M TPM): 40+  |  Tier 3+: 60+.
-    # ICP trimmed to ~8K tokens/company (12K enrich input + lean validation profile),
-    # so 200K TPM / 8K ≈ 25 companies/min -> concurrency 25 saturates Tier-1 without
-    # 429s. Raise alongside the tier (Tier 2 = 2M TPM -> 40+).
-    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "25"))        # ICP gate (extractor + 2 LLM) — TPM-bound
+    # Pipeline in-stage concurrency (latency vs memory tradeoff). Raise these on a
+    # larger instance to cut wall-clock time for big campaigns.
+    #
+    # Stage 3 = merged ICP-qualify + research. Per company it runs the v2 multi-layer
+    # enrichment (website + RSS + Google News + DDGS + hiring/ATS + Wikipedia) and one
+    # enrichment LLM call, then the MEDDPICC validation LLM call. It is I/O-bound, not
+    # CPU-bound.
+    #
+    # MEMORY: the whole Phase-2 batch shares ONE curl_cffi AsyncSession (created in
+    # campaign_service.stage_3_icp_filtering), and trafilatura/lxml parsing is globally
+    # bounded to 8 concurrent parses (enrichment_v2.TRAFILATURA_CONCURRENCY). At
+    # concurrency 20 this keeps the heavy worker's peak RSS well under its 350 MB target
+    # (≈ shared session 20-30 MB + ≤8 live lxml parses + small per-company text buffers).
+    # Do NOT switch back to a per-company session — that multiplies pool memory by the
+    # concurrency factor and breaks the envelope.
+    #
+    # THROUGHPUT GOVERNOR is OpenAI TPM, not RAM/CPU. Each ICP company ≈ 8-10K tokens
+    # (12K enrich input + lean validation profile), so 200K TPM (Tier-1) / ~9K ≈ ~22
+    # companies/min — concurrency 20 saturates Tier-1 without 429s. Right-size to tier:
+    #   Tier 1 (200K TPM): 20  |  Tier 2 (2M TPM): 40+  |  Tier 3+: 60+.
+    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "20"))        # enrich + ICP — TPM-bound, RAM-safe via shared session
     STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "25"))   # stakeholder ranking
     STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "25"))   # email drafting (single MEDDPICC call)
 
-    # ICP acceptance threshold (0-100). A company is accepted when its inferred
+    # ICP acceptance threshold (0-100). A company is ACCEPTED when its inferred
     # operator_fit score (+ optional need/precondition bonus) >= this value AND it
     # does not hard-fail an explicit firmographic requirement. Score-driven (no
     # pass/fail/unknown cliff). Lower to accept more, raise to be stricter.
-    # Recalibrated for the inference-based fit model (operator_fit bands: 55-79 solid,
-    # 80+ strong); the old default of 45 was tuned to the broken 0.70-clamped scores.
     ICP_ACCEPT_THRESHOLD = int(os.getenv("ICP_ACCEPT_THRESHOLD", "55"))
 
     # Cross-campaign reuse of a domain's structured research profile (skips crawl +

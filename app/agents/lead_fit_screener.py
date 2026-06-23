@@ -382,69 +382,57 @@ def match_size(csv_size: str, target_size: str) -> tuple[str, str]:
 # Static system prompt — contains ONLY rules/examples with zero variables.
 # Sent as SystemMessage so OpenAI caches this prefix across every call in the run.
 # Dynamic context (sender info, target industry, company data) goes in HumanMessage.
+#
+# DESIGN NOTE: This prompt is deliberately industry-agnostic. The target industry
+# is injected at the end of build_system_message() — never hardcode industry-specific
+# rules here, or the screener silently breaks for any non-manufacturing campaign.
 _INDUSTRY_SCREEN_SYSTEM = """\
 You are a B2B lead pre-screener doing INDUSTRY CLASSIFICATION only.
 
 Answer this single question:
-"Does this company's own primary business BELONG TO the target industry?"
+"Does this company's primary business belong to the TARGET INDUSTRY stated at the end
+of this message?"
 
 You are NOT judging sales fit, product relevance, or operational match.
-Sender context is provided solely so you understand what industry is being targeted.
-DO NOT use it to assess whether the sender's product would work for this company.
+Sender context is provided solely so you understand which industry sector is being
+targeted. Do NOT use it to assess whether the sender's product would work for this
+company.
 
-DECISION TEST — follow these steps in order:
+VERDICTS:
 
-Step 1. Does the description contain EXPLICIT PRODUCTION LANGUAGE showing the company
-makes something? Look for: manufactures, makes, produces, fabricates, assembles,
-builds, engineers and builds, designs and manufactures, designs and builds, produces.
-  EXAMPLES → PASS:
-    - "manufactures wire and cable products"
-    - "designs and builds antenna solutions"
-    - "engineers thermal imaging cameras"
-    - "fabricates stainless steel swimming pools"
-    - "assembles precision metal components"
-  If YES → verdict = pass. Stop here.
+"pass" — the company clearly belongs to the target industry:
+  - Its PRIMARY business activity falls squarely within the target industry category.
+  - The industry label, SIC/NAICS codes, or description language clearly confirm
+    membership in that sector.
+  - When the evidence tilts toward the target industry but is not definitive, prefer
+    "pass" over "unknown" — a missed prospect is a worse outcome than a false lead.
 
-Step 2. Does the description show the company is a PURE SERVICE PROVIDER, SOFTWARE
-COMPANY, CONSULTANT, or DISTRIBUTOR/RESELLER/DEALER with NO production language?
-  DISTRIBUTOR / DEALER signals (FAIL): "sells X", "rents X", "offers X for sale",
-    "service and repair of X", "distributes X" with no mention of making X.
-  SERVICE signals (FAIL): consulting, staffing, IT services, cloud platforms,
-    construction services, engineering services, pre-construction software.
-  SOFTWARE signals (FAIL): SaaS, platform, software for X, AI solutions.
-  EXAMPLES → FAIL:
-    - "offers forklifts for sale, rentals, leasing and service"   ← dealer
-    - "premier provider of industrial automation components"      ← could be distributor
-    - "provides engineering consulting services"                  ← services
-    - "software platform for warehouse management"                ← software
-    - "AI workforce that assists builders in pre-construction"    ← software/service
-  If YES → verdict = fail.
+"fail" — the company is clearly in a DIFFERENT industry supercategory:
+  - Its core activities have NO meaningful overlap with the target industry.
+  - Reserve FAIL for UNAMBIGUOUS mismatches only — not borderline judgement calls.
+  - The company's own industry label and what it does must both point clearly away
+    from the target sector.
+  - IMPORTANT: A company that SERVES, DISTRIBUTES, or SELLS TO companies in the
+    target industry is NOT automatically a FAIL — evaluate its own primary business,
+    not its customer base. Only FAIL if the company's own core activity is clearly
+    outside the target industry.
 
-Step 3. Description is too vague, uses only "provider of X" or "supplier of X"
-without explicit production language, or is genuinely ambiguous → verdict = unknown.
-  EXAMPLES → UNKNOWN:
-    - "provider of team communication systems" (could make or resell them)
-    - "supplier of industrial components" (could make or distribute them)
-    - "leading provider of cargo loading solutions" (ambiguous)
+"unknown" — too ambiguous or too thin to decide:
+  - Description is very short, generic, or uses only vague terms ("provider of
+    solutions", "leading supplier of products").
+  - The company could plausibly belong to the target industry OR to another sector.
+  - Industry label and description give conflicting or unclear signals.
+  - Genuinely borderline — the company straddles two industry categories.
 
-RULES:
-- "Provider/supplier of [product]" alone is NOT enough for PASS — it could be a
-  reseller. Only explicit production language earns PASS.
-- The TYPE of physical product never matters. Tape, molds, antennas, sensors,
-  fasteners, RF equipment, cables — all qualify as Manufacturing if MADE by the
-  company.
-- FAIL only when clearly non-manufacturing. Wrong FAILs lose real prospects.
-
-INDUSTRY LABEL OVERRIDE:
-If the CSV industry label is UNAMBIGUOUSLY a manufacturing/industrial category
-(examples: Machinery, Industrial Automation, Electronics Manufacturing, Composites,
-Textiles, Semiconductors, Automotive, Medical Devices, etc.) AND the description is
-absent, thin, or only says "provides [products]" / "supplies [products]" without
-explicit distributor or service-only signals → return UNKNOWN, not FAIL.
-A manufacturing industry label is strong evidence — only override it to FAIL when the
-description explicitly contradicts it (e.g. label="Machinery" but description says
-"software platform" or "consulting services"). When in doubt with a manufacturing
-label, UNKNOWN is always safer than FAIL.\
+CALIBRATION RULES:
+  1. Wrong FAILs eliminate real prospects permanently. Wrong PASSes are caught by the
+     deeper ICP qualification stage. Always err toward PASS or UNKNOWN over FAIL.
+  2. UNKNOWN is always a pass-through — it never eliminates a company.
+  3. SIC/NAICS codes provide supporting evidence but do not override a clear description.
+     Descriptions and industry labels take precedence when they conflict with codes.
+  4. If the industry label places the company clearly in the target sector AND the
+     description does not explicitly contradict that — return PASS or UNKNOWN, not FAIL.
+  5. Do not invent reasons to FAIL. If you are unsure, UNKNOWN is correct.\
 """
 
 
@@ -530,24 +518,31 @@ class LeadFitScreener:
         size_check = CheckResult(verdict=sz_v, evidence=sz_e)
 
         # ── Check 3: Industry (LLM — always runs) ───────────────────────────
+        from app.core.logging_config import agent_label_var, company_domain_var
+        _dom_tok = company_domain_var.set(company_data.get("domain") or company_data.get("website") or name)
+        _ag_tok  = agent_label_var.set("screener")
         tok_usage: dict = {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}
-        if _is_blank(target_industry):
-            industry_check = CheckResult(verdict="pass", evidence="No target industry specified.")
-        else:
-            sys_msg = self.build_system_message(
-                target_industry=target_industry,
-                sender_customers=sender_customers,
-                sender_services=sender_services,
-                campaign_prompt=campaign_prompt,
-            )
-            industry_check, tok_usage = await self._check_industry(
-                name=name,
-                csv_industry=csv_industry,
-                csv_desc=csv_desc,
-                csv_sic=csv_sic,
-                csv_naics=csv_naics,
-                system_message=sys_msg,
-            )
+        try:
+            if _is_blank(target_industry):
+                industry_check = CheckResult(verdict="pass", evidence="No target industry specified.")
+            else:
+                sys_msg = self.build_system_message(
+                    target_industry=target_industry,
+                    sender_customers=sender_customers,
+                    sender_services=sender_services,
+                    campaign_prompt=campaign_prompt,
+                )
+                industry_check, tok_usage = await self._check_industry(
+                    name=name,
+                    csv_industry=csv_industry,
+                    csv_desc=csv_desc,
+                    csv_sic=csv_sic,
+                    csv_naics=csv_naics,
+                    system_message=sys_msg,
+                )
+        finally:
+            agent_label_var.reset(_ag_tok)
+            company_domain_var.reset(_dom_tok)
 
         # ── Final verdict ────────────────────────────────────────────────────
         failed: list[str] = []

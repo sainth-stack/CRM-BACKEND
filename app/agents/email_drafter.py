@@ -71,30 +71,61 @@ STRATEGY:
     - If no slots available: Apologize that the slot didn't fit, ask them to suggest 2-3 alternative times.
     - DO NOT claim the requested time works. DO NOT promise a calendar invite without a confirmed booking.
 
-- If MODE is 'NUDGE' (MEDDPICC, each step grounded — never invented):
-    1. IDENTIFY PAIN: open with a NEW pain/signal NOT already used in the thread above.
-    2. CAPABILITY + DECISION CRITERIA: bridge that to the exact sender capability that fits their likely criteria.
-    3. METRICS: add a credible proof/outcome or cost-of-inaction — a sender proof point, or a general
-       pattern phrased without a hard figure ('teams like yours often…'). NEVER invent a number or attach a
-       metric/percentage to a NAMED client unless that exact figure is in the sender's proof points.
-    4. ASK calibrated to the recipient's role (decision-owner: business outcome + a short call; champion/
-       influencer: make it forwardable, or ask who owns this).
-    5. Escalation level {escalation_level}: Early (#1-3) confident, insight-led; Mid (#4-6) more direct,
-       stronger; Late (#7-9) build urgency, cost of inaction visible; Final (#10-11) blunt, give an easy out.
+- If MODE is 'NUDGE':
+
+  EMAIL STRUCTURE — 3 paragraphs, in this order:
+
+  Para 1 — NEW OBSERVATION (2-3 sentences):
+    Open with a trigger or angle that has NOT appeared in thread_history.
+    Scan thread_history first: if the acquisition was used, pivot to the leadership hire, the new
+    product line, or a specific operational characteristic. If the funding was used, pivot to a
+    hiring signal or expansion detail. NEVER open with the same trigger twice.
+    Frame as observation or pattern — NOT as accusation. 'One thing we've noticed after acquisitions
+    like this...' works. 'As I mentioned, you're facing X...' does not.
+    DO NOT mention {user_company_name}, its product, platform, or any feature in this paragraph.
+
+  Para 2 — NEW INSIGHT (1-2 sentences):
+    Add a broader pattern or a new angle on the observation.
+    'The challenge in these situations usually isn't the equipment itself — it's getting consistent
+    visibility across old and new assets.' Frame it as something the prospect hasn't heard before.
+    Still NO mention of {user_company_name} or its product.
+    NO performance claims: never say 'significant reduction', 'significant improvement',
+    'typically see X within Y days', or any outcome claim unless the exact figure is in sender_proof.
+    If sender_proof is empty, stay fully qualitative — omit claims entirely.
+
+  Para 3 — SOFT RELEVANCE + ENGAGEMENT QUESTION (2 sentences max):
+    ONE sentence of soft sender relevance only: 'That's actually the operational problem
+    {user_company_name} focuses on.' No feature list. No product dump. No capabilities paragraph.
+    Then ONE low-friction engagement question — ask for curiosity, not a meeting:
+    'Has that become more of a focus since [trigger]?' / 'Curious if that's something your team
+    is navigating?' / 'How are you approaching that today?' / 'Is that part of the conversation
+    this year?' — pick the one that fits best.
+
+  Escalation context {escalation_level}:
+    Early (#1-3): insight-led, no meeting ask — engagement questions only.
+    Mid (#4-6): more direct, stronger hook, still no hard close.
+    Late (#7-9): cost of inaction visible, can ask for a call.
+    Final (#10-11): direct, blunt, give an easy out.
 
 STRICT CONSTRAINTS:
-1. ABSOLUTELY NO PLACEHOLDERS or bracketed/curly/angle tokens ([Name], {{metric}}, <X>). Fill a real value or omit it.
-2. NO FABRICATION: every fact, client name, outcome, and number must come from the data above only.
-3. For NUDGE: do NOT reuse any angle, hook, framing, or proof already in the thread.
-4. Do NOT state MEDDPICC hypotheses as facts and do NOT expose framework jargon. No "hope this finds you well" filler.
-5. Sign off EXACTLY, with a blank line after 'Best regards,' and a single line break between name and company:
+1. NO PLACEHOLDERS of any kind ([Name], {{metric}}, <X>). Fill or omit.
+2. NO FABRICATION: every fact and number must come from the data above only.
+3. NEVER reuse any angle, hook, or trigger already in thread_history.
+4. INFERENCE RULE: silence does not confirm prior pain assertions. Never re-state a claimed pain
+   as agreed fact. The thread shows used angles, not confirmed agreements.
+5. BANNED CTAs: 'does this resonate?' / 'Would you be open to a brief discussion?' /
+   'I'd love to connect' / 'let's schedule time'. For early stage (#1-6): engagement questions only.
+6. ZERO PERFORMANCE CLAIMS unless verbatim in sender_proof: never write 'significant reduction',
+   'significant improvement', 'typically see X', or any specific outcome.
+7. {user_company_name} must NOT appear in Para 1 or Para 2.
+8. No framework jargon. No 'hope this finds you well' filler.
+9. Sign off EXACTLY, with a blank line after 'Best regards,':
    "Best regards,
 
    {user_name}
    {user_company_name}"
-6. 150-220 words; richer and more substantive than the prior emails. Write each paragraph as ONE continuous
-   line with NO hard line breaks inside it; separate sections with a single blank line only.
-7. Return subject + body.
+10. 130-180 words total body. Each paragraph ONE continuous line — no internal line breaks.
+11. Return subject + body.
 """
 
 def clean_email_body(body: str) -> str:
@@ -253,38 +284,37 @@ ALL PREVIOUS EMAILS WE HAVE ALREADY SENT (do NOT reuse ANY of their angles, hook
 {previous_emails}
 
 ESCALATION: {escalation_level}
-- Level 1: confident re-engagement from a FRESH pain/value angle; add a concrete proof point.
-- Level 2 (final): strongest and most substantive; make the cost of inaction vivid, be direct, give an easy out.
+- Level 1: confident re-engagement from a FRESH observation or angle not in previous emails.
+- Level 2 (final): most direct; make cost of inaction concrete but qualitative — no invented numbers; give an easy out.
 
 GREETING (ALWAYS): begin with a greeting line "Hi <first name>," using ONLY the recipient's first name
 (the first word of "{dm_name}") — on its own line, followed by a blank line, before the body.
 
-MISSION (MEDDPICC, each step grounded — never invented):
-1. IDENTIFY PAIN: open with a NEW pain/signal not used in ANY previous email above.
-2. CAPABILITY + DECISION CRITERIA: bridge to the exact sender capability that fits their likely criteria.
-3. METRICS: add a credible proof/outcome or cost-of-inaction. Use ONLY the sender's stated proof points,
-   or a general pattern phrased without a hard figure ('teams like yours often reduce…'). NEVER invent a
-   number, percentage, or result, and NEVER attach a metric/percentage to a NAMED client unless that exact
-   figure appears verbatim in the sender's proof points. When unsure, stay qualitative — no number.
-4. ASK calibrated to the recipient's role (decision-owner: business outcome + a short call; champion/
-   influencer: make it forwardable or ask who owns this).
+MISSION (each step grounded — never invented):
+1. FRESH OBSERVATION: open with a NEW angle from growth_hooks, news_hooks, or a different operational
+   characteristic NOT used in any previous email above. Frame as observation, not accusation.
+   INFERENCE RULE: the prospect's silence does NOT confirm any pain asserted in previous emails.
+   Never re-state prior pain claims as confirmed facts. Never say 'as I mentioned, you're facing X.'
+2. INFER PAIN: frame as likelihood — 'operations like yours often encounter Y' — not as assertion.
+   Only state a pain as fact if it appears verbatim in need_evidence or matched_pains.
+3. CAPABILITY: bridge the observation to the exact sender capability that fits their context.
+4. METRICS: use sender_proof ONLY, or qualitative pattern. NEVER invent a number, percentage, or
+   dollar figure. If sender_proof is empty, stay qualitative — no stat is better than a fake one.
+5. ASK calibrated to role. BANNED CTA: 'does this resonate?' — use a natural question instead.
 
 STRICT CONSTRAINTS:
-1. ABSOLUTELY NO PLACEHOLDERS or bracketed/curly/angle tokens of ANY kind ([Name], {{metric}}, <X>). Fill a
-   real value or omit it — never bracket it.
-2. NO FABRICATION: every fact, client name, outcome, and number must come from the sender data or target
-   intelligence above. Do not invent percentages or attribute invented results to named clients.
-3. Do NOT reuse the angle, hook, framing, or proof of ANY previous email above.
-4. Do NOT state MEDDPICC hypotheses as facts (who the buyer is, their decision/paper process) and do NOT
-   expose framework jargon. No "hope this finds you well" filler.
-5. Sign off EXACTLY, with a blank line after 'Best regards,' and a single line break between name and company:
+1. ABSOLUTELY NO PLACEHOLDERS or bracketed/curly/angle tokens of ANY kind. Fill or omit.
+2. NO FABRICATION: every fact and number must come from the data above only.
+3. Do NOT reuse the angle, hook, or proof of ANY previous email.
+4. INFERENCE RULE: silence ≠ confirmation. Never treat prior assertions as agreed facts.
+5. No framework jargon. No 'hope this finds you well'. BANNED: 'does this resonate?'
+6. Sign off EXACTLY, with a blank line after 'Best regards,' and a single line break between name and company:
    "Best regards,
 
    {user_name}
    {user_company_name}"
-6. 150-220 words; richer and more substantive than the prior emails. Write each paragraph as ONE continuous
-   line with NO hard line breaks inside it; separate sections with a single blank line only.
-7. Return subject + body.
+7. 150-220 words; richer than every prior email. Each paragraph ONE continuous line, no internal breaks.
+8. Return subject + body.
 """
 
 def draft_reminder_escalation_email(

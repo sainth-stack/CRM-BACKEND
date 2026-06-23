@@ -12,8 +12,17 @@ cost governance.
   * enforces both the global daily budget and a per-campaign budget, raising
     before a call when either is exceeded (fail-safe: Redis errors never block).
 
-Pricing is per-1M-tokens, env-overridable (PRICE_<MODEL>_IN / _OUT), since
-gpt-5-mini pricing is not in LangChain's built-in table.
+Per-agent-per-company granularity:
+  Every metered call writes into two Redis hashes keyed by campaign:
+    llm:r:usd:{campaign_id}  → hash  field="{domain}|{agent}"  value=float
+    llm:r:tok:{campaign_id}  → hash  field="{domain}|{agent}"  value=int
+  These are read by `get_cost_report(campaign_id)` and exposed via the admin API.
+
+`agent_label_var` and `company_domain_var` (both in logging_config) are set by
+each agent before its LLM call. The sentinel "—" is used when either is absent
+so the hash field is always well-formed.
+
+Pricing is per-1M-tokens, env-overridable (PRICE_<MODEL>_IN / _OUT).
 """
 from __future__ import annotations
 
@@ -23,7 +32,7 @@ import os
 from langchain_core.callbacks import BaseCallbackHandler
 
 from app.core.config import settings
-from app.core.logging_config import campaign_id_var, logger
+from app.core.logging_config import campaign_id_var, company_domain_var, agent_label_var, logger
 
 
 class CostBudgetExceeded(Exception):
@@ -31,19 +40,13 @@ class CostBudgetExceeded(Exception):
 
 
 # Default USD price per 1,000,000 tokens: (input, output).
-# Best-effort defaults — override per model via PRICE_<MODEL>_IN / PRICE_<MODEL>_OUT
-# env vars (e.g. PRICE_GPT_5_4_MINI_IN) once exact pricing is known. Longer prefixes
-# are matched first so "gpt-5.4-mini" doesn't accidentally match "gpt-5".
 _DEFAULT_PRICES = {
     "gpt-4o-mini": (0.15, 0.60),
-    "gpt-4.1-mini": (0.40, 1.60),
-    "gpt-5.4-mini": (0.45, 3.60),
-    "gpt-5-mini": (0.25, 2.00),
-    "gpt-5-nano": (0.05, 0.40),
-    "o4-mini": (1.10, 4.40),
-    "o3-mini": (1.10, 4.40),
 }
-_FALLBACK_PRICE = (0.50, 1.50)  # conservative default for unrecognised mini models
+_FALLBACK_PRICE = (0.50, 1.50)
+
+# Redis TTL for per-campaign cost hashes (30 days).
+_REPORT_TTL_SEC = 60 * 60 * 24 * 30
 
 
 def _model_price(model: str) -> tuple[float, float]:
@@ -77,12 +80,7 @@ def _redis():
 
 
 # --------------------------------------------------------------------------- #
-# Process-local fallback accounting.                                           #
-# When Redis is unavailable (e.g. broker over quota / outage) the previous     #
-# implementation failed fully OPEN — every budget check was skipped, so a      #
-# runaway loop could burn unbounded spend. This in-memory accumulator keeps    #
-# enforcement alive per-process (degraded but not disabled). It is also kept   #
-# warm while Redis works, so enforcement is seamless if Redis drops mid-run.   #
+# Process-local fallback accounting (survives Redis outages).                  #
 # --------------------------------------------------------------------------- #
 import threading
 
@@ -98,7 +96,6 @@ def _local_roll_day(today: str) -> None:
 
 
 def _local_check(today: str, cid: str | None) -> None:
-    """Raise CostBudgetExceeded if the process-local counters are over budget."""
     with _local_lock:
         _local_roll_day(today)
         if _local_state["daily_usd"] >= settings.LLM_DAILY_BUDGET_USD:
@@ -121,15 +118,58 @@ def _local_add(today: str, cid: str | None, cost: float) -> None:
             _local_state["campaign_usd"][cid] = _local_state["campaign_usd"].get(cid, 0.0) + cost
 
 
+# --------------------------------------------------------------------------- #
+# Per-agent-per-company Redis write                                             #
+# --------------------------------------------------------------------------- #
+
+def _write_granular(r, cid: str | None, domain: str | None, agent: str | None,
+                    cost: float, tokens: int) -> None:
+    """Write (cost, tokens) to the per-campaign per-agent-per-company hashes.
+
+    No-ops silently on Redis error so accounting never blocks the LLM call.
+    """
+    if not r or not cid:
+        return
+    field = f"{domain or '—'}|{agent or '—'}"
+    try:
+        r.hincrbyfloat(f"llm:r:usd:{cid}", field, cost)
+        r.hincrby(f"llm:r:tok:{cid}", field, tokens)
+        r.expire(f"llm:r:usd:{cid}", _REPORT_TTL_SEC)
+        r.expire(f"llm:r:tok:{cid}", _REPORT_TTL_SEC)
+    except Exception as e:
+        logger.warning(f"[COST] granular write failed: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Public helper for run_openai_guarded (legacy path)                           #
+# --------------------------------------------------------------------------- #
+
+def record_guarded_cost(operation_name: str, cost_usd: float, tokens: int) -> None:
+    """Called by run_openai_guarded after a successful token-counted call.
+
+    Writes the legacy path's cost into the same per-agent-per-company hashes so
+    the cost report covers ALL agents regardless of which execution path they use.
+    """
+    today = datetime.date.today().isoformat()
+    cid    = campaign_id_var.get()
+    domain = company_domain_var.get()
+
+    _local_add(today, cid, cost_usd)
+
+    r = _redis()
+    _write_granular(r, cid, domain, operation_name, cost_usd, tokens)
+
+
+# --------------------------------------------------------------------------- #
+# CostGuard — LangChain callback (new path via get_chat_llm)                   #
+# --------------------------------------------------------------------------- #
+
 class CostGuard(BaseCallbackHandler):
     def on_llm_start(self, serialized, prompts, **kwargs):
         today = datetime.date.today().isoformat()
         cid = campaign_id_var.get()
         r = _redis()
         if not r:
-            # Redis down → enforce against the process-local fallback instead of
-            # failing open. This is what stops a loop from burning unbounded spend
-            # during a broker outage.
             _local_check(today, cid)
             return
         try:
@@ -149,7 +189,6 @@ class CostGuard(BaseCallbackHandler):
             logger.error("🚨 [COST GOVERNANCE] %s", kwargs.get("run_id", ""))
             raise
         except Exception as e:
-            # Redis errored mid-check → fall back to local enforcement, don't open up.
             logger.warning(f"[COST] Redis budget check failed ({e}); using local fallback.")
             _local_check(today, cid)
 
@@ -157,20 +196,21 @@ class CostGuard(BaseCallbackHandler):
         try:
             out = getattr(response, "llm_output", None) or {}
             usage = out.get("token_usage") or out.get("usage") or {}
-            prompt_tokens = usage.get("prompt_tokens", 0) or 0
+            prompt_tokens     = usage.get("prompt_tokens", 0) or 0
             completion_tokens = usage.get("completion_tokens", 0) or 0
             if prompt_tokens == 0 and completion_tokens == 0:
                 return
 
-            model = out.get("model_name") or out.get("model") or ""
+            model  = out.get("model_name") or out.get("model") or ""
             p_in, p_out = _model_price(model)
-            cost = (prompt_tokens / 1_000_000) * p_in + (completion_tokens / 1_000_000) * p_out
+            cost   = (prompt_tokens / 1_000_000) * p_in + (completion_tokens / 1_000_000) * p_out
+            tokens = prompt_tokens + completion_tokens
 
-            today = datetime.date.today().isoformat()
-            cid = campaign_id_var.get()
+            today  = datetime.date.today().isoformat()
+            cid    = campaign_id_var.get()
+            domain = company_domain_var.get()
+            agent  = agent_label_var.get()
 
-            # Always keep the process-local accumulator warm so enforcement survives
-            # a Redis outage that starts mid-run.
             _local_add(today, cid, cost)
 
             r = _redis()
@@ -179,15 +219,19 @@ class CostGuard(BaseCallbackHandler):
                     r.incrbyfloat(f"llm_cost:{today}", cost)
                     r.expire(f"llm_cost:{today}", 172800)
                     r.incrbyfloat("llm_cost_total", cost)
-                    r.incrby("llm_tokens_total", prompt_tokens + completion_tokens)
+                    r.incrby("llm_tokens_total", tokens)
                     if cid:
                         r.incrbyfloat(f"llm_cost_campaign:{cid}", cost)
-                        r.expire(f"llm_cost_campaign:{cid}", 604800)  # 7 days
+                        r.expire(f"llm_cost_campaign:{cid}", 604800)
                 except Exception as e:
                     logger.warning(f"[COST] Redis cost write failed ({e}); local accounting retained.")
 
+                # Per-agent-per-company granular write.
+                _write_granular(r, cid, domain, agent, cost, tokens)
+
             logger.info(
-                f"📊 [COST] model={model or '?'} tokens={prompt_tokens + completion_tokens} "
+                f"📊 [COST] model={model or '?'} agent={agent or '—'} "
+                f"domain={domain or '—'} tokens={tokens} "
                 f"cost=${cost:.5f} campaign={cid or '-'}"
             )
         except Exception as e:
@@ -196,3 +240,88 @@ class CostGuard(BaseCallbackHandler):
 
 # Shared singleton attached to every get_chat_llm instance.
 cost_guard = CostGuard()
+
+
+# --------------------------------------------------------------------------- #
+# Report builder                                                               #
+# --------------------------------------------------------------------------- #
+
+def get_cost_report(campaign_id: str) -> dict:
+    """Read per-agent-per-company cost hashes from Redis and return a structured report.
+
+    Returns a dict with:
+      companies: list of per-company breakdowns (sorted by total cost desc)
+      agents:    list of per-agent totals across the campaign
+      campaign:  overall totals
+      missing:   True when Redis data is unavailable
+    """
+    r = _redis()
+    if not r:
+        return {"missing": True, "reason": "Redis unavailable"}
+
+    try:
+        usd_hash = r.hgetall(f"llm:r:usd:{campaign_id}") or {}
+        tok_hash = r.hgetall(f"llm:r:tok:{campaign_id}") or {}
+    except Exception as e:
+        return {"missing": True, "reason": str(e)}
+
+    if not usd_hash:
+        return {"missing": False, "companies": [], "agents": [], "campaign": {"usd": 0.0, "tokens": 0}}
+
+    # Decode Redis byte strings if necessary.
+    def _dec(v):
+        return v.decode() if isinstance(v, bytes) else str(v)
+
+    rows: list[dict] = []
+    for raw_field, raw_usd in usd_hash.items():
+        field = _dec(raw_field)
+        domain, agent = (field.split("|", 1) + ["—"])[:2]
+        usd    = float(_dec(raw_usd) or 0)
+        tokens = int(_dec(tok_hash.get(raw_field, b"0") or b"0"))
+        rows.append({"domain": domain, "agent": agent, "usd": usd, "tokens": tokens})
+
+    # ---- per-company view ----
+    from collections import defaultdict
+    by_company: dict[str, dict] = defaultdict(lambda: {"domain": "", "agents": {}, "usd": 0.0, "tokens": 0})
+    for row in rows:
+        dom = row["domain"]
+        ag  = row["agent"]
+        by_company[dom]["domain"] = dom
+        by_company[dom]["agents"][ag] = {
+            "usd":    round(row["usd"], 6),
+            "tokens": row["tokens"],
+        }
+        by_company[dom]["usd"]    += row["usd"]
+        by_company[dom]["tokens"] += row["tokens"]
+
+    companies = sorted(
+        [{"domain": v["domain"], "usd": round(v["usd"], 6), "tokens": v["tokens"], "agents": v["agents"]}
+         for v in by_company.values()],
+        key=lambda x: x["usd"],
+        reverse=True,
+    )
+
+    # ---- per-agent view ----
+    by_agent: dict[str, dict] = defaultdict(lambda: {"agent": "", "usd": 0.0, "tokens": 0})
+    for row in rows:
+        ag = row["agent"]
+        by_agent[ag]["agent"]   = ag
+        by_agent[ag]["usd"]    += row["usd"]
+        by_agent[ag]["tokens"] += row["tokens"]
+
+    agents = sorted(
+        [{"agent": v["agent"], "usd": round(v["usd"], 6), "tokens": v["tokens"]}
+         for v in by_agent.values()],
+        key=lambda x: x["usd"],
+        reverse=True,
+    )
+
+    total_usd    = round(sum(r["usd"]    for r in rows), 6)
+    total_tokens = sum(r["tokens"] for r in rows)
+
+    return {
+        "missing":   False,
+        "campaign":  {"usd": total_usd, "tokens": total_tokens},
+        "companies": companies,
+        "agents":    agents,
+    }

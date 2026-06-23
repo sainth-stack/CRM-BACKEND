@@ -44,28 +44,48 @@ _BANNED_PHRASES = (
 #   (all drove the sender-first paragraph that the team rejected).
 # ---------------------------------------------------------------------------
 class PainFirstPlan(BaseModel):
+    opening_trigger: str = Field(
+        description="The single most concrete OBSERVED FACT from enrichment the prospect will "
+                    "immediately recognise as real — a named event: acquisition, funding round, "
+                    "expansion announcement, new facility, leadership hire, product launch, new "
+                    "contract, certification. Pull from news_hooks, growth_hooks, or urgency_trigger. "
+                    "If nothing event-level exists, use the most specific operational characteristic "
+                    "(e.g. 'multi-process stamping + assembly operation' or 'AS9100-certified aerospace "
+                    "supplier'). NEVER generic ('as a manufacturer', 'in the manufacturing industry', "
+                    "'companies like yours')."
+    )
     primary_pain: str = Field(
-        description="The single most specific, evidenced business pain this company has RIGHT NOW — "
-                    "drawn from pain_hooks, matched_pains, and need_evidence. One concrete statement."
+        description="The most specific pain this company LIKELY faces — stated as INFERENCE, not "
+                    "assertion. Frame as 'companies doing X often face Y' or 'with X underway, Y "
+                    "becomes a risk' — NEVER 'you have Y problem' unless that exact pain appears "
+                    "verbatim in matched_pains or need_evidence. Ground the inference in the "
+                    "opening_trigger or a real operational characteristic."
     )
     pain_evidence: str = Field(
-        description="2-3 specific facts that PROVE this pain is real for THIS company. "
-                    "Ground every word in research_summary, news_hooks, or growth_hooks."
+        description="2-3 specific facts that make this pain PLAUSIBLE for THIS company. "
+                    "Ground every word in research_summary, news_hooks, or growth_hooks. "
+                    "These are reasons the pain is likely, not proof it exists."
     )
     pain_consequence: str = Field(
-        description="What this pain is costing them. Frame as a recognisable industry pattern; "
-                    "never invent a number about THIS company."
+        description="What this pain costs — framed as a recognisable INDUSTRY PATTERN, not a "
+                    "claim about THIS company. Never invent a number. If no proof point exists, "
+                    "stay qualitative ('teams going through this often find...')."
     )
     urgency_trigger: str = Field(
         description="Single growth/news hook making this pain urgent RIGHT NOW. Empty string if none."
     )
     sender_relevance: str = Field(
-        description="ONE sentence: how the sender has solved this exact pain before. "
-                    "Use sender_proof or matched_services. Proof, not a pitch."
+        description="ONE sentence: how the sender is relevant to this situation. "
+                    "Use matched_services. If sender_proof is empty, describe the capability "
+                    "without inventing an outcome — 'we work with manufacturers on X' not "
+                    "'we reduced downtime by 30%'."
     )
     ask: str = Field(
-        description="Ultra-light CTA. Decision-owner → 'worth a quick chat?'. "
-                    "Champion → 'does this resonate?'. Never ask for a 30-min call."
+        description="Ultra-light CTA. Pick ONE that fits the trigger and recipient role. "
+                    "BANNED — never use: 'does this resonate?' (flags AI-generated copy). "
+                    "Choose from: 'Curious if that's a priority this year?' / "
+                    "'Worth a quick conversation?' / 'Is that something your team is evaluating?' / "
+                    "'How are you approaching that today?' / 'Would that be worth 15 minutes?'"
     )
     strategic_observation: str = Field(
         description="Core strategic insight powering this email. Kept for follow-up continuity."
@@ -99,7 +119,7 @@ class DraftState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 _PLAN_PROMPT = ChatPromptTemplate.from_template(
     """You are a B2B cold email strategist. Analyse the target company intelligence below and
-fill the strategic PLAN that will drive a pain-first cold email.
+fill the strategic PLAN that will drive an observation-first cold email.
 Every field must be grounded in the provided data — never invent facts.
 
 SENDER (background only — referenced in sender_relevance field):
@@ -125,12 +145,27 @@ TARGET INTELLIGENCE:
 
 CAMPAIGN OBJECTIVE: {objective}
 
+CRITICAL RULES FOR THIS PLAN:
+1. INFERENCE NOT ASSERTION — Pain must be framed as inference, never as fact. 'Companies expanding
+   production capacity often run into maintenance bottlenecks' is correct. 'You have downtime
+   problems' is wrong and will make the prospect reply 'how do you know that?'. Use matched_pains
+   or need_evidence only when they contain explicitly evidenced text; otherwise infer from the
+   operational context.
+2. NO INVENTED STATISTICS — Never include a percentage, dollar figure, or outcome that is not
+   verbatim in sender_proof. If sender_proof is empty, stay qualitative. 'Teams going through
+   ownership transitions often prioritise production visibility' is fine. 'Manufacturers lose
+   20-30% productivity' is fabrication and will be rejected.
+3. OBSERVATION FIRST — The opening_trigger must be a real named event or specific operational
+   fact the prospect will recognise — not a generic industry statement.
+4. BANNED CTA — Never use 'does this resonate?' in the ask field. It signals AI copy.
+
 {refine_block}"""
 )
 
 _WRITE_PROMPT = (
     "Write a cold email using the plan below. Output ONLY the two labelled blocks.\n\n"
     "PLAN:\n"
+    "  Opening trigger:   {opening_trigger}\n"
     "  Primary pain:      {primary_pain}\n"
     "  Evidence:          {pain_evidence}\n"
     "  Consequence:       {pain_consequence}\n"
@@ -138,26 +173,37 @@ _WRITE_PROMPT = (
     "  Sender relevance:  {sender_relevance}\n"
     "  Ask:               {ask}\n"
     "  Tone:              {tone}\n\n"
-    "EMAIL STRUCTURE — copy this layout exactly, filling in the <placeholders>:\n\n"
-    "SUBJECT: <≤10-word subject line naming their pain or situation — NOT the sender's product>\n\n"
+    "EMAIL STRUCTURE — copy this layout exactly:\n\n"
+    "SUBJECT: <≤10-word subject line referencing their situation or trigger — NOT the sender's product>\n\n"
     "BODY:\n"
     "Hi {prospect_first_name},\n\n"
-    "<Para 1: 2-3 sentences about the specific pain grounded in their reality. "
+    "<Para 1 (2-3 sentences): Open with the opening_trigger — name the specific fact "
+    "(acquisition, funding, expansion, hire, etc.) the prospect will recognise as real. "
+    "Then draw ONE inference about what that might mean operationally. "
+    "Frame as observation + curiosity, NOT accusation. "
+    "NEVER state a problem as fact. NEVER use 'you have X problem'. "
     "DO NOT mention {sender_name}.>\n\n"
-    "<Para 2: 1-2 sentences on the consequence + urgency trigger if any. "
+    "<Para 2 (1-2 sentences): What we've seen happen in this situation — "
+    "framed as a pattern ('manufacturers going through X often find...'), not a claim about THIS company. "
+    "NO invented statistics, percentages, or dollar figures. "
+    "If no proof point exists, stay qualitative. "
     "Still NO mention of {sender_name}.>\n\n"
-    "<Para 3: 1 sentence of soft sender relevance. 1 ultra-light ask.>\n\n"
+    "<Para 3 (2 sentences max): One line of soft sender relevance. "
+    "Then the ask — use the exact ask from the plan. "
+    "NEVER write 'does this resonate?'.>\n\n"
     "Best regards,\n\n"
     "{user_name}\n"
     "{sender_name}\n\n"
-    "RULES (hard constraints):\n"
-    "  - 100-150 words in the BODY total.\n"
-    "  - {sender_name} must NOT appear in Para 1 or Para 2.\n"
-    "  - No placeholders of any kind — fill with real facts or omit.\n"
-    "  - No filler openers (hope this finds you, I am reaching out, etc.).\n"
-    "  - Each paragraph is a single unbroken block of text (no line breaks within a paragraph).\n"
-    "  - Blank line between every section as shown above.\n"
-    "  - No sales jargon in the email text."
+    "HARD RULES — any violation means the draft fails:\n"
+    "  1. 100-150 words in the BODY total.\n"
+    "  2. {sender_name} must NOT appear in Para 1 or Para 2.\n"
+    "  3. No placeholders of any kind — fill with real facts or omit entirely.\n"
+    "  4. No filler openers ('hope this finds you', 'I am reaching out', etc.).\n"
+    "  5. NEVER assert a pain as fact — inference and observation only in Para 1.\n"
+    "  6. NEVER write 'does this resonate?' — use the ask from the plan.\n"
+    "  7. NEVER invent a statistic, percentage, or dollar figure not in sender_proof.\n"
+    "  8. Each paragraph is one unbroken block of text — no line breaks inside a paragraph.\n"
+    "  9. Blank line between every section as shown above."
 )
 
 
@@ -198,7 +244,7 @@ def _parse_write_output(text: str) -> dict:
 _PLACEHOLDER_RE = re.compile(r"\[[^\]\n]+\]|\{[^}\n]+\}|<[A-Za-z][A-Za-z0-9 _/-]*>")
 
 _PLAN_KEYS = (
-    "primary_pain", "pain_evidence", "pain_consequence", "urgency_trigger",
+    "opening_trigger", "primary_pain", "pain_evidence", "pain_consequence", "urgency_trigger",
     "sender_relevance", "ask", "strategic_observation", "tone",
 )
 
@@ -314,6 +360,7 @@ def _node_compose(state: DraftState):
 
     # ── Call 2: Write the email (plain text, no schema) ──────────────────
     write_prompt = _WRITE_PROMPT.format(
+        opening_trigger=plan.opening_trigger,
         primary_pain=plan.primary_pain,
         pain_evidence=plan.pain_evidence,
         pain_consequence=plan.pain_consequence,

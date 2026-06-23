@@ -136,7 +136,8 @@ def _get_pending_prospects(db, campaign_id: str, lock_key: str) -> list[dict]:
                     "id": dm.id,
                     "name": dm.name,
                     "target_company_id": dm.target_company_id,
-                    "target_company_name": dm.target_company.name if dm.target_company else None
+                    "target_company_name": dm.target_company.name if dm.target_company else None,
+                    "domain": dm.target_company.domain if dm.target_company else None,
                 })
         offset += PAGE_SIZE
     return dm_data_list

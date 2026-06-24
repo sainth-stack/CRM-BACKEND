@@ -16,7 +16,7 @@ from app.core.scheduler import (
     calculate_next_send_slot,
     format_scheduled_display,
 )
-from app.services.draft_dispatch import queue_draft_dispatch
+from app.services.draft_dispatch import queue_draft_dispatch, execute_draft_send
 from app.workers.tasks.outbound_worker import send_draft_worker
 
 logger = setup_logging()
@@ -32,6 +32,34 @@ def _lock_query(query):
     if bind is not None and bind.dialect.name != "sqlite":
         return query.with_for_update()
     return query
+
+@router.get("/{draft_id}/next-slot")
+def get_next_slot(
+    draft_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Preview the next scheduled slot for a draft WITHOUT scheduling it.
+    Used by the dispatch confirmation modal to show the time before committing."""
+    db_draft = (
+        db.query(models.EmailDraft).join(models.Campaign).filter(
+            models.EmailDraft.id == draft_id,
+            get_visibility_filter(db, current_user)
+        )
+    ).first()
+    if not db_draft:
+        raise HTTPException(status_code=404, detail="Draft not found.")
+    if not db_draft.dm or not db_draft.dm.email:
+        raise HTTPException(status_code=400, detail="No recipient email on this draft.")
+
+    prospect_tz = resolve_prospect_timezone(db, db_draft.dm)
+    slot = calculate_next_send_slot(db_draft.campaign.user_id, prospect_tz, db)
+    return {
+        "scheduled_at": slot.isoformat(),
+        "timezone": prospect_tz,
+        "display": format_scheduled_display(slot, prospect_tz),
+    }
+
 
 @router.patch("/{draft_id}")
 def update_draft(
@@ -64,10 +92,11 @@ def update_draft(
 @limiter.limit("10/minute")
 def send_draft(
     request: Request,
-    draft_id: str, 
+    draft_id: str,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
+    """Schedule a draft for sending at the next optimal time slot."""
     # Scope the lookup to the caller's campaigns (prevents IDOR).
     db_draft = _lock_query(
         db.query(models.EmailDraft).join(models.Campaign).filter(
@@ -127,3 +156,53 @@ def send_draft(
         "timezone": prospect_tz,
         "display": display,
     }
+
+
+@router.post("/{draft_id}/send-now")
+@limiter.limit("10/minute")
+def send_draft_now(
+    request: Request,
+    draft_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Send a draft immediately, bypassing all scheduling, delivery windows, and queues.
+    Calls the Gmail API directly in this request — no poller, no timezone constraints."""
+    db_draft = _lock_query(
+        db.query(models.EmailDraft).join(models.Campaign).filter(
+            models.EmailDraft.id == draft_id,
+            get_visibility_filter(db, current_user)
+        )
+    ).first()
+    if not db_draft:
+        raise HTTPException(status_code=404, detail="Email engagement protocol not found.")
+
+    if db_draft.status == "SENT" and db_draft.message_id:
+        return {"message": "already_sent"}
+
+    if not db_draft.dm or not db_draft.dm.email:
+        raise HTTPException(status_code=400, detail="Deployment coordinate (Email) missing.")
+
+    if db_draft.dispatch_state == "IN_PROGRESS":
+        raise HTTPException(status_code=429, detail="Operational Lock: This draft is currently being deployed.")
+
+    # Transition to QUEUED so execute_draft_send accepts it, then commit before
+    # execute_draft_send opens its own session to read the updated state.
+    queue_state = queue_draft_dispatch(db, db_draft, queued_at=datetime.datetime.now(UTC).replace(tzinfo=None))
+    if queue_state == "already_sent":
+        return {"message": "already_sent"}
+    if queue_state == "in_progress":
+        raise HTTPException(status_code=429, detail="Operational Lock: This draft is currently being deployed.")
+    if queue_state == "requires_review":
+        raise HTTPException(status_code=409, detail="Operational Review Required: Previous deployment attempt is still unresolved.")
+    db.commit()
+
+    # execute_draft_send opens its own session — do NOT close the FastAPI session
+    # manually here (double-close breaks the dependency teardown).
+    result = execute_draft_send(draft_id)
+
+    if result["status"] in ("sent", "recovered", "already_sent"):
+        return {"message": "sent", "detail": result["message"]}
+    if result["status"] == "in_progress":
+        raise HTTPException(status_code=429, detail="Operational Lock: This draft is currently being deployed.")
+    raise HTTPException(status_code=500, detail=result.get("message", "Send failed."))

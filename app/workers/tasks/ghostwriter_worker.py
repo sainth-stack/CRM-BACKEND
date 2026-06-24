@@ -57,9 +57,30 @@ def _save_drafts_batch(campaign_id: str, drafts_batch: list):
                     continue
 
                 dm = db.query(models.DecisionMaker).filter(models.DecisionMaker.id == dm_id).first()
-                if dm:
+                if not dm:
+                    continue
+
+                # Sequence path: save the initial email only (follow-ups drafted on-demand)
+                if hasattr(draft_set, "sequence") and draft_set.sequence:
+                    for email_data in draft_set.sequence:
+                        email_draft = models.EmailDraft(
+                            campaign_id=campaign_id,
+                            decision_maker_id=dm.id,
+                            subject=email_data["subject"],
+                            body=email_data["body"],
+                            status="DRAFTED",
+                            followup_index=email_data["followup_index"],
+                            draft_type=email_data["draft_type"],
+                            variants=draft_set.variants if email_data["followup_index"] == 0 else None,
+                            strategic_observation=draft_set.strategic_observation if email_data["followup_index"] == 0 else None,
+                            pain_hypothesis=draft_set.pain_hypothesis if email_data["followup_index"] == 0 else None,
+                            personalization_hook=draft_set.personalization_hook if email_data["followup_index"] == 0 else None,
+                        )
+                        db.add(email_draft)
+                else:
+                    # Legacy single-email path
                     primary_variant = draft_set.variants.get("primary", list(draft_set.variants.values())[0])
-                    new_draft = models.EmailDraft(
+                    email_draft = models.EmailDraft(
                         campaign_id=campaign_id,
                         decision_maker_id=dm.id,
                         subject=primary_variant.get("subject"),
@@ -70,17 +91,18 @@ def _save_drafts_batch(campaign_id: str, drafts_batch: list):
                         variants=draft_set.variants,
                         strategic_observation=draft_set.strategic_observation,
                         pain_hypothesis=draft_set.pain_hypothesis,
-                        personalization_hook=draft_set.personalization_hook
+                        personalization_hook=draft_set.personalization_hook,
                     )
-                    db.add(new_draft)
-                    transition_prospect(
-                        db, dm,
-                        state=models.ProspectState.DRAFTED,
-                        status="DRAFTED",
-                        reason="INITIAL_DRAFTED",
-                        actor="ghostwriter",
-                        metadata={"draft_type": "INITIAL", "v2_enhanced": True},
-                    )
+                    db.add(email_draft)
+
+                transition_prospect(
+                    db, dm,
+                    state=models.ProspectState.DRAFTED,
+                    status="DRAFTED",
+                    reason="INITIAL_DRAFTED",
+                    actor="ghostwriter",
+                    metadata={"draft_type": "SEQUENCE" if hasattr(draft_set, "sequence") else "INITIAL", "v2_enhanced": True},
+                )
             db.commit()
             logger.info(f"[BATCH] Committed batch of {len(drafts_batch)} drafts.")
         except Exception as e:
@@ -325,19 +347,36 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, 
             "recipient_role_signal": dm.relevance_explanation or "",
         }
 
-        # Pull a fuller thread (covers the whole 11-step nudge arc) so each new email
-        # can be richer than ALL previous ones, not just the last few.
-        logs = db.query(models.CommunicationLog).filter(
-            models.CommunicationLog.dm_id == dm.id
-        ).order_by(models.CommunicationLog.received_at.desc()).limit(15).all()
+        # Separate sent emails and prospect replies so the drafter can reason about each clearly.
+        all_logs = (
+            db.query(models.CommunicationLog)
+            .filter(models.CommunicationLog.dm_id == dm.id)
+            .order_by(models.CommunicationLog.received_at.asc())
+            .all()
+        )
+        sent_logs     = [l for l in all_logs if l.direction == "SENT"]
+        received_logs = [l for l in all_logs if l.direction == "RECEIVED"]
 
-        history_text = "\n".join([f"{log.direction}: {log.body}" for log in logs])
+        # Format sent history: labelled list oldest→newest
+        sent_history = "\n\n".join(
+            f"[Email {i + 1}] Subject: {(l.subject or '(no subject)')}\n{(l.body or '')}"
+            for i, l in enumerate(sent_logs)
+        ) or "(No emails sent yet)"
+
+        # Format prospect replies oldest→newest
+        prospect_replies = "\n\n---\n\n".join(
+            f"[Reply {i + 1}] {(l.body or '')}"
+            for i, l in enumerate(received_logs)
+        ) or "N/A"
+
+        # The reply that triggered this follow-up is the most recent one received
+        latest_reply = received_logs[-1].body if received_logs else None
 
         if not manual_scheduling:
             dm.followup_count += 1
             nudge_num = dm.followup_count
         else:
-            nudge_num = 0 # Coordination request
+            nudge_num = 0  # Coordination request
 
         user_name = campaign.owner.full_name if campaign.owner else None
         if not user_name:
@@ -347,12 +386,15 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, 
             user_intel=user_intel,
             dm_info={"name": dm.name},
             target_company_name=tc.name if tc else "",
-            thread_history=history_text,
+            thread_history="",           # superseded by explicit fields below
             followup_number=nudge_num,
             manual_scheduling=manual_scheduling,
             alternative_slots=alternative_slots,
             user_name=user_name,
             target_company_intel=target_company_intel,
+            sent_history=sent_history,
+            prospect_replies=prospect_replies,
+            latest_prospect_reply=latest_reply,
         )
 
         if draft_data:

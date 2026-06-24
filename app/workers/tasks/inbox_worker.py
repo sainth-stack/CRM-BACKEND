@@ -222,9 +222,30 @@ def poll_inbox_task(self, user_id: str):
 @celery_app.task
 def poll_all_users_task():
     with db_session() as db:
+        # Only poll users who have at least one prospect that can receive a reply.
+        # Skips users with no active campaigns entirely — saves Gmail API calls and
+        # Redis command overhead for accounts with no outreach in flight.
+        active_user_ids = {
+            row[0]
+            for row in db.query(models.Campaign.user_id)
+            .join(models.DecisionMaker, models.DecisionMaker.campaign_id == models.Campaign.id)
+            .filter(
+                models.DecisionMaker.state.notin_([
+                    models.ProspectState.NEW,
+                    models.ProspectState.TERMINATED,
+                    models.ProspectState.MEETING_BOOKED,
+                    models.ProspectState.ON_HOLD,
+                    models.ProspectState.DRAFTED,
+                ])
+            )
+            .distinct()
+            .all()
+        }
+
         users = (
             db.query(models.User.id, models.User.is_demo, models.User.demo_expires_at)
             .join(models.OAuthAccount, models.OAuthAccount.user_id == models.User.id)
+            .filter(models.User.id.in_(active_user_ids))
             .distinct()
             .all()
         )

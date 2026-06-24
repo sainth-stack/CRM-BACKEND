@@ -773,3 +773,93 @@ def dispatch_all_drafts(
         "skipped": skipped,
         "errors": errors,
     }
+
+
+@router.post("/{campaign_id}/drafts/dispatch-all-now")
+@limiter.limit("5/minute")
+def dispatch_all_drafts_now(
+    request: Request,
+    campaign_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Send all pending drafts immediately without scheduling.
+    Skips drafts that are already queued, in-progress, or already sent.
+    Returns a count summary.
+    """
+    from app.services.draft_dispatch import queue_draft_dispatch
+
+    campaign = db.query(models.Campaign).filter(
+        models.Campaign.id == campaign_id,
+        get_visibility_filter(db, current_user),
+    ).first()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    # All drafts that are still waiting to be sent
+    pending_drafts = (
+        db.query(models.EmailDraft)
+        .filter(
+            models.EmailDraft.campaign_id == campaign_id,
+            models.EmailDraft.status == "DRAFTED",
+        )
+        .all()
+    )
+
+    sent, skipped, errors = [], [], []
+
+    for draft in pending_drafts:
+        draft_id = draft.id
+        dm = draft.dm
+
+        # Skip drafts missing an email address — cannot send
+        if not dm or not dm.email:
+            skipped.append({"draft_id": draft_id, "reason": "no_email"})
+            continue
+
+        # Transition to QUEUED
+        queued_at = datetime.datetime.now(UTC).replace(tzinfo=None)
+        queue_state = queue_draft_dispatch(db, draft, queued_at=queued_at)
+
+        if queue_state == "already_sent":
+            skipped.append({"draft_id": draft_id, "dm_name": dm.name, "reason": "already_sent"})
+            continue
+        if queue_state in ("in_progress", "requires_review"):
+            skipped.append({"draft_id": draft_id, "dm_name": dm.name, "reason": queue_state})
+            continue
+
+        # Send immediately: set scheduled_at to now
+        try:
+            now_utc = datetime.datetime.now(UTC).replace(tzinfo=None)
+            draft.scheduled_at = now_utc
+            db.commit()
+
+            sent.append({
+                "draft_id": draft_id,
+                "dm_name": dm.name,
+                "recipient": dm.email,
+            })
+            logger.info(f"[DISPATCH-ALL-NOW] Draft {draft_id} queued for immediate send")
+        except Exception as exc:
+            db.rollback()
+            try:
+                draft.dispatch_state = "FAILED"
+                draft.dispatch_error = f"Batch dispatch error: {str(exc)}"[:1000]
+                db.commit()
+            except Exception:
+                db.rollback()
+            logger.error(
+                f"[DISPATCH-ALL-NOW] Failed to queue draft {draft_id}: {exc}",
+                exc_info=True,
+            )
+            errors.append({"draft_id": draft_id, "dm_name": dm.name if dm else "?", "reason": str(exc)[:120]})
+
+    return {
+        "sent_count": len(sent),
+        "skipped_count": len(skipped),
+        "error_count": len(errors),
+        "sent": sent,
+        "skipped": skipped,
+        "errors": errors,
+    }

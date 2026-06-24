@@ -408,18 +408,18 @@ def _deploy_nudge(
                 else "Account Manager"
             )
 
-        # Full history of everything we've already SENT to this prospect (oldest first)
-        # so the reminder drafter can open a genuinely new angle each round and be
-        # richer than ALL previous emails — not just avoid repeating the last one.
-        sent_logs = (
+        # Fetch full communication history (sent + received) oldest first.
+        # Sent emails: reminder drafter avoids reusing their angles.
+        # Received replies: reminder drafter knows the relationship history even though
+        # the prospect hasn't replied to the latest email.
+        all_logs = (
             db.query(models.CommunicationLog)
-            .filter(
-                models.CommunicationLog.dm_id == dm.id,
-                models.CommunicationLog.direction == "SENT",
-            )
+            .filter(models.CommunicationLog.dm_id == dm.id)
             .order_by(models.CommunicationLog.received_at.asc())
             .all()
         )
+        sent_logs     = [l for l in all_logs if l.direction == "SENT"]
+        received_logs = [l for l in all_logs if l.direction == "RECEIVED"]
         last_sent = sent_logs[-1] if sent_logs else None
 
         if is_discovery:
@@ -436,12 +436,17 @@ def _deploy_nudge(
             user_intel_obj = dm.campaign.user_intel
             tc = dm.target_company
             meddpicc = (tc.v2_intel or {}).get("meddpicc", {}) if (tc and tc.v2_intel) else {}
-            previous_emails = "\n\n----- next email -----\n\n".join(
+            previous_emails = "\n\n---\n\n".join(
                 f"[Email {i + 1}] Subject: {(l.subject or '')}\n{(l.body or '')}"
                 for i, l in enumerate(sent_logs)
             )
+            previous_replies = "\n\n---\n\n".join(
+                f"[Reply {i + 1}] {(l.body or '')}"
+                for i, l in enumerate(received_logs)
+            ) or None
             body = draft_reminder_escalation_email(
                 previous_emails=previous_emails,
+                previous_replies=previous_replies,
                 user_intel={
                     "company_name": user_intel_obj.company_name,
                     "deep_research": user_intel_obj.deep_research or "",

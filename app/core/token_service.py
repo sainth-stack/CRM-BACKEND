@@ -57,8 +57,7 @@ class TokenService:
             client_secret=settings.GOOGLE_CLIENT_SECRET,
             expiry=oauth_acc.token_expiry,
             scopes=[
-                "https://www.googleapis.com/auth/gmail.readonly",
-                "https://www.googleapis.com/auth/gmail.send"
+                "https://www.googleapis.com/auth/gmail.modify",
             ]
         )
         

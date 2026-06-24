@@ -89,8 +89,8 @@ class OutreachService:
             )
 
         elif intent == "NEUTRAL":
-            if dm.followup_count < 11:
-                logger.info(f"[OUTREACH] Neutral: {dm.name} (Routing to Nudge Drafting)")
+            if dm.followup_count < 2:
+                logger.info(f"[OUTREACH] Neutral: {dm.name} (Routing to Follow-up Drafting)")
                 transition_prospect(
                     db,
                     dm,
@@ -103,6 +103,7 @@ class OutreachService:
                 dm.next_action_at = utcnow_naive()
                 dm.termination_reason = None
                 dm.retry_after = None
+                draft_followup_worker(dm.id, db=db)
             else:
                 logger.info(f"[OUTREACH] Neutral: {dm.name} (Threshold Exhausted - Terminating)")
                 restore_held_company_siblings(db, dm)

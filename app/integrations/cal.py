@@ -111,7 +111,7 @@ class CalProvider:
                 else:
                     user.cal_token_expires_at = datetime.now() + timedelta(seconds=1800)
                     
-                db.commit()
+                db.flush()
                 logger.info(f"[CAL] Access token successfully refreshed for user {user.email}")
             except Exception as e:
                 error_str = str(e).lower()
@@ -127,7 +127,7 @@ class CalProvider:
                     user.cal_refresh_token = None
                     user.cal_token_expires_at = None
                     try:
-                        db.commit()
+                        db.flush()
                     except Exception:
                         pass
                 else:

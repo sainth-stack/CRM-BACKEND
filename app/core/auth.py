@@ -36,8 +36,7 @@ if not CAL_REDIRECT_URI:
 
 # Extra scopes for mailbox connection
 MAILBOX_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
     "openid"
@@ -70,7 +69,6 @@ class GoogleAuthService:
             "response_type": "code",
             "scope": " ".join(MAILBOX_SCOPES),
             "access_type": "offline",
-            "include_granted_scopes": "true",
             "prompt": "consent",
             "state": state
         }

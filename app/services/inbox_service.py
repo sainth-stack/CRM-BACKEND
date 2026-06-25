@@ -1,9 +1,43 @@
+import re
+import datetime
+from datetime import UTC
 from sqlalchemy.orm import Session
 from app.db import models
 from app.core.logging_config import logger
 from app.agents.intent_classifier import classify_reply_intent, extract_schedule_info
-import datetime
-from datetime import UTC
+
+# Matches the standard "On <date>, <name> <email> wrote:" quoted-thread delimiter.
+# Covers Gmail, Outlook, Apple Mail, and Thunderbird formatting variants.
+_QUOTED_THREAD_RE = re.compile(
+    r'\n[ \t]*On\s.+?wrote:\s*$',
+    re.DOTALL | re.MULTILINE,
+)
+# Also covers Outlook-style delimiters
+_OUTLOOK_DELIMITER_RE = re.compile(
+    r'\n\s*-{3,}\s*(Original Message|Forwarded Message|From:)',
+    re.IGNORECASE,
+)
+
+def strip_quoted_reply(body: str) -> str:
+    """
+    Strips the quoted original-thread block from an email reply body,
+    leaving only the prospect's own top-level text.
+    Handles Gmail, Outlook, Apple Mail, and Thunderbird quoting styles.
+    """
+    if not body:
+        return body
+    # Remove "> " style quoted lines (RFC 2822 inline quoting)
+    lines = body.splitlines()
+    top_lines = []
+    for line in lines:
+        if line.startswith('>'):
+            break
+        top_lines.append(line)
+    cleaned = "\n".join(top_lines)
+    # Remove "On <date> ... wrote:" block and everything after it
+    cleaned = _QUOTED_THREAD_RE.split(cleaned)[0]
+    cleaned = _OUTLOOK_DELIMITER_RE.split(cleaned)[0]
+    return cleaned.strip()
 
 class InboxService:
     """
@@ -40,10 +74,12 @@ class InboxService:
             .first()
         )
 
-        # 3. Intent Classification
+        # 3. Intent Classification — strip quoted thread so the classifier
+        #    only sees the prospect's own words, not forwarded date/time headers.
+        clean_reply = strip_quoted_reply(reply["body"])
         classification = classify_reply_intent(
             last_sent.body if last_sent else "",
-            reply["body"],
+            clean_reply,
         )
         intent = classification["intent"]
         dm.reply_intent = intent
@@ -67,7 +103,7 @@ class InboxService:
         if intent == "BOOKING":
             today_str = datetime.datetime.now(UTC).strftime("%Y-%m-%d")
             extract = extract_schedule_info(
-                reply["body"],
+                clean_reply,
                 today_str,
                 dm.target_company.location if dm.target_company else "Global",
             )

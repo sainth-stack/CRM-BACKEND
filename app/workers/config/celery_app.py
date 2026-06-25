@@ -8,6 +8,8 @@ logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
+from app.core.config import settings
+
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 
@@ -200,38 +202,33 @@ celery_app.conf.task_routes = {
 }
 
 celery_app.conf.beat_schedule = {
-    "poll-inboxes-every-10-minutes": {
+    "poll-inboxes": {
         "task": "app.workers.tasks.inbox_worker.poll_all_users_task",
-        "schedule": 600.0,
+        "schedule": float(settings.INBOX_POLL_SECONDS),
     },
-    "check-meetings-every-60-minutes": {
+    "check-meetings": {
         "task": "app.workers.tasks.reminders_worker.check_upcoming_meetings_task",
-        "schedule": 3600.0,
+        "schedule": float(settings.MEETING_CHECK_SECONDS),
     },
-    "check-inactivity-every-30-minutes": {
+    "check-inactivity": {
         "task": "app.workers.tasks.orchestrator_worker.check_all_inactivity_task",
-        "schedule": 1800.0,
+        "schedule": float(settings.INACTIVITY_CHECK_SECONDS),
     },
-    "reactivate-terminated-every-24-hours": {
+    "reactivate-terminated": {
         "task": "app.workers.tasks.orchestrator_worker.reactivate_terminated_prospects_task",
-        "schedule": 86400.0,
+        "schedule": float(settings.REACTIVATION_CHECK_SECONDS),
     },
-    "sweep-stuck-campaigns-every-30-minutes": {
+    "sweep-stuck-campaigns": {
         "task": "app.workers.tasks.sweeper_worker.sweep_stuck_campaigns_task",
-        "schedule": 1800.0,
+        "schedule": float(settings.SWEEP_STUCK_CAMPAIGNS_SECONDS),
     },
-    # Durable outbound dispatch poller — the single, restart-proof trigger that
-    # actually sends scheduled emails (replaces the old per-draft Celery eta +
-    # the 10-min stranded sweep, both of which could drop/smear sends).
     "dispatch-due-drafts": {
         "task": "app.workers.tasks.outbound_worker.dispatch_due_drafts_task",
-        # 60 -> 120s: halves this poller's idle command churn; a scheduled send now
-        # waits at most ~2 min to go out (negligible for cold outreach).
-        "schedule": float(os.getenv("DISPATCH_POLL_SECONDS", "120")),
+        "schedule": float(settings.DISPATCH_POLL_SECONDS),
         "options": {"queue": "outbound_dispatch"},
     },
-    "refresh-oauth-tokens-every-6-hours": {
+    "refresh-oauth-tokens": {
         "task": "app.workers.tasks.token_refresh_worker.refresh_expiring_tokens_task",
-        "schedule": 21600.0,  # 6 hours in seconds
+        "schedule": float(settings.OAUTH_REFRESH_SECONDS),
     },
 }

@@ -46,16 +46,16 @@ class StorageService:
             self.upload_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Storage initialized in LOCAL mode at {self.upload_dir.absolute()}")
 
-    async def save_file(self, file_bytes: bytes, filename: str, campaign_id: str) -> str:
+    async def save_file(self, file_bytes: bytes, filename: str, campaign_id: str, content_type: str = "text/csv") -> str:
         """Saves file to designated storage and returns the path/URL."""
         unique_name = f"campaign_{campaign_id}_{filename}"
-        
+
         if self.mode == "local":
             file_path = self.upload_dir / unique_name
             with open(file_path, "wb") as buffer:
                 buffer.write(file_bytes)
             return str(file_path.absolute())
-        
+
         elif self.mode == "s3":
             try:
                 # Upload bytes directly to S3 bucket
@@ -63,7 +63,7 @@ class StorageService:
                     Bucket=self.bucket_name,
                     Key=f"campaigns/{unique_name}",
                     Body=file_bytes,
-                    ContentType="text/csv"
+                    ContentType=content_type
                 )
                 logger.info(f"Successfully uploaded {unique_name} to S3 bucket {self.bucket_name}.")
                 return f"https://{self.bucket_name}.s3.{self.region_name}.amazonaws.com/campaigns/{unique_name}"

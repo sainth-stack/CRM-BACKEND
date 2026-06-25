@@ -28,19 +28,25 @@ class Settings:
     #
     # MEMORY: the whole Phase-2 batch shares ONE curl_cffi AsyncSession (created in
     # campaign_service.stage_3_icp_filtering), and trafilatura/lxml parsing is globally
-    # bounded to 8 concurrent parses (enrichment_v2.TRAFILATURA_CONCURRENCY). At
-    # concurrency 20 this keeps the heavy worker's peak RSS well under its 350 MB target
-    # (≈ shared session 20-30 MB + ≤8 live lxml parses + small per-company text buffers).
+    # bounded to 6 concurrent parses (enrichment_v2.TRAFILATURA_CONCURRENCY). The heavy
+    # worker's peak RSS stays well under its 380 MB ceiling at this concurrency.
     # Do NOT switch back to a per-company session — that multiplies pool memory by the
     # concurrency factor and breaks the envelope.
     #
-    # THROUGHPUT GOVERNOR is OpenAI TPM, not RAM/CPU. Each ICP company ≈ 8-10K tokens
-    # (12K enrich input + lean validation profile), so 200K TPM (Tier-1) / ~9K ≈ ~22
-    # companies/min — concurrency 20 saturates Tier-1 without 429s. Right-size to tier:
-    #   Tier 1 (200K TPM): 20  |  Tier 2 (2M TPM): 40+  |  Tier 3+: 60+.
-    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "20"))        # enrich + ICP — TPM-bound, RAM-safe via shared session
-    STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "25"))   # stakeholder ranking
-    STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "25"))   # email drafting (single MEDDPICC call)
+    # THROUGHPUT GOVERNOR is OpenAI TPM, not RAM/CPU.
+    # Actual token budget per company (measured):
+    #   Enrichment input (6 sources, char budgets)  ≈  8,000-9,500 tokens
+    #   ICP/MEDDPICC call (prompt + structured out) ≈  3,000-3,500 tokens
+    #   Per-company total                           ≈ 12,000-13,000 tokens
+    #
+    # Safe concurrency formula:  floor(TPM_limit / avg_tokens × safety_margin)
+    #   Tier 1 (200K TPM): floor(200K / 12.5K × 0.90) = 14   ← DEFAULT
+    #   Tier 2 (2M TPM):   floor(2M   / 12.5K × 0.90) = 144  (cap at 40 for RAM)
+    #   Tier 3+:           raise further as needed
+    # Running at 20 on Tier-1 generates ~250K TPM → trips circuit breaker repeatedly.
+    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "14"))        # enrich + ICP — TPM-bound (Tier-1 safe ceiling)
+    STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "25"))   # stakeholder ranking (~2K tokens/call — TPM-safe)
+    STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "20"))   # email drafting — reduced from 25; retry storms at 25 can hit ~250K TPM
 
     # ICP acceptance threshold (0-100). A company is ACCEPTED when its inferred
     # operator_fit score (+ optional need/precondition bonus) >= this value AND it
@@ -114,25 +120,73 @@ class Settings:
     
     # Dispatch poller — the durable reconciliation loop that actually sends
     # scheduled emails (DB-driven, survives server restarts / lost Celery tasks).
-    DISPATCH_POLL_SECONDS = int(os.getenv("DISPATCH_POLL_SECONDS", "60"))
+    # 120s default: halves idle Redis command churn vs 60s; max send delay ~2 min.
+    DISPATCH_POLL_SECONDS = int(os.getenv("DISPATCH_POLL_SECONDS", "120"))
 
     # 10. STATE-MACHINE TIMERS & NUDGE TUNING COORDINATES
     REPLY_FALLBACK_WINDOW_DAYS = int(os.getenv("REPLY_FALLBACK_WINDOW_DAYS", "90"))
     NUDGE_DISPATCH_STALE_MINUTES = int(os.getenv("NUDGE_DISPATCH_STALE_MINUTES", "15"))
     NUDGE_FOLLOWUP_DELAY_DAYS = int(os.getenv("NUDGE_FOLLOWUP_DELAY_DAYS", "2"))
     SWEEP_STUCK_MINUTES = int(os.getenv("SWEEP_STUCK_MINUTES", "10"))
-    
+
+    # How long to hold sibling prospects after a discovery email is sent to one DM
+    # at the same company, to avoid hammering the same company from multiple angles.
+    DISCOVERY_HOLD_WINDOW_HOURS = int(os.getenv("DISCOVERY_HOLD_WINDOW_HOURS", "96"))
+
     # Limits
     MAX_NEUTRAL_FOLLOWUPS = int(os.getenv("MAX_NEUTRAL_FOLLOWUPS", "2"))
-    
+
     # Reminders
     REMINDER_24H_MIN_HOURS = int(os.getenv("REMINDER_24H_MIN_HOURS", "22"))
     REMINDER_24H_MAX_HOURS = int(os.getenv("REMINDER_24H_MAX_HOURS", "25"))
     REMINDER_1H_MIN_MINUTES = int(os.getenv("REMINDER_1H_MIN_MINUTES", "45"))
     REMINDER_1H_MAX_MINUTES = int(os.getenv("REMINDER_1H_MAX_MINUTES", "75"))
 
+    # 11. CELERY BEAT SCHEDULES (seconds between each periodic task run)
+    INBOX_POLL_SECONDS            = int(os.getenv("INBOX_POLL_SECONDS",            "300"))    # 5 min
+    MEETING_CHECK_SECONDS         = int(os.getenv("MEETING_CHECK_SECONDS",         "3600"))   # 1 hr
+    INACTIVITY_CHECK_SECONDS      = int(os.getenv("INACTIVITY_CHECK_SECONDS",      "1800"))   # 30 min
+    SWEEP_STUCK_CAMPAIGNS_SECONDS = int(os.getenv("SWEEP_STUCK_CAMPAIGNS_SECONDS", "1800"))   # 30 min
+    REACTIVATION_CHECK_SECONDS    = int(os.getenv("REACTIVATION_CHECK_SECONDS",    "86400"))  # 24 hr
+    OAUTH_REFRESH_SECONDS         = int(os.getenv("OAUTH_REFRESH_SECONDS",         "21600"))  # 6 hr
+
+    # 12. EMAIL DELIVERY WINDOWS (prospect local time, 24-h "HH:MM" format)
+    # Two windows per day; emails outside these windows are held until the next slot.
+    SEND_WINDOW_MORNING_START   = os.getenv("SEND_WINDOW_MORNING_START",   "09:30")
+    SEND_WINDOW_MORNING_END     = os.getenv("SEND_WINDOW_MORNING_END",     "11:59")
+    SEND_WINDOW_AFTERNOON_START = os.getenv("SEND_WINDOW_AFTERNOON_START", "13:30")
+    SEND_WINDOW_AFTERNOON_END   = os.getenv("SEND_WINDOW_AFTERNOON_END",   "16:00")
+    # Minimum gap (minutes) between consecutive sends queued for the same user.
+    SEND_STAGGER_MINUTES = int(os.getenv("SEND_STAGGER_MINUTES", "3"))
+
+    # 13. OUTBOUND DISPATCH WORKER LIMITS
+    # Max drafts dispatched per single poll cycle (caps burst on a large backlog).
+    MAX_DISPATCH_PER_RUN = int(os.getenv("MAX_DISPATCH_PER_RUN", "300"))
+    # Draft age (days) after which a QUEUED draft is auto-failed as stale.
+    MAX_STALE_DRAFT_DAYS = int(os.getenv("MAX_STALE_DRAFT_DAYS", "3"))
+    # Grace window (minutes) before the sweeper flags a dispatch as stranded.
+    SWEEPER_STALE_GRACE_MINUTES = int(os.getenv("SWEEPER_STALE_GRACE_MINUTES", "30"))
+
+    # 14. GMAIL INBOX SCAN SETTINGS
+    # Rolling lookback window used in the Gmail search query (e.g. "newer_than:30d").
+    GMAIL_SCAN_LOOKBACK_DAYS = int(os.getenv("GMAIL_SCAN_LOOKBACK_DAYS", "30"))
+    # Max pages (× GMAIL_PAGE_SIZE messages each) fetched per inbox poll.
+    GMAIL_MAX_PAGES  = int(os.getenv("GMAIL_MAX_PAGES",  "5"))
+    GMAIL_PAGE_SIZE  = int(os.getenv("GMAIL_PAGE_SIZE",  "15"))
+
+    # 15. CAL.COM SLOT SETTINGS
+    # Days ahead to look for the first available slot when auto-booking.
+    CAL_SLOTS_LOOKAHEAD_DAYS = int(os.getenv("CAL_SLOTS_LOOKAHEAD_DAYS", "7"))
+    # Number of alternative slots offered to the prospect on booking failure.
+    CAL_SLOTS_LIMIT = int(os.getenv("CAL_SLOTS_LIMIT", "5"))
+
+    # 16. CONTENT / INTELLIGENCE SETTINGS
+    # Maximum age of a news item to be used as a "recent_news" hook in initial emails.
+    NEWS_CUTOFF_MONTHS = int(os.getenv("NEWS_CUTOFF_MONTHS", "12"))
+
     # AWS Storage Credentials & Region
-    AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+    AWS_STORAGE_BUCKET_NAME= os.getenv("AWS_STORAGE_BUCKET_NAME", "focalreach")
+    AWS_REGION = os.getenv("AWS_REGION", "us-west-1")
     AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 

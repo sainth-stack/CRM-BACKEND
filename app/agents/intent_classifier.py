@@ -38,7 +38,7 @@ Prospect's Reply:
 
 CLASSIFICATION RULES:
 1. BOOKING: The prospect is interested AND explicitly shares a specific day, date, time, or scheduling slot they are available for (e.g., "available on Wednesday at 4.00 PM EST", "How about tomorrow morning at 10am?", "Let's meet Monday at 2pm", "I can do 2 PM on Thursday").
-2. POSITIVE: The prospect is interested, wants a meeting, asks for a call, wants a demo, or expresses clear interest in next steps, but does NOT provide any specific date, day, time, or availability slot yet (e.g., "Yes, I would be interested", "Sure, let's talk next week", "Send me more details and a calendar link", "I'd love to connect").
+2. POSITIVE: The prospect is interested, wants a meeting, asks for a call, wants a demo, or expresses clear interest in next steps, but does NOT provide any specific date, day, time, or availability slot yet (e.g., "Yes, I would be interested", "Sure, let's talk next week", "Send me more details and a calendar link", "I'd love to connect", "Please send me a calendar link"). Asking for a calendar link is POSITIVE — the prospect has not committed to any specific time yet.
 3. NEGATIVE: The prospect says "No", "Not interested", "Stop emailing me", "Remove from list", or clearly rejects the proposal.
 4. NEUTRAL: The prospect is hesitant, asks a general question, says "Check back later", expresses mild skepticism but doesn't say No, or provides a non-committal answer that requires further convincing.
 
@@ -46,6 +46,8 @@ STRICT CONSTRAINTS:
 - No assumptions.
 - If they say "Talk next month", it is NEUTRAL (requires a follow-up/convincing).
 - If they ask for pricing or more info before meeting, it is NEUTRAL.
+- The prospect's reply may contain a quoted email thread below a line like "On [date] ... wrote:". IGNORE everything after that line. Classify ONLY the prospect's own words above it.
+- Date or time values appearing in a quoted-thread header (e.g. "On Wed, 24 Jun 2026 at 16:45 ... wrote:") are NOT scheduling offers from the prospect. Do NOT use them as evidence for BOOKING.
 
 Return only the structured intent classification.
 """

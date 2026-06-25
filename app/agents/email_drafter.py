@@ -101,6 +101,7 @@ If MODE is 'COORDINATION':
   Para 2 — SENDER INTRODUCTION (2-3 sentences):
     Introduce {user_company_name}: what they are and the specific capability that maps to Para 1's pain.
     Name {user_company_name} explicitly. Be concrete about what you do and for whom.
+    NEVER mention {user_company_name}'s location, headquarters, city, or country — irrelevant to the prospect.
 
   Para 3 — PROOF + CTA (2 sentences):
     Sentence 1: one proof point from sender_proof relevant to the pain. Qualitative if proof is empty.
@@ -128,6 +129,7 @@ If MODE is 'COORDINATION':
 
   Para 2 — GRACEFUL EXIT (2-3 sentences, pure closing — zero pitch):
     This paragraph must contain ZERO product information, capabilities, or proof points.
+    NEVER mention {user_company_name}'s location, headquarters, city, or country — irrelevant to a soft close.
     Convey finality through tone, not by announcing it.
     Acceptable phrasing: "I'll leave it here for now", "I won't keep filling your inbox",
     "I'll step back and give you space", "I'll let you take it from here" — choose what fits naturally.
@@ -145,6 +147,7 @@ If MODE is 'COORDINATION':
 
   Para 2 — GRACEFUL EXIT (2-3 sentences, pure closing — zero pitch):
     This paragraph must contain ZERO product information, capabilities, or proof points.
+    NEVER mention {user_company_name}'s location, headquarters, city, or country — irrelevant to a soft close.
     Convey finality through tone, not by announcing it.
     Do NOT reference "not hearing back" or imply the prospect ignored you.
     Acceptable phrasing: "I'll leave it here for now", "I won't keep filling your inbox",
@@ -168,10 +171,12 @@ STRICT CONSTRAINTS (both follow-up numbers)
 5. BANNED openers: "I wanted to follow up", "Just following up", "Touching base", "Checking in",
    "Hope this finds you", "I wanted to reach out", "As I mentioned".
 6. ZERO PERFORMANCE CLAIMS unless verbatim in sender_proof.
-7. No framework jargon. Write like a human.
-8. 80-130 words for Follow-up #2 (shorter is fine for a soft close). 110-160 words for Follow-up #1.
+7. NEVER mention {user_company_name}'s location, headquarters, city, or country anywhere in the email,
+   even if present in user_company_research. It is irrelevant to the prospect.
+8. No framework jargon. Write like a human.
+9. 80-130 words for Follow-up #2 (shorter is fine for a soft close). 110-160 words for Follow-up #1.
    Each paragraph ONE continuous line — no internal line breaks.
-9. Return subject + body.
+10. Return subject + body.
 """
 
 def clean_email_body(body: str) -> str:

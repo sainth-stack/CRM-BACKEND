@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import date
 from typing import List, Literal, Optional, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -62,7 +63,7 @@ class Email1Plan(BaseModel):
     hook_type: Literal[
         "recent_news", "growth_signal", "need_evidence", "pain_hook", "research_insight"
     ] = Field(description=(
-        "recent_news: ONLY when news has explicit date ≤ 30 days from current_month. "
+        "recent_news: ONLY when news has explicit date ≤ 12 months from current_month. "
         "growth_signal: named expansion event. need_evidence: specific MEDDPICC observation. "
         "pain_hook: specific operational pain grounded in THIS company's characteristics. "
         "research_insight: last resort — most specific company fact from research/description."
@@ -164,8 +165,8 @@ EMAIL PLANNING — PROSPECT-CENTRIC INITIAL OUTREACH
 HOOK SELECTION (priority order — pick the highest that qualifies):
 
   Priority 1 — recent_news:
-    ✓ ONLY when news has EXPLICIT date AND ≤ 30 days from {current_month}.
-    ✓ Calculate months_old. If > 30 days OR no date → skip entirely.
+    ✓ ONLY when news has EXPLICIT date AND ≤ 12 months from {current_month}.
+    ✓ Calculate months_old. If > 12 months OR no date → skip entirely.
     If multiple qualify, pick the most recent.
 
   Priority 2 — growth_signal:
@@ -269,8 +270,17 @@ HARD RULES:
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Module-level singleton — one ChatOpenAI (and its httpx connection pool) shared
+# across all concurrent drafts in this process. The old pattern (get_chat_llm
+# called inside each node function) created a fresh ChatOpenAI per node call:
+# at STAGE6_CONCURRENCY=20 with 4 calls per draft that's 80 httpx clients per
+# batch, each carrying its own SSL context and connection pool — unnecessary
+# RAM pressure and GC churn on t2.medium.
+_DRAFT_LLM = get_chat_llm("reasoning", timeout=60, max_retries=1)
+
+
 def _llm():
-    return get_chat_llm("reasoning", timeout=60, max_retries=1)
+    return _DRAFT_LLM
 
 
 def _parse_output(text: str) -> dict:
@@ -318,6 +328,55 @@ def _plan_to_dict(p: Email1Plan) -> dict:
         "pain_hypothesis":       p.primary_pain,
         "hook":                  p.hook_value,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# News freshness guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+from app.core.config import settings as _settings
+_NEWS_CUTOFF_MONTHS = _settings.NEWS_CUTOFF_MONTHS
+
+_DATE_PATTERNS = [
+    (re.compile(r"^(\d{4})-(\d{2})-(\d{2})$"), lambda m: date(int(m[0]), int(m[1]), int(m[2]))),
+    (re.compile(r"^(\d{4})-(\d{2})$"),          lambda m: date(int(m[0]), int(m[1]), 1)),
+    (re.compile(r"^(\d{4})$"),                   lambda m: date(int(m[0]), 1, 1)),
+]
+
+def _parse_hook_date(raw: str) -> Optional[date]:
+    """Return a date object from a hook_source_date string, or None if unparseable."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    for pattern, extractor in _DATE_PATTERNS:
+        m = pattern.match(raw)
+        if m:
+            try:
+                return extractor(m.groups())
+            except ValueError:
+                return None
+    return None
+
+
+def news_is_within_cutoff(hook_source_date: Optional[str], current_month: str) -> bool:
+    """Return True iff the news date is within _NEWS_CUTOFF_MONTHS of current_month.
+
+    current_month must be in YYYY-MM format (e.g. '2026-06').
+    Returns False if either date is missing or unparseable.
+    """
+    if not hook_source_date:
+        return False
+    news_date = _parse_hook_date(hook_source_date)
+    if news_date is None:
+        return False
+    try:
+        cy, cm = int(current_month[:4]), int(current_month[5:7])
+    except (ValueError, IndexError):
+        return False
+    current = date(cy, cm, 1)
+    # months_old = how many calendar months back the news date is
+    months_old = (current.year - news_date.year) * 12 + (current.month - news_date.month)
+    return 0 <= months_old <= _NEWS_CUTOFF_MONTHS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -435,7 +494,20 @@ def _node_plan(state: SequenceState) -> dict:
         "refine_block":          refine_block,
     })
 
-    return {"plan": _plan_to_dict(plan)}
+    plan_dict = _plan_to_dict(plan)
+
+    # Deterministic guard: if the LLM chose recent_news but the date is stale or missing,
+    # demote to growth_signal so the writer never sees a stale news hook.
+    if plan_dict.get("e1_hook_type") == "recent_news":
+        if not news_is_within_cutoff(plan_dict.get("e1_hook_source_date"), ctx.get("current_month", "")):
+            logger.warning(
+                "[SEQ-GRAPH] LLM chose recent_news but date '%s' is outside 12-month window — "
+                "demoting to growth_signal.", plan_dict.get("e1_hook_source_date")
+            )
+            plan_dict["e1_hook_type"] = "growth_signal"
+            plan_dict["e1_hook_source_date"] = None
+
+    return {"plan": plan_dict}
 
 
 def _node_write_emails(state: SequenceState) -> dict:

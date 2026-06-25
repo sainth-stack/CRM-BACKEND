@@ -5,6 +5,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError
+from app.core.config import settings
 from app.core.circuit_breaker import (
     CircuitBreakerConfig,
     circuit_is_open,
@@ -48,16 +49,15 @@ class GmailProvider:
             service = build('gmail', 'v1', credentials=self.creds)
             
             # 1. High-Performance Query: recent unread inbox messages only
-            query = "label:INBOX newer_than:30d"
+            query = f"label:INBOX newer_than:{settings.GMAIL_SCAN_LOOKBACK_DAYS}d"
             if unread_only:
                 query += " label:UNREAD"
-                
+
             messages = []
             next_page = None
-            # Limit to 5 pages (75 messages) per poll
-            for _ in range(5):
+            for _ in range(settings.GMAIL_MAX_PAGES):
                 results = service.users().messages().list(
-                    userId='me', q=query, maxResults=15, pageToken=next_page
+                    userId='me', q=query, maxResults=settings.GMAIL_PAGE_SIZE, pageToken=next_page
                 ).execute()
                 messages.extend(results.get('messages', []))
                 next_page = results.get('nextPageToken')

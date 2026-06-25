@@ -10,7 +10,7 @@ import os
 from app.core.logging_config import setup_logging
 from app.core.limiter import limiter
 from app.workers import sweep_stuck_campaigns_task
-from app.api import auth, admin, export, campaigns, drafts, prospects, health
+from app.api import auth, admin, export, campaigns, drafts, prospects, health, uploads
 
 # Initialize Enterprise Logging
 logger = setup_logging()
@@ -77,3 +77,4 @@ app.include_router(campaigns.router, prefix="/campaigns", tags=["campaigns"])
 app.include_router(drafts.router, prefix="/drafts", tags=["drafts"])
 app.include_router(prospects.router, prefix="/prospects", tags=["prospects"])
 app.include_router(health.router, prefix="/health", tags=["health"])
+app.include_router(uploads.router, prefix="/uploads", tags=["uploads"])

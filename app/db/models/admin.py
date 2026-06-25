@@ -107,6 +107,34 @@ class UserRoleAssignment(Base):
     )
 
 
+class OrgAsset(Base):
+    """
+    Brochure or use-case PDF uploaded by an admin for their organization.
+    Stored in S3 under org-assets/{org_id}/{type}s/. Accessible to every
+    user in the same organization. The permanent download link is served via
+    GET /uploads/assets/{id}, which generates a fresh presigned S3 URL on
+    each request — safe to embed as a hyperlink in outreach emails.
+    """
+    __tablename__ = "org_assets"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(
+        String, ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    asset_type = Column(String, nullable=False)    # "brochure" | "usecase"
+    filename = Column(String, nullable=False)
+    s3_key = Column(String, nullable=False, unique=True)
+    file_size = Column(Integer, nullable=True)      # bytes
+    uploaded_by_id = Column(
+        String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
+
+    organization = relationship("Organization")
+    uploaded_by = relationship("User", foreign_keys=[uploaded_by_id])
+
+
 class LoginSession(Base):
     """
     Login audit trail. One row is written per successful login, capturing the

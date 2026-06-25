@@ -94,11 +94,38 @@ _WIKI_CAP          = 20_000    # Wikipedia API response (JSON)
 # =============================================================================
 # Lazy global throttle semaphores — created inside the running event loop
 # so they are safe across hot-reloads and multiple campaigns in one process.
+# _throttles_lock guards the check-then-set: without it two coroutines that
+# both see a missing key simultaneously create two separate semaphores and the
+# second write silently discards the first, allowing 2× the intended concurrency
+# on the very first Stage 3 run (e.g. 8 DDGS calls instead of 4).
 # =============================================================================
 _throttles: dict[str, asyncio.Semaphore] = {}
+_throttles_lock: asyncio.Lock | None = None
+
+
+def _get_throttles_lock() -> asyncio.Lock:
+    global _throttles_lock
+    if _throttles_lock is None:
+        _throttles_lock = asyncio.Lock()
+    return _throttles_lock
+
+
+async def _sem_async(name: str, n: int) -> asyncio.Semaphore:
+    """Return (or lazily create) the named semaphore — race-free."""
+    s = _throttles.get(name)
+    if s is not None:
+        return s
+    async with _get_throttles_lock():
+        s = _throttles.get(name)   # re-check inside lock
+        if s is None:
+            s = asyncio.Semaphore(n)
+            _throttles[name] = s
+    return s
 
 
 def _sem(name: str, n: int) -> asyncio.Semaphore:
+    """Sync accessor — safe to call when the semaphore is already initialised.
+    Use _sem_async on first access from async context to avoid the race."""
     s = _throttles.get(name)
     if s is None:
         s = asyncio.Semaphore(n)

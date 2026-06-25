@@ -11,11 +11,11 @@ from app.core.config import settings
 # considered stranded (the Celery task was lost — Redis restart, worker killed
 # before ack, etc.).  Set higher than the longest normal task-start delay
 # (~1 s in practice) but low enough to catch a missed delivery window quickly.
-_STALE_GRACE_MINUTES = 30
+_STALE_GRACE_MINUTES = settings.SWEEPER_STALE_GRACE_MINUTES
 
 # Drafts stranded longer than this many days are too stale to auto-recover —
 # mark them FAILED so the user can review and decide what to do.
-_MAX_STALE_DAYS = 3
+_MAX_STALE_DAYS = settings.MAX_STALE_DRAFT_DAYS
 
 
 @celery_app.task

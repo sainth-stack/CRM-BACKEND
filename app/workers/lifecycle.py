@@ -3,11 +3,12 @@ from datetime import UTC
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db import models
 
 
-RETRY_WINDOW_DAYS = 90
-DISCOVERY_HOLD_WINDOW_HOURS = 96
+RETRY_WINDOW_DAYS = settings.REPLY_FALLBACK_WINDOW_DAYS
+DISCOVERY_HOLD_WINDOW_HOURS = settings.DISCOVERY_HOLD_WINDOW_HOURS
 
 
 def utcnow_naive() -> datetime.datetime:

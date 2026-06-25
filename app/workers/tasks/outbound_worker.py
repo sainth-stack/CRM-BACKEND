@@ -38,8 +38,8 @@ from app.workers.utils import db_session
 UTC = timezone.utc
 
 _POLLER_LOCK = "dispatch_due_drafts:poller"
-_MAX_PER_RUN = 300            # cap drafts processed per poll (next run continues)
-_MAX_STALE_DAYS = 3           # older than this -> FAILED for manual review
+_MAX_PER_RUN    = settings.MAX_DISPATCH_PER_RUN   # cap drafts processed per poll (next run continues)
+_MAX_STALE_DAYS = settings.MAX_STALE_DRAFT_DAYS   # older than this -> FAILED for manual review
 
 
 def _stagger_seconds() -> int:

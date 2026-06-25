@@ -19,8 +19,10 @@ from app.services.user_intel_service import UserIntelService
 from app.services.search_hints import derive_search_hints
 from app.db.database import SessionLocal
 
-# Bounded DNS Executor for Vitality Audits
-dns_executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+# Bounded DNS Executor for Vitality Audits.
+# 8 workers is enough for spot DNS checks; 20 was oversized and burned ~40 MB
+# of idle thread-stack memory on t2.medium even with no campaigns running.
+dns_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 
 class CampaignService:

@@ -184,7 +184,9 @@ class CalProvider:
             raise exc
 
     @with_retries(max_attempts=3, base_delay=2.0)
-    def get_upcoming_available_slots(self, db, user, days_ahead: int = 7, limit: int = 5) -> list[str]:
+    def get_upcoming_available_slots(self, db, user, days_ahead: int = None, limit: int = None) -> list[str]:
+        days_ahead = days_ahead if days_ahead is not None else settings.CAL_SLOTS_LOOKAHEAD_DAYS
+        limit      = limit      if limit      is not None else settings.CAL_SLOTS_LIMIT
         token = self.get_valid_access_token(db, user)
         if not token:
             logger.warning("[CAL] Cannot fetch availability slots: Cal.com account not connected or token invalid. Please connect your Cal.com account in Settings.")

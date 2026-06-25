@@ -11,17 +11,25 @@ import pytz
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.logging_config import logger
 
 UTC = timezone.utc
 
-# Delivery windows expressed in prospect local time
+
+def _parse_hhmm(s: str) -> time:
+    h, m = s.strip().split(":")
+    return time(int(h), int(m))
+
+
+# Delivery windows expressed in prospect local time — driven by config so
+# you can adjust business hours without a code deploy.
 SEND_WINDOWS: list[tuple[time, time]] = [
-    (time(9, 30), time(11, 59)),
-    (time(13, 30), time(16, 0)),
+    (_parse_hhmm(settings.SEND_WINDOW_MORNING_START),   _parse_hhmm(settings.SEND_WINDOW_MORNING_END)),
+    (_parse_hhmm(settings.SEND_WINDOW_AFTERNOON_START), _parse_hhmm(settings.SEND_WINDOW_AFTERNOON_END)),
 ]
 
-STAGGER_MINUTES = 3
+STAGGER_MINUTES = settings.SEND_STAGGER_MINUTES
 
 
 # ---------------------------------------------------------------------------

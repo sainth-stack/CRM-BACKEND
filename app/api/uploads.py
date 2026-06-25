@@ -85,7 +85,7 @@ async def _upload_org_asset(
 
     org_id = _require_org(current_user)
     safe_name = file.filename.replace(" ", "_")
-    key = f"org-assets/{org_id}/{asset_type}s/{uuid.uuid4()}_{safe_name}"
+    key = settings.s3_key(f"org-assets/{org_id}/{asset_type}s/{uuid.uuid4()}_{safe_name}")
 
     try:
         s3 = _get_s3()
@@ -138,7 +138,7 @@ async def upload_pdf(
         raise HTTPException(status_code=413, detail="File exceeds 20 MB limit.")
 
     safe_name = file.filename.replace(" ", "_")
-    key = f"pdfs/{current_user.id}/{uuid.uuid4()}_{safe_name}"
+    key = settings.s3_key(f"pdfs/{current_user.id}/{uuid.uuid4()}_{safe_name}")
     try:
         s3 = _get_s3()
         s3.put_object(

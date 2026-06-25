@@ -63,8 +63,7 @@ class Settings:
     # 3. PRODUCTION OBSERVABILITY, METRICS & ALERTS
     SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
     STORAGE_MODE = os.getenv("STORAGE_MODE", "local")
-    AWS_STORAGE_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME", "company-outreach-storage-bucket")
-    
+
     # 4. IDENTITY, SECURITY & SESSION MANAGEMENT
     ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "paste_secure_aes_256_base64_encoded_token_here")
     JWT_SECRET = os.getenv("JWT_SECRET", "AI_PRIORI_ENTERPRISE_IDENT_SESSION_KEY_PRODUCTION")
@@ -189,6 +188,12 @@ class Settings:
     AWS_REGION = os.getenv("AWS_REGION", "us-west-1")
     AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+    # Key prefix ("folder") that every S3 object is stored under within the bucket.
+    AWS_S3_PREFIX = os.getenv("AWS_S3_PREFIX", "focalreach").strip("/")
+
+    def s3_key(self, key: str) -> str:
+        """Prefixes an S3 object key with AWS_S3_PREFIX, if set."""
+        return f"{self.AWS_S3_PREFIX}/{key}" if self.AWS_S3_PREFIX else key
 
     # LLM Model & Circuit Breaker Settings
     INPUT_VALIDATION_MODEL = os.getenv("INPUT_VALIDATION_MODEL", "gpt-4o-mini")

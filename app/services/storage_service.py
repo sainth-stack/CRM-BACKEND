@@ -3,6 +3,8 @@ from pathlib import Path
 import logging
 import io
 
+from app.core.config import settings
+
 try:
     import boto3
     from botocore.exceptions import ClientError
@@ -59,14 +61,15 @@ class StorageService:
         elif self.mode == "s3":
             try:
                 # Upload bytes directly to S3 bucket
+                key = settings.s3_key(f"campaigns/{unique_name}")
                 self.s3_client.put_object(
                     Bucket=self.bucket_name,
-                    Key=f"campaigns/{unique_name}",
+                    Key=key,
                     Body=file_bytes,
                     ContentType=content_type
                 )
                 logger.info(f"Successfully uploaded {unique_name} to S3 bucket {self.bucket_name}.")
-                return f"https://{self.bucket_name}.s3.{self.region_name}.amazonaws.com/campaigns/{unique_name}"
+                return f"https://{self.bucket_name}.s3.{self.region_name}.amazonaws.com/{key}"
             except ClientError as e:
                 logger.error(f"S3 Upload Failure for {unique_name}: {e}")
                 # Fallback to local storage on S3 failure to maintain server continuity

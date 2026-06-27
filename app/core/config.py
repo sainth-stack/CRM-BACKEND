@@ -68,6 +68,7 @@ class Settings:
     ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "paste_secure_aes_256_base64_encoded_token_here")
     JWT_SECRET = os.getenv("JWT_SECRET", "AI_PRIORI_ENTERPRISE_IDENT_SESSION_KEY_PRODUCTION")
     ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,https://app.ai-priori.com")
+    API_BASE_URL = os.getenv("API_BASE_URL", os.getenv("BACKEND_URL", "http://localhost:8000")).rstrip("/")
     
     # Resolve dynamic FRONTEND_URL fallback for config properties
     _frontend_url = os.getenv("FRONTEND_URL")
@@ -120,12 +121,12 @@ class Settings:
     # Dispatch poller — the durable reconciliation loop that actually sends
     # scheduled emails (DB-driven, survives server restarts / lost Celery tasks).
     # 120s default: halves idle Redis command churn vs 60s; max send delay ~2 min.
-    DISPATCH_POLL_SECONDS = int(os.getenv("DISPATCH_POLL_SECONDS", "120"))
+    DISPATCH_POLL_SECONDS = int(os.getenv("DISPATCH_POLL_SECONDS", "60"))
 
     # 10. STATE-MACHINE TIMERS & NUDGE TUNING COORDINATES
     REPLY_FALLBACK_WINDOW_DAYS = int(os.getenv("REPLY_FALLBACK_WINDOW_DAYS", "90"))
     NUDGE_DISPATCH_STALE_MINUTES = int(os.getenv("NUDGE_DISPATCH_STALE_MINUTES", "15"))
-    NUDGE_FOLLOWUP_DELAY_DAYS = int(os.getenv("NUDGE_FOLLOWUP_DELAY_DAYS", "2"))
+    NUDGE_FOLLOWUP_DELAY_MINUTES = int(os.getenv("NUDGE_FOLLOWUP_DELAY_MINUTES", "2880"))
     SWEEP_STUCK_MINUTES = int(os.getenv("SWEEP_STUCK_MINUTES", "10"))
 
     # How long to hold sibling prospects after a discovery email is sent to one DM
@@ -146,6 +147,7 @@ class Settings:
     MEETING_CHECK_SECONDS         = int(os.getenv("MEETING_CHECK_SECONDS",         "3600"))   # 1 hr
     INACTIVITY_CHECK_SECONDS      = int(os.getenv("INACTIVITY_CHECK_SECONDS",      "1800"))   # 30 min
     SWEEP_STUCK_CAMPAIGNS_SECONDS = int(os.getenv("SWEEP_STUCK_CAMPAIGNS_SECONDS", "1800"))   # 30 min
+    SWEEP_STRANDED_DISPATCHES_SECONDS = int(os.getenv("SWEEP_STRANDED_DISPATCHES_SECONDS", "600"))  # 10 min
     REACTIVATION_CHECK_SECONDS    = int(os.getenv("REACTIVATION_CHECK_SECONDS",    "86400"))  # 24 hr
     OAUTH_REFRESH_SECONDS         = int(os.getenv("OAUTH_REFRESH_SECONDS",         "21600"))  # 6 hr
 

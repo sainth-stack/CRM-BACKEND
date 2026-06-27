@@ -120,18 +120,24 @@ class OrgAsset(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     organization_id = Column(
         String, ForeignKey("organizations.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        nullable=True, index=True,   # nullable: super-admin assets use owner_user_id instead
+    )
+    owner_user_id = Column(
+        String, ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True, index=True,   # set for super-admin uploads (no org)
     )
     asset_type = Column(String, nullable=False)    # "brochure" | "usecase"
     filename = Column(String, nullable=False)
     s3_key = Column(String, nullable=False, unique=True)
     file_size = Column(Integer, nullable=True)      # bytes
+    display_order = Column(Integer, nullable=False, default=0, index=True)
     uploaded_by_id = Column(
         String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
     )
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
 
     organization = relationship("Organization")
+    owner_user = relationship("User", foreign_keys=[owner_user_id])
     uploaded_by = relationship("User", foreign_keys=[uploaded_by_id])
 
 

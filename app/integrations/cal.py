@@ -1,8 +1,8 @@
-import os
 from datetime import datetime, timedelta, timezone
 import requests
 from app.core.logging_config import logger
 from app.core.config import settings
+from app.db import models
 
 CAL_API_KEY = settings.CAL_API_KEY
 CAL_EVENT_TYPE_ID = settings.CAL_EVENT_TYPE_ID
@@ -99,18 +99,38 @@ class CalProvider:
         if is_expired:
             logger.info(f"[CAL] Access token for user {user.email} is expired. Refreshing...")
             try:
+                # Cal.com refresh tokens are single-use/rotating. Lock the row and pull
+                # the latest state first — a concurrent worker (e.g. the proactive
+                # token_refresh_worker, or another task for the same user) may have
+                # already consumed and rotated this refresh token. Refreshing again
+                # with the stale value would 400 and wipe the (now-valid) credentials.
+                user = (
+                    db.query(models.User)
+                    .filter(models.User.id == user.id)
+                    .populate_existing()
+                    .with_for_update()
+                    .first()
+                )
+                still_expired = (
+                    user.cal_token_expires_at is None or
+                    user.cal_token_expires_at <= datetime.now() + timedelta(seconds=120)
+                )
+                if not still_expired:
+                    logger.info(f"[CAL] Token for {user.email} was already refreshed by another process. Reusing it.")
+                    return decrypt_token(user.cal_access_token)
+
                 decrypted_refresh = decrypt_token(user.cal_refresh_token)
                 tokens = CalAuthService.refresh_access_token(decrypted_refresh)
-                
+
                 user.cal_access_token = encrypt_token(tokens["access_token"])
                 user.cal_refresh_token = encrypt_token(tokens["refresh_token"])
-                
+
                 if tokens.get("expires_at"):
                     import dateutil.parser
                     user.cal_token_expires_at = dateutil.parser.parse(tokens["expires_at"]).replace(tzinfo=None)
                 else:
                     user.cal_token_expires_at = datetime.now() + timedelta(seconds=1800)
-                    
+
                 db.flush()
                 logger.info(f"[CAL] Access token successfully refreshed for user {user.email}")
             except Exception as e:
@@ -149,7 +169,7 @@ class CalProvider:
 
         event_type_id = (user.cal_event_type_id if user else None) or CAL_EVENT_TYPE_ID
         if not event_type_id:
-            logger.warning(f"[CAL] User has no configured event type and no global CAL_EVENT_TYPE_ID fallback configured.")
+            logger.warning("[CAL] User has no configured event type and no global CAL_EVENT_TYPE_ID fallback configured.")
             return None
 
         timezone_str = (user.cal_timezone if user else None) or CAL_TIMEZONE or "UTC"
@@ -194,7 +214,7 @@ class CalProvider:
 
         event_type_id = (user.cal_event_type_id if user else None) or CAL_EVENT_TYPE_ID
         if not event_type_id:
-            logger.warning(f"[CAL] User has no configured event type and no global CAL_EVENT_TYPE_ID fallback configured.")
+            logger.warning("[CAL] User has no configured event type and no global CAL_EVENT_TYPE_ID fallback configured.")
             return []
 
         timezone_str = (user.cal_timezone if user else None) or CAL_TIMEZONE or "UTC"

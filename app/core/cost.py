@@ -16,7 +16,6 @@ Per-agent-per-company granularity:
   Every metered call writes into two Redis hashes keyed by campaign:
     llm:r:usd:{campaign_id}  → hash  field="{domain}|{agent}"  value=float
     llm:r:tok:{campaign_id}  → hash  field="{domain}|{agent}"  value=int
-  These are read by `get_cost_report(campaign_id)` and exposed via the admin API.
 
 `agent_label_var` and `company_domain_var` (both in logging_config) are set by
 each agent before its LLM call. The sentinel "—" is used when either is absent
@@ -240,88 +239,3 @@ class CostGuard(BaseCallbackHandler):
 
 # Shared singleton attached to every get_chat_llm instance.
 cost_guard = CostGuard()
-
-
-# --------------------------------------------------------------------------- #
-# Report builder                                                               #
-# --------------------------------------------------------------------------- #
-
-def get_cost_report(campaign_id: str) -> dict:
-    """Read per-agent-per-company cost hashes from Redis and return a structured report.
-
-    Returns a dict with:
-      companies: list of per-company breakdowns (sorted by total cost desc)
-      agents:    list of per-agent totals across the campaign
-      campaign:  overall totals
-      missing:   True when Redis data is unavailable
-    """
-    r = _redis()
-    if not r:
-        return {"missing": True, "reason": "Redis unavailable"}
-
-    try:
-        usd_hash = r.hgetall(f"llm:r:usd:{campaign_id}") or {}
-        tok_hash = r.hgetall(f"llm:r:tok:{campaign_id}") or {}
-    except Exception as e:
-        return {"missing": True, "reason": str(e)}
-
-    if not usd_hash:
-        return {"missing": False, "companies": [], "agents": [], "campaign": {"usd": 0.0, "tokens": 0}}
-
-    # Decode Redis byte strings if necessary.
-    def _dec(v):
-        return v.decode() if isinstance(v, bytes) else str(v)
-
-    rows: list[dict] = []
-    for raw_field, raw_usd in usd_hash.items():
-        field = _dec(raw_field)
-        domain, agent = (field.split("|", 1) + ["—"])[:2]
-        usd    = float(_dec(raw_usd) or 0)
-        tokens = int(_dec(tok_hash.get(raw_field, b"0") or b"0"))
-        rows.append({"domain": domain, "agent": agent, "usd": usd, "tokens": tokens})
-
-    # ---- per-company view ----
-    from collections import defaultdict
-    by_company: dict[str, dict] = defaultdict(lambda: {"domain": "", "agents": {}, "usd": 0.0, "tokens": 0})
-    for row in rows:
-        dom = row["domain"]
-        ag  = row["agent"]
-        by_company[dom]["domain"] = dom
-        by_company[dom]["agents"][ag] = {
-            "usd":    round(row["usd"], 6),
-            "tokens": row["tokens"],
-        }
-        by_company[dom]["usd"]    += row["usd"]
-        by_company[dom]["tokens"] += row["tokens"]
-
-    companies = sorted(
-        [{"domain": v["domain"], "usd": round(v["usd"], 6), "tokens": v["tokens"], "agents": v["agents"]}
-         for v in by_company.values()],
-        key=lambda x: x["usd"],
-        reverse=True,
-    )
-
-    # ---- per-agent view ----
-    by_agent: dict[str, dict] = defaultdict(lambda: {"agent": "", "usd": 0.0, "tokens": 0})
-    for row in rows:
-        ag = row["agent"]
-        by_agent[ag]["agent"]   = ag
-        by_agent[ag]["usd"]    += row["usd"]
-        by_agent[ag]["tokens"] += row["tokens"]
-
-    agents = sorted(
-        [{"agent": v["agent"], "usd": round(v["usd"], 6), "tokens": v["tokens"]}
-         for v in by_agent.values()],
-        key=lambda x: x["usd"],
-        reverse=True,
-    )
-
-    total_usd    = round(sum(r["usd"]    for r in rows), 6)
-    total_tokens = sum(r["tokens"] for r in rows)
-
-    return {
-        "missing":   False,
-        "campaign":  {"usd": total_usd, "tokens": total_tokens},
-        "companies": companies,
-        "agents":    agents,
-    }

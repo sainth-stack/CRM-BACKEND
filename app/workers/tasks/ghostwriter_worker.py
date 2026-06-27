@@ -424,8 +424,8 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, 
                         )
                     else:
                         dm.scheduling_note = (
-                            f"[ACTION REQUIRED] Booking failed and no alternative slots could be fetched from Cal.com. "
-                            f"Prospect is requesting a call - please check your Cal.com calendar and coordinate manually."
+                            "[ACTION REQUIRED] Booking failed and no alternative slots could be fetched from Cal.com. "
+                            "Prospect is requesting a call - please check your Cal.com calendar and coordinate manually."
                         )
                     logger.info(f"[DISCOVERY] Coordination draft flagged REQUIRES_REVIEW for {dm.name}")
                 
@@ -459,11 +459,12 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, 
                     db.commit()
                 else:
                     db.flush()
-                logger.info(f"[FOLLOW-UP] Persistence triggered for {dm.name} | Index: {dm.followup_count} | Mode: {'ManualCoord' if manual_scheduling else 'Nudge'}")
+                logger.info(f"[FOLLOW-UP] Persistence triggered for {dm.name} | Index: {draft_index} | Mode: {'ManualCoord' if manual_scheduling else 'Nudge'}")
             except IntegrityError:
                 if db_ctx:
                     db.rollback()
-                logger.info(f"[IDEMPOTENCY] Benign Collision: Follow-up {dm.followup_count} for DM {dm.id} already exists.")
+                # dm is expired after rollback; use the captured dm_id/draft_index, not the ORM object.
+                logger.info(f"[IDEMPOTENCY] Benign Collision: Follow-up {draft_index} for DM {dm_id} already exists.")
     finally:
         if db_ctx:
             db_ctx.__exit__(None, None, None)

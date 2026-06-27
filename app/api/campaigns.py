@@ -16,7 +16,6 @@ from app.core.logging_config import setup_logging
 from app.core.sanitizer import sanitize_text
 from app.core.config import settings
 from app.services.input_validation_service import input_validation_service
-from app.services.csv_service import CSVProcessingService
 from app.workers.tasks.intel_worker import process_csv_worker
 
 logger = setup_logging()
@@ -184,6 +183,9 @@ def create_campaign(
         # F2: stream-trim straight from the upload handle. pandas reads only
         # MAX_CSV_ROWS and stops — the whole file is never pulled into RAM (no
         # file.file.read(), no BytesIO copy). Bounds ingestion memory + latency.
+        # Lazy import: pandas costs ~3s to import, so keep it off the API's
+        # startup path — only pay it on a request that actually uploads a CSV.
+        from app.services.csv_service import CSVProcessingService
         csv_svc = CSVProcessingService()
         # xlsx/xls inputs are converted to CSV bytes RIGHT HERE so every line of the
         # downstream pipeline (trim -> parse -> persist) treats the upload as CSV with
@@ -486,6 +488,10 @@ def get_campaign(
             models.ProspectState.WAITING_FOR_REPLY,
             models.ProspectState.REMINDER_1_SENT,
             models.ProspectState.REMINDER_2_SENT,
+            models.ProspectState.REMINDER_3_SENT,
+            models.ProspectState.REMINDER_4_SENT,
+            models.ProspectState.REMINDER_5_SENT,
+            models.ProspectState.REMINDER_6_SENT,
             models.ProspectState.FOLLOWUP_ACTIVE,
         ]:
             timeline.append({"step": "Waiting for Reply", "status": "active"})
@@ -673,14 +679,12 @@ def dispatch_all_drafts(
     Skips drafts that are already queued, in-progress, or already sent.
     Returns a count summary so the frontend can display results.
     """
-    import pytz
     from app.core.scheduler import (
         resolve_prospect_timezone,
         calculate_next_send_slot,
         format_scheduled_display,
     )
     from app.services.draft_dispatch import queue_draft_dispatch
-    from app.workers.tasks.outbound_worker import send_draft_worker
 
     campaign = db.query(models.Campaign).filter(
         models.Campaign.id == campaign_id,

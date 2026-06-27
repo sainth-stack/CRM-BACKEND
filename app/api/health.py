@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Depends, HTTPException
-from starlette.requests import Request
 from sqlalchemy.orm import Session
 import os
 

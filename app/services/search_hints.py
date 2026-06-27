@@ -12,7 +12,6 @@ sender's actual pain vocabulary instead of any fixed industry terms.
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 # Words too generic to be useful search modifiers.
 _STOP = {

@@ -52,8 +52,6 @@ def sweep_stuck_campaigns_task():
 
             logger.info(f"[SWEEPER] Found {count} stalled campaigns with expired leases; re-queuing.")
 
-            from app.workers.tasks.intel_worker import process_csv_worker
-
             for campaign in stuck_campaigns:
                 owner = campaign.owner
                 if owner and owner.is_demo and owner.demo_expires_at:

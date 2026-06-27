@@ -57,12 +57,12 @@ def _apply_sent_draft_effects(
         dm.last_message_id = message_id
         dm.thread_id = thread_id or dm.thread_id
         dm.last_sent_at = sent_at
-        dm.reminder_count = 0
         dm.termination_reason = None
         dm.retry_after = None
 
         draft_type = getattr(db_draft, "draft_type", "INITIAL")
         if draft_type == "DISCOVERY":
+            dm.reminder_count = 0
             transition_prospect(
                 db,
                 dm,
@@ -72,9 +72,10 @@ def _apply_sent_draft_effects(
                 actor="user",
                 metadata={"draft_type": draft_type, "draft_id": db_draft.id, "message_id": message_id},
             )
-            dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
+            dm.next_action_at = dm.last_sent_at + datetime.timedelta(minutes=settings.NUDGE_FOLLOWUP_DELAY_MINUTES)
             arm_company_hold_window(db, dm, sent_at=sent_at)
         elif draft_type == "INITIAL":
+            dm.reminder_count = 0
             transition_prospect(
                 db,
                 dm,
@@ -84,8 +85,18 @@ def _apply_sent_draft_effects(
                 actor="user",
                 metadata={"draft_type": draft_type, "draft_id": db_draft.id, "message_id": message_id},
             )
-            dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
+            dm.next_action_at = dm.last_sent_at + datetime.timedelta(minutes=settings.NUDGE_FOLLOWUP_DELAY_MINUTES)
+        elif draft_type == "REMINDER":
+            from app.services.reminder_sequence import mark_reminder_sent_effects
+            mark_reminder_sent_effects(
+                db,
+                db_draft,
+                dm,
+                message_id=message_id,
+                sent_at=sent_at,
+            )
         else:
+            dm.reminder_count = 0
             idx = db_draft.followup_index
             dm.followup_count = idx
             transition_prospect(
@@ -97,7 +108,7 @@ def _apply_sent_draft_effects(
                 actor="user",
                 metadata={"draft_type": draft_type, "draft_id": db_draft.id, "message_id": message_id, "followup_index": idx},
             )
-            dm.next_action_at = dm.last_sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
+            dm.next_action_at = dm.last_sent_at + datetime.timedelta(minutes=settings.NUDGE_FOLLOWUP_DELAY_MINUTES)
 
     db_draft.status = "SENT"
     db_draft.message_id = message_id

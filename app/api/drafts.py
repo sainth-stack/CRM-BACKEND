@@ -4,7 +4,6 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import datetime
 from datetime import UTC
-import pytz
 
 from app.db.database import get_db
 from app.db import models
@@ -17,7 +16,6 @@ from app.core.scheduler import (
     format_scheduled_display,
 )
 from app.services.draft_dispatch import queue_draft_dispatch, execute_draft_send
-from app.workers.tasks.outbound_worker import send_draft_worker
 
 logger = setup_logging()
 router = APIRouter()

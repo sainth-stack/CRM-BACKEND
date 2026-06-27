@@ -62,6 +62,11 @@ def get_prospect_details(
 _DISPATCHABLE_STATES = {
     models.ProspectState.INITIAL_SENT,
     models.ProspectState.REMINDER_1_SENT,
+    models.ProspectState.REMINDER_2_SENT,
+    models.ProspectState.REMINDER_3_SENT,
+    models.ProspectState.REMINDER_4_SENT,
+    models.ProspectState.REMINDER_5_SENT,
+    models.ProspectState.REMINDER_6_SENT,
     models.ProspectState.FOLLOWUP_ACTIVE,
     models.ProspectState.WAITING_FOR_REPLY,
 }
@@ -82,6 +87,10 @@ def manual_dispatch_nudge(
     """
     # Deferred import to avoid circular startup import from Celery worker tree
     from app.workers.tasks.orchestrator_worker import _deploy_nudge, _nudge_dispatch_key
+    from app.services.reminder_sequence import (
+        MAX_SILENCE_REMINDERS,
+        create_next_reminder_draft_for_review,
+    )
 
     # Auth + IDOR guard — load with all relations the nudge generator needs
     dm = (
@@ -109,7 +118,7 @@ def manual_dispatch_nudge(
             status_code=409,
             detail=(
                 f"Prospect is in state '{state.value}' — manual dispatch is only "
-                "available for INITIAL_SENT, REMINDER_1_SENT, FOLLOWUP_ACTIVE, "
+                "available for INITIAL_SENT, REMINDER_*_SENT, FOLLOWUP_ACTIVE, "
                 "and WAITING_FOR_REPLY prospects."
             ),
         )
@@ -118,22 +127,29 @@ def manual_dispatch_nudge(
     is_discovery = state == models.ProspectState.WAITING_FOR_REPLY
     reminder_number = dm.reminder_count + 1
 
-    if not is_discovery and dm.reminder_count >= 2:
+    if not is_discovery and dm.reminder_count >= MAX_SILENCE_REMINDERS:
         raise HTTPException(
             status_code=409,
-            detail="Maximum reminders (2) already sent for this prospect.",
+            detail=f"Maximum reminders ({MAX_SILENCE_REMINDERS}) already sent for this prospect.",
         )
 
-    if is_discovery:
-        next_state = models.ProspectState.WAITING_FOR_REPLY
-        expire_after_send = reminder_number >= 2
-    else:
-        next_state = (
-            models.ProspectState.REMINDER_1_SENT
-            if reminder_number == 1
-            else models.ProspectState.REMINDER_2_SENT
-        )
-        expire_after_send = False
+    if not is_discovery:
+        result = create_next_reminder_draft_for_review(db, dm, actor="user")
+        if result["status"] == "exhausted":
+            raise HTTPException(status_code=409, detail="No sendable reminder remains for this prospect.")
+        db.commit()
+        draft = result.get("draft")
+        return {
+            "message": "drafted" if result["status"] == "drafted" else "already_drafted",
+            "draft_id": draft.id if draft else None,
+            "reminder_number": result.get("reminder_number"),
+            "skipped": result.get("skipped", []),
+        }
+
+    # Only the discovery path reaches here — the silence-reminder ladder
+    # above always returns before this point.
+    next_state = models.ProspectState.WAITING_FOR_REPLY
+    expire_after_send = reminder_number >= 2
 
     # Idempotency guard — if already queued or in-flight, return existing slot
     dispatch_key = _nudge_dispatch_key(dm_id, reminder_number, is_discovery)

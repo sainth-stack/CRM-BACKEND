@@ -4,7 +4,7 @@ from datetime import UTC
 from sqlalchemy.orm import Session
 from app.db import models
 from app.core.logging_config import logger
-from typing import Callable, Any, Optional
+from typing import Callable, Any
 from app.db.database import SessionLocal
 
 

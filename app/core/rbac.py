@@ -13,7 +13,7 @@ Two layers of authorization:
 
 `super_admin` implicitly holds every permission.
 """
-from typing import List, Optional, Callable
+from typing import List, Callable
 from fastapi import Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 

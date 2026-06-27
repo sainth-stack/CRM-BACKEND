@@ -1,5 +1,5 @@
 """
-Background workers: inbox polling, orchestrator nudges, and meeting reminders.
+Background workers: inbox polling and prospect-reply matching.
 """
 
 import datetime
@@ -7,27 +7,16 @@ import re
 from datetime import UTC
 
 from sqlalchemy import or_
-from sqlalchemy.orm import joinedload
 
 from app.services.inbox_service import inbox_service
-from app.core.email_service import email_service
 from app.core.logging_config import logger
 from app.core.security import acquire_lock, release_lock
 from app.core.token_service import TokenService
 from app.db import models
 from app.workers.utils import db_session
-from app.integrations.cal import cal_provider
 from app.integrations.gmail import GmailProvider
 from app.workers.config.celery_app import celery_app
-from app.workers.lifecycle import (
-    hold_company_siblings,
-    reactivate_due_prospects,
-    restore_held_company_siblings,
-    terminate_company_siblings,
-    terminate_prospect,
-    transition_prospect,
-    utcnow_naive,
-)
+from app.workers.lifecycle import utcnow_naive
 
 from app.core.config import settings
 

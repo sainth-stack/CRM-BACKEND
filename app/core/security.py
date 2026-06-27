@@ -1,16 +1,15 @@
 import hashlib
-import os
 import jwt
 import socket
 import ipaddress
 import urllib.parse
 from datetime import datetime, timedelta, UTC
-from typing import Optional, Dict, Any
+from typing import Optional
 # Force a global 15-second socket timeout so a slow external API call can't
 # hang worker threads indefinitely.
 socket.setdefaulttimeout(15)
 from cryptography.fernet import Fernet
-from fastapi import HTTPException, status, Depends, Request
+from fastapi import HTTPException, status, Depends
 from fastapi.security import OAuth2PasswordBearer
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
@@ -37,7 +36,7 @@ def validate_url_for_ssrf(url: str) -> tuple[str, str]:
         # Phase 1: Direct IP Check & DNS Resolution Audit (Dual-Stack)
         try:
             # Check if hostname is already a valid IP
-            ip_obj = ipaddress.ip_address(hostname)
+            ipaddress.ip_address(hostname)
             resolved_ips = [hostname]
         except ValueError:
             # Resolve hostname to all available IPs (IPv4 & IPv6)

@@ -192,7 +192,6 @@ def clean_email_body(body: str) -> str:
     
     signature_block = ""
     if match:
-        full_match = match.group(0)
         body = body[:match.start()]
         sign_off = match.group(1)
         sig_lines = match.group(2).strip()
@@ -481,6 +480,78 @@ def draft_reminder_escalation_email(
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Reminder escalation drafting failure: {e}")
         return f"Hi {dm_name}, I wanted to follow up on my previous message.\n\nBest regards,\n\n{user_name}\n{ui.get('company_name', '')}"
+
+
+def _first_name(name: str | None) -> str:
+    parts = (name or "").strip().split()
+    return parts[0] if parts else "there"
+
+
+def _first_text(items) -> str | None:
+    if not items:
+        return None
+    if isinstance(items, str):
+        return items.strip() or None
+    if isinstance(items, dict):
+        for key in ("text", "summary", "pain", "hook", "name", "title"):
+            value = items.get(key)
+            if value:
+                return str(value).strip()
+        return None
+    if isinstance(items, (list, tuple)):
+        for item in items:
+            value = _first_text(item)
+            if value:
+                return value
+    return str(items).strip() or None
+
+
+def draft_asset_link_email(
+    *,
+    asset,
+    asset_url: str,
+    dm_name: str,
+    target_company_name: str,
+    sender_name: str,
+    user_company_name: str,
+    content_kind: str,
+    pain_hint=None,
+) -> dict:
+    """Create a deterministic reminder draft that links to an org asset."""
+    greeting = f"Hi {_first_name(dm_name)},"
+    company = user_company_name or "our team"
+    sender = sender_name or "Account Manager"
+    target = target_company_name or "your team"
+    filename = getattr(asset, "filename", "") or "this PDF"
+    hint = _first_text(pain_hint)
+
+    if content_kind == "brochure":
+        subject = f"{company} overview"
+        body = (
+            f"{greeting}\n\n"
+            f"Sharing a short overview of {company} in case it is useful context for {target}.\n\n"
+            f"You can view the brochure here: {asset_url}\n\n"
+            "Best regards,\n\n"
+            f"{sender}\n"
+            f"{company}"
+        )
+    else:
+        subject = "Relevant use case"
+        context = (
+            f"Given the work around {hint},"
+            if hint
+            else "Given the themes we were looking at,"
+        )
+        body = (
+            f"{greeting}\n\n"
+            f"{context} this use case may be a helpful reference for {target}.\n\n"
+            f"Here is the PDF: {asset_url}\n\n"
+            "Best regards,\n\n"
+            f"{sender}\n"
+            f"{company}"
+        )
+
+    return {"subject": subject, "body": clean_email_body(body), "asset_filename": filename}
 
 def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, target_company: str, last_interest: str, booked_link: str = None, user_real_name: str = "Account Manager"):
     """

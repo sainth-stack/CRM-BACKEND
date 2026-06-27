@@ -6,12 +6,9 @@ from app.db import models
 from sqlalchemy.orm import Session
 from app.workers.config.celery_app import celery_app
 from app.core.logging_config import logger
-from app.workers.utils import with_short_lived_db_session, execute_with_db_session, db_session
+from app.workers.utils import with_short_lived_db_session, db_session
 import json
-import datetime
-from datetime import UTC
 import asyncio
-from app.core.security import acquire_lock, release_lock
 
 
 @celery_app.task(name="app.workers.tasks.intel_worker.process_csv_worker", bind=True, max_retries=3, default_retry_delay=60)
@@ -23,7 +20,6 @@ def process_csv_worker(self, db: Session, campaign_id: str):
     """
     from app.services.campaign_service import campaign_service
     from app.core.security import acquire_lock, release_lock
-    import os
 
     lock_key = f"campaign_csv:{campaign_id}"
     if not acquire_lock(lock_key, ttl=600):

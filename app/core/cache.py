@@ -15,7 +15,6 @@ a harmless rebuild, never staleness.
 """
 from __future__ import annotations
 
-from app.core.logging_config import logger
 from app.core.security import _get_redis
 
 # Detail payload TTL — safety net behind generation invalidation. Also the de-facto

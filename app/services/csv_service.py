@@ -1,7 +1,6 @@
 import pandas as pd
 import io
 import re
-from urllib.parse import urlparse
 from sqlalchemy.orm import Session
 import logging
 
@@ -96,7 +95,7 @@ def get_fuzzy_map(cols):
     for i in range(1, 11):
         # Special case: The first mobile phone often has no number '1' in the base header
         if i == 1:
-            patterns[f'contact_mobile_phone_{i}'] = fr'contact\s*mobile\s*phone$'
+            patterns[f'contact_mobile_phone_{i}'] = r'contact\s*mobile\s*phone$'
         else:
             patterns[f'contact_mobile_phone_{i}'] = fr'contact\s*mobile\s*phone\s*{i}$'
             
@@ -134,14 +133,12 @@ class CSVProcessingService:
         # 1. Detect Encoding and Load in Chunks
         encodings = ['utf-8', 'latin-1', 'utf-8-sig', 'cp1252', 'iso-8859-1']
         chunks_generator = None
-        detected_enc = None
-        
+
         # Try all encodings
         for enc in encodings:
             try:
                 # Initialize a chunked text reader (chunksize=100)
                 chunks_generator = pd.read_csv(io.BytesIO(content), on_bad_lines='skip', chunksize=100, encoding=enc)
-                detected_enc = enc
                 logger.info(f"Successfully configured chunked reader with {enc} encoding.")
                 break
             except Exception as e:

@@ -2,8 +2,6 @@ from app.db import models
 from app.workers.config.celery_app import celery_app
 from app.workers.utils import acquire_lease, release_lease, db_session
 from app.core.logging_config import logger
-import datetime
-from datetime import UTC
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def find_companies_worker(self, campaign_id: str):

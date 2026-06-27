@@ -1,6 +1,4 @@
-import os
 import json
-import time
 from datetime import datetime, UTC, timedelta
 from sqlalchemy.orm import Session
 from google.oauth2.credentials import Credentials
@@ -8,7 +6,6 @@ from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from app.db import models
 from app.core.security import decrypt_token, encrypt_token
-from app.core.auth import GoogleAuthService
 from app.core.logging_config import logger
 from app.core.config import settings
 import requests

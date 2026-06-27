@@ -3,10 +3,9 @@ from fastapi import APIRouter, Depends, HTTPException, status, Body, Request, Qu
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import aliased
 from typing import Dict, Any
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 import datetime
 from datetime import UTC, timedelta
-import random
 from app.db import models
 from app.db.database import get_db
 from app.core.security import (
@@ -23,9 +22,8 @@ from app.core.security import (
 )
 from app.core.token_service import TokenService
 from app.core.email_service import email_service
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 from app.core.logging_config import logger
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -496,7 +494,6 @@ def logout(request: Request, payload: RefreshRequest, db: Session = Depends(get_
 @router.get("/me")
 def get_me(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return the authenticated user's profile, role, permissions and trial status."""
-    from app.core.config import settings
     oauth_account = db.query(models.OAuthAccount).filter(models.OAuthAccount.user_id == current_user.id).first()
     has_mailbox = oauth_account is not None
     has_calendar = current_user.cal_refresh_token is not None

@@ -4,14 +4,11 @@ Periodically refreshes OAuth tokens before expiration to ensure seamless
 Gmail and Calendar integrations without manual user intervention.
 """
 
-import datetime
-from sqlalchemy.orm import Session
 from app.workers.config.celery_app import celery_app
 from app.db.database import SessionLocal
 from app.db import models
 from app.core.token_service import TokenService
 from app.core.logging_config import logger
-from celery import current_task
 
 
 @celery_app.task(bind=True, max_retries=2)

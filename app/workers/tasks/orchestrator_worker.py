@@ -1,39 +1,29 @@
 """
-Background workers: inbox polling, orchestrator nudges, and meeting reminders.
+Background workers: lifecycle inactivity audit and reminder/nudge dispatch.
 """
 
 import datetime
-import re
-from datetime import UTC
 
-from sqlalchemy import or_
 from sqlalchemy.orm import joinedload
 
-from app.services.inbox_service import inbox_service
 from app.core.email_service import email_service
 from app.core.logging_config import logger
 from app.core.security import acquire_lock, release_lock
 from app.core.token_service import TokenService
-from app.core.scheduler import resolve_prospect_timezone, calculate_next_send_slot, format_scheduled_display
+from app.core.scheduler import resolve_prospect_timezone, calculate_next_send_slot
 from app.db import models
 from app.workers.utils import db_session
-from app.integrations.cal import cal_provider
-from app.integrations.gmail import GmailProvider
 from app.workers.config.celery_app import celery_app
 import pytz
 from app.workers.lifecycle import (
-    hold_company_siblings,
     reactivate_due_prospects,
     restore_held_company_siblings,
-    terminate_company_siblings,
     terminate_prospect,
     transition_prospect,
     utcnow_naive,
 )
 
 from app.core.config import settings
-
-EMAIL_PATTERN = re.compile(r"[\w\.-]+@[\w\.-]+")
 
 
 def _lock_query(query, *, skip_locked: bool = False):
@@ -139,22 +129,30 @@ def _audit_single_prospect(db, candidate_id: str, now: datetime.datetime) -> Non
 
         from app.workers.tasks.ghostwriter_worker import draft_followup_worker
 
+        from app.services.reminder_sequence import (
+            INACTIVITY_STATES,
+            MAX_SILENCE_REMINDERS,
+            create_next_reminder_draft_for_review,
+        )
+
         state = dm.state
-        if state in [
-            models.ProspectState.INITIAL_SENT,
-            models.ProspectState.FOLLOWUP_ACTIVE,
-            models.ProspectState.REMINDER_1_SENT,
-            models.ProspectState.REMINDER_2_SENT,
-        ]:
-            if dm.reminder_count < 2:
-                reminder_number = dm.reminder_count + 1
-                new_state = (
-                    models.ProspectState.REMINDER_1_SENT
-                    if reminder_number == 1
-                    else models.ProspectState.REMINDER_2_SENT
-                )
-                logger.info(f"[ORCHESTRATOR] Inactivity detected for {dm.name}. Deploying Reminder #{reminder_number}")
-                _deploy_nudge(db, dm, new_state, reminder_number=reminder_number)
+        if state in INACTIVITY_STATES:
+            if dm.reminder_count < MAX_SILENCE_REMINDERS:
+                result = create_next_reminder_draft_for_review(db, dm, actor="orchestrator")
+                if result["status"] == "exhausted":
+                    logger.info(f"[ORCHESTRATOR] Reminder ladder exhausted for {dm.name}. Terminating mission.")
+                    terminate_prospect(
+                        db, dm,
+                        models.ProspectTerminationReason.NO_RESPONSE,
+                        retryable=True, now=now, actor="orchestrator",
+                    )
+                else:
+                    logger.info(
+                        "[ORCHESTRATOR] Inactivity detected for %s. Reminder #%s drafted for human review (%s).",
+                        dm.name,
+                        result.get("reminder_number"),
+                        result["status"],
+                    )
             else:
                 logger.info(f"[ORCHESTRATOR] Maximum silence reached for {dm.name}. Terminating mission.")
                 terminate_prospect(
@@ -311,9 +309,9 @@ def _apply_nudge_effects(
             if dm.target_company and dm.target_company.status != "MEETING_BOOKED":
                 dm.target_company.status = "ACTIVE"
         else:
-            dm.next_action_at = sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
+            dm.next_action_at = sent_at + datetime.timedelta(minutes=settings.NUDGE_FOLLOWUP_DELAY_MINUTES)
     else:
-        dm.next_action_at = sent_at + datetime.timedelta(days=settings.NUDGE_FOLLOWUP_DELAY_DAYS)
+        dm.next_action_at = sent_at + datetime.timedelta(minutes=settings.NUDGE_FOLLOWUP_DELAY_MINUTES)
 
 
 def _recover_nudge_persistence(
@@ -527,8 +525,6 @@ def send_scheduled_nudge_worker(
     user_id: str,
 ):
     """Fires at the scheduled eta to send a nudge/reminder and apply all lifecycle effects."""
-    from sqlalchemy.orm import joinedload
-
     with db_session() as db:
         dm = (
             _lock_query(

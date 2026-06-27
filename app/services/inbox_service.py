@@ -3,7 +3,6 @@ import datetime
 from datetime import UTC
 from sqlalchemy.orm import Session
 from app.db import models
-from app.core.logging_config import logger
 from app.agents.intent_classifier import classify_reply_intent, extract_schedule_info
 
 # Matches the standard "On <date>, <name> <email> wrote:" quoted-thread delimiter.

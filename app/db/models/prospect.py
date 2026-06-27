@@ -14,6 +14,10 @@ class ProspectState(enum.Enum):
     DISCOVERY_EXPIRED = "DISCOVERY_EXPIRED"
     REMINDER_1_SENT = "REMINDER_1_SENT"
     REMINDER_2_SENT = "REMINDER_2_SENT"
+    REMINDER_3_SENT = "REMINDER_3_SENT"
+    REMINDER_4_SENT = "REMINDER_4_SENT"
+    REMINDER_5_SENT = "REMINDER_5_SENT"
+    REMINDER_6_SENT = "REMINDER_6_SENT"
     FOLLOWUP_ACTIVE = "FOLLOWUP_ACTIVE"
     POSITIVE = "POSITIVE"
     NEGATIVE = "NEGATIVE"
@@ -107,7 +111,7 @@ class DecisionMaker(Base):
     next_action_at = Column(DateTime, nullable=True, index=True) # Key for Orchestrator dispatch
     retry_after = Column(DateTime, nullable=True, index=True) # For 3-month reactivation
     
-    reminder_count = Column(Integer, default=0) # 0-2
+    reminder_count = Column(Integer, default=0) # 0-6
     followup_count = Column(Integer, default=0) # 0-11
     intent_last = Column(String, nullable=True)
 

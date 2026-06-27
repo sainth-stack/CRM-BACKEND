@@ -198,8 +198,8 @@ def run_openai_guarded(operation_name: str, action, fallback=None):
                         r.expire(f"llm_cost:{today}", 172800) # Keep day's cost for 48h
 
                         # Increment Prometheus/Telemetry aggregate counters
-                        r.incrby(f"llm_tokens_total", cb.total_tokens)
-                        r.incrbyfloat(f"llm_cost_total", cb.total_cost)
+                        r.incrby("llm_tokens_total", cb.total_tokens)
+                        r.incrbyfloat("llm_cost_total", cb.total_cost)
                     except Exception as metric_err:
                         logger.warning(f"Failed to update cost metrics: {metric_err}")
 

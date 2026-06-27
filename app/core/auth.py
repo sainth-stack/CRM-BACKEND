@@ -1,8 +1,7 @@
 import os
-import datetime
 from app.core.logging_config import logger
 import requests
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from fastapi import HTTPException, status
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
@@ -284,6 +283,11 @@ class CalAuthService:
                 },
                 timeout=15
             )
+            if not response.ok:
+                logger.error(
+                    f"[AUTH-CAL] Token exchange rejected by Cal.com: "
+                    f"status={response.status_code} body={response.text}"
+                )
             response.raise_for_status()
             body = response.json()
             # Cal.com v2 token response structure: {"status": "success", "data": {"accessToken": "...", "refreshToken": "...", "expiresAt": "..."}}
@@ -291,7 +295,7 @@ class CalAuthService:
             access_token = data.get("accessToken") or data.get("access_token")
             refresh_token = data.get("refreshToken") or data.get("refresh_token")
             expires_at = data.get("expiresAt") or data.get("expires_at")
-            
+
             return {
                 "access_token": access_token,
                 "refresh_token": refresh_token,
@@ -324,13 +328,18 @@ class CalAuthService:
                 },
                 timeout=15
             )
+            if not response.ok:
+                logger.error(
+                    f"[AUTH-CAL] Token refresh rejected by Cal.com: "
+                    f"status={response.status_code} body={response.text}"
+                )
             response.raise_for_status()
             body = response.json()
             data = body.get("data", body) if isinstance(body, dict) else {}
             access_token = data.get("accessToken") or data.get("access_token")
             new_refresh_token = data.get("refreshToken") or data.get("refresh_token") or refresh_token
             expires_at = data.get("expiresAt") or data.get("expires_at")
-            
+
             return {
                 "access_token": access_token,
                 "refresh_token": new_refresh_token,

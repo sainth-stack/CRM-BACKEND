@@ -9,7 +9,7 @@ import os
 
 from app.core.logging_config import setup_logging
 from app.core.limiter import limiter
-from app.workers import sweep_stuck_campaigns_task
+from app.workers.tasks.sweeper_worker import sweep_stuck_campaigns_task
 from app.api import auth, admin, export, campaigns, drafts, prospects, health, uploads
 
 # Initialize Enterprise Logging

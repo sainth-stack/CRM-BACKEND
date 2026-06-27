@@ -1,11 +1,8 @@
 import json
 import re
 import socket
-import datetime
 import concurrent.futures
-from typing import List, Set
 from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert
 from app.db import models
 from app.core.logging_config import logger
 from app.workers.utils import heartbeat_lease
@@ -15,7 +12,6 @@ from app.core.circuit_breaker import circuit_is_open, record_circuit_failure, Ci
 from app.core.llm_resilience import OPENAI_CIRCUIT
 from app.services.company_validation_service import CompanyValidationService
 from app.services.stakeholder_service import StakeholderRankingService
-from app.services.user_intel_service import UserIntelService
 from app.services.search_hints import derive_search_hints
 from app.db.database import SessionLocal
 

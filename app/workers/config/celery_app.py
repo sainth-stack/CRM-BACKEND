@@ -96,7 +96,7 @@ def handle_task_failure(sender=None, task_id=None, exception=None, args=None, kw
             payload = {
                 "attachments": [
                     {
-                        "title": f"🚨 Background task failure",
+                        "title": "🚨 Background task failure",
                         "text": error_msg,
                         "color": "#FF0000",
                         "mrkdwn_in": ["text"]
@@ -221,6 +221,10 @@ celery_app.conf.beat_schedule = {
     "sweep-stuck-campaigns": {
         "task": "app.workers.tasks.sweeper_worker.sweep_stuck_campaigns_task",
         "schedule": float(settings.SWEEP_STUCK_CAMPAIGNS_SECONDS),
+    },
+    "sweep-stranded-dispatches": {
+        "task": "app.workers.tasks.sweeper_worker.sweep_stranded_dispatches_task",
+        "schedule": float(settings.SWEEP_STRANDED_DISPATCHES_SECONDS),
     },
     "dispatch-due-drafts": {
         "task": "app.workers.tasks.outbound_worker.dispatch_due_drafts_task",

@@ -6,7 +6,7 @@ from app.core.resilience import retry_with_backoff
 logger = logging.getLogger(__name__)
 
 class DraftingService:
-    # Stateless: the actual LLMs live in the email sub-graph (app.agents.email_graph),
+    # Stateless: the actual LLMs live in the email sub-graph (app.agents.sequence_graph),
     # routed via app.core.llm. No per-instance client is needed.
 
     @retry_with_backoff(max_attempts=3, base_delay_sec=2.0, max_delay_sec=15.0)
@@ -72,7 +72,6 @@ class DraftingService:
             temp_db.close()
 
         # 2. Run the Strategist -> Writer -> Validate sub-graph.
-        from app.agents.email_graph import get_email_graph, MAX_ATTEMPTS
         from app.agents.email_drafter import clean_email_body
         from app.services.observability_service import ObservabilityService
 

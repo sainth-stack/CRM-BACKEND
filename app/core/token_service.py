@@ -1,8 +1,6 @@
-import json
 from datetime import datetime, UTC, timedelta
 from sqlalchemy.orm import Session
 from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from app.db import models
 from app.core.security import decrypt_token, encrypt_token
@@ -15,70 +13,123 @@ class TokenService:
     monitor replies on a user's behalf."""
     @staticmethod
     def get_google_credentials(db: Session, user_id: str) -> Credentials:
-        """Load a user's stored Google refresh token, decrypt it, rebuild a
-        Credentials object, and refresh the access token if it has expired."""
-        # 1. Look up the user's stored Google OAuth account.
+        """Load, proactively refresh if near-expiry, and return Google credentials.
+
+        Mirrors cal.py's get_valid_access_token() pattern:
+        - No fallback to any global token — each user must have their own OAuthAccount.
+        - Refreshes the access token synchronously when it is expired or within 120s of expiry.
+        - Uses a DB row lock to prevent concurrent refresh races (two tabs clicking send).
+        - If the refresh token is revoked, deletes the OAuthAccount and returns None so
+          the caller can surface a 'reconnect mailbox' error rather than a silent failure.
+        """
         oauth_acc = db.query(models.OAuthAccount).filter(
             models.OAuthAccount.user_id == user_id,
             models.OAuthAccount.provider == "google"
         ).first()
 
         if not oauth_acc:
-            if settings.GMAIL_TOKEN_JSON:
-                try:
-                    data = json.loads(settings.GMAIL_TOKEN_JSON)
-                    logger.info(f"[IDENTITY] No Google OAuthAccount for user {user_id}. Using global GMAIL_TOKEN_JSON fallback.")
-                    return Credentials.from_authorized_user_info(data)
-                except Exception as e:
-                    logger.error(f"[IDENTITY] Failed to load global GMAIL_TOKEN_JSON fallback: {e}")
-            logger.warning(f"[IDENTITY] No Google capability for user {user_id} and no global fallback configured.")
+            logger.warning(f"[GMAIL] No connected mailbox for user {user_id}.")
             return None
 
-         # 2. Decrypt the stored refresh token.
-        refresh_token = decrypt_token(oauth_acc.encrypted_refresh_token)
-        
-        # Load and decrypt access token if it exists
-        access_token = None
-        if oauth_acc.access_token:
-            try:
-                access_token = decrypt_token(oauth_acc.access_token)
-            except Exception:
-                pass
-
-        # 3. Reconstruct Credentials Object
-        creds = Credentials(
-            token=access_token,
-            refresh_token=refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=settings.GOOGLE_CLIENT_ID,
-            client_secret=settings.GOOGLE_CLIENT_SECRET,
-            expiry=oauth_acc.token_expiry,
-            scopes=[
-                "https://www.googleapis.com/auth/gmail.modify",
-            ]
+        now = datetime.now(UTC).replace(tzinfo=None)
+        is_expired = (
+            oauth_acc.token_expiry is None
+            or oauth_acc.token_expiry <= now + timedelta(seconds=120)
         )
-        
-        # 4. Auto-Refresh if Expired (using google-auth's built-in refresh)
+
+        if not is_expired:
+            # Access token is still valid — build and return credentials directly.
+            refresh_token = decrypt_token(oauth_acc.encrypted_refresh_token)
+            access_token = None
+            if oauth_acc.access_token:
+                try:
+                    access_token = decrypt_token(oauth_acc.access_token)
+                except Exception:
+                    pass
+            return Credentials(
+                token=access_token,
+                refresh_token=refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=settings.GOOGLE_CLIENT_ID,
+                client_secret=settings.GOOGLE_CLIENT_SECRET,
+                expiry=oauth_acc.token_expiry,
+                scopes=["https://www.googleapis.com/auth/gmail.modify"],
+            )
+
+        # Access token expired or expiring soon — acquire row lock then re-check
+        # (another concurrent caller may have already refreshed it).
+        bind = db.get_bind()
+        if bind is not None and bind.dialect.name != "sqlite":
+            oauth_acc = (
+                db.query(models.OAuthAccount)
+                .filter(
+                    models.OAuthAccount.user_id == user_id,
+                    models.OAuthAccount.provider == "google",
+                )
+                .with_for_update()
+                .first()
+            )
+            if not oauth_acc:
+                return None
+
+            still_expired = (
+                oauth_acc.token_expiry is None
+                or oauth_acc.token_expiry <= datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=120)
+            )
+            if not still_expired:
+                logger.info(f"[GMAIL] Token for user {user_id} already refreshed by another process. Reusing.")
+                refresh_token = decrypt_token(oauth_acc.encrypted_refresh_token)
+                access_token = decrypt_token(oauth_acc.access_token) if oauth_acc.access_token else None
+                return Credentials(
+                    token=access_token,
+                    refresh_token=refresh_token,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=settings.GOOGLE_CLIENT_ID,
+                    client_secret=settings.GOOGLE_CLIENT_SECRET,
+                    expiry=oauth_acc.token_expiry,
+                    scopes=["https://www.googleapis.com/auth/gmail.modify"],
+                )
+
+        logger.info(f"[GMAIL] Access token expired for user {user_id}. Refreshing via Google...")
         try:
-            request = Request()
-            if creds.expired:
-                logger.info(f"[TOKEN-REFRESH] Auto-refreshing expired Google token for user {user_id}")
-                creds.refresh(request)
-                
-                # Update stored token in DB if refresh was successful
-                if creds.token:
-                    oauth_acc.access_token = encrypt_token(creds.token)
-                    expiry_dt = creds.expiry
-                    if expiry_dt:
-                        if expiry_dt.tzinfo is not None:
-                            expiry_dt = expiry_dt.astimezone(UTC).replace(tzinfo=None)
-                    else:
-                        expiry_dt = datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=3600)
-                    oauth_acc.token_expiry = expiry_dt
-                    db.commit()
-                    logger.info(f"[TOKEN-REFRESH] Successfully refreshed token for user {user_id}")
+            refresh_token = decrypt_token(oauth_acc.encrypted_refresh_token)
+            response = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": settings.GOOGLE_CLIENT_ID,
+                    "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                },
+                timeout=10,
+            )
+            if not response.ok:
+                raise RefreshError(f"Google token refresh rejected: {response.status_code} {response.text}")
+
+            token_data = response.json()
+            new_access_token = token_data["access_token"]
+            expires_in = token_data.get("expires_in", 3600)
+            new_expiry = datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=expires_in)
+
+            oauth_acc.access_token = encrypt_token(new_access_token)
+            oauth_acc.token_expiry = new_expiry
+            oauth_acc.mailbox_health_status = "HEALTHY"
+            db.commit()
+            logger.info(f"[GMAIL] Token refreshed successfully for user {user_id}. Expires at {new_expiry}.")
+
+            return Credentials(
+                token=new_access_token,
+                refresh_token=refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=settings.GOOGLE_CLIENT_ID,
+                client_secret=settings.GOOGLE_CLIENT_SECRET,
+                expiry=new_expiry,
+                scopes=["https://www.googleapis.com/auth/gmail.modify"],
+            )
+
         except RefreshError as e:
-            logger.warning(f"[TOKEN-REFRESH] Refresh token for user {user_id} is invalid or revoked. Clearing credentials: {e}")
+            # Refresh token is revoked or invalid — user must reconnect.
+            logger.warning(f"[GMAIL] Refresh token revoked for user {user_id}. Clearing mailbox credentials: {e}")
             db.delete(oauth_acc)
             try:
                 db.commit()
@@ -86,10 +137,11 @@ class TokenService:
                 db.rollback()
             return None
         except Exception as e:
-            logger.warning(f"[TOKEN-REFRESH] Failed to auto-refresh token for user {user_id}: {e}")
-            # Token will fail when actually used, allowing graceful error handling
-        
-        return creds
+            # Transient failure (network timeout, Google 5xx) — do NOT clear credentials.
+            # Raise so the caller surfaces a 503 retry error rather than a false
+            # "mailbox not connected" that would wrongly redirect the user to reconnect.
+            logger.error(f"[GMAIL] Transient failure refreshing token for user {user_id}: {e}", exc_info=True)
+            raise
 
     @staticmethod
     def refresh_and_update_access(db: Session, user_id: str, provider: str = "google"):

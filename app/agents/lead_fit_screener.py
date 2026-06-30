@@ -28,6 +28,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 
+import naics as _naics_lib
+
 from app.core.llm import get_chat_llm
 
 logger = logging.getLogger("LeadFitScreener")
@@ -50,23 +52,36 @@ class IndustryScreenVerdict(BaseModel):
             "'unknown' = signals are too thin, missing, or genuinely contradictory to decide."
         )
     )
-    decision_reason: str = Field(
-        description="One sentence: the single clearest reason why this company was approved, rejected, or marked inconclusive."
-    )
-    industry_label_signal: str = Field(
-        description="State the industry label and whether it aligns with, conflicts with, or is unrelated to the target industry."
-    )
-    sic_signal: str = Field(
-        description="State the SIC code number, its official category name, and whether it aligns with or conflicts with the target industry. If not provided, say 'SIC: not provided'."
-    )
-    naics_signal: str = Field(
-        description="State the NAICS code number, its official category name, and whether it aligns with or conflicts with the target industry. If not provided, say 'NAICS: not provided'."
-    )
-    description_signal: str = Field(
-        description="Quote the single most relevant phrase from the company description and state what it confirms or contradicts about industry fit."
-    )
     signals_conclusion: str = Field(
-        description="State whether all signals agree or conflict. If they conflict, state which signal is most reliable and why it was trusted over the others."
+        description="A:<vote> B:<vote> C:<vote> -> matched rule -> verdict"
+    )
+    description_reasoning: str = Field(
+        description=(
+            "2-3 sentences explaining what the company does based on the description. "
+            "Quote the key phrase that reveals their primary activity. "
+            "Explain in plain English whether what they do belongs to the target industry or not."
+        )
+    )
+    sic_reasoning: str = Field(
+        description=(
+            "2-3 sentences explaining what the SIC code tells us about this company. "
+            "State the code number and its resolved sector name. "
+            "Explain what kind of business that sector represents and whether it fits the target industry."
+        )
+    )
+    naics_reasoning: str = Field(
+        description=(
+            "2-3 sentences explaining what the NAICS code tells us about this company. "
+            "State the code number and its resolved industry name. "
+            "Explain what kind of business that industry represents and whether it fits the target industry."
+        )
+    )
+    final_reasoning: str = Field(
+        description=(
+            "3-4 sentences summarising the overall picture. "
+            "State what all three signals say, whether they agree or conflict, "
+            "and give the plain-English reason why this company is being approved, rejected, or flagged as inconclusive."
+        )
     )
 
 
@@ -99,6 +114,89 @@ _CONTINENT_NAMES: frozenset[str] = frozenset({
 
 def _is_blank(v: str) -> bool:
     return (v or "").strip().lower() in _BLANK_VALUES
+
+
+# --------------------------------------------------------------------------- #
+# SIC / NAICS resolvers — Python lookup, never the LLM                        #
+# --------------------------------------------------------------------------- #
+
+# SIC major divisions (stable since 1987). Source: US Census SIC manual.
+_SIC_DIVISIONS: list[tuple[int, int, str]] = [
+    (100,  999,  "Agriculture, Forestry and Fishing"),
+    (1000, 1499, "Mining"),
+    (1500, 1999, "Construction"),
+    (2000, 3999, "Manufacturing"),
+    (4000, 4999, "Transportation, Communications and Utilities"),
+    (5000, 5199, "Wholesale Trade"),
+    (5200, 5999, "Retail Trade"),
+    (6000, 6799, "Finance, Insurance and Real Estate"),
+    (7000, 8999, "Services"),
+    (9100, 9999, "Public Administration"),
+]
+
+
+def resolve_sic(code: str) -> str | None:
+    """Return the SIC division name for a code string, or None if unresolvable."""
+    if not code or _is_blank(code):
+        return None
+    try:
+        n = int(str(code).strip().split(".")[0])
+    except ValueError:
+        return None
+    for lo, hi, name in _SIC_DIVISIONS:
+        if lo <= n <= hi:
+            return name
+    return None
+
+
+def resolve_naics(code: str) -> str | None:
+    """Return the official NAICS industry name for a code, or None if unresolvable.
+
+    Tries progressively shorter prefixes until a match is found in the naics library.
+    Manufacturing spans sectors 31/32/33 which aren't stored as standalone 2-digit
+    keys — handled explicitly.
+    """
+    if not code or _is_blank(code):
+        return None
+    c = str(code).strip().split(".")[0]
+    # Manufacturing special case: 31x / 32x / 33x exist as 3+ digit codes
+    if len(c) >= 2 and c[:2] in ("31", "32", "33"):
+        try:
+            return _naics_lib.industry(c) if len(c) >= 3 else "Manufacturing"
+        except KeyError:
+            pass
+        # Walk up to 3-digit prefix
+        for length in range(min(len(c), 6), 2, -1):
+            try:
+                return _naics_lib.industry(c[:length])
+            except KeyError:
+                pass
+        return "Manufacturing"
+    # General case: try longest prefix first, walk back to 2 digits
+    for length in range(min(len(c), 6), 1, -1):
+        try:
+            return _naics_lib.industry(c[:length])
+        except KeyError:
+            pass
+    return None
+
+
+def _sic_naics_context(sic: str, naics: str) -> tuple[str, str]:
+    """Return (sic_label, naics_label) with resolved sector names included."""
+    sic_resolved = resolve_sic(sic)
+    naics_resolved = resolve_naics(naics)
+
+    sic_label = (
+        f"SIC {sic} ({sic_resolved})" if sic and not _is_blank(sic) and sic_resolved
+        else f"SIC {sic} (unrecognised range)" if sic and not _is_blank(sic)
+        else "SIC: not provided"
+    )
+    naics_label = (
+        f"NAICS {naics} ({naics_resolved})" if naics and not _is_blank(naics) and naics_resolved
+        else f"NAICS {naics} (unrecognised)" if naics and not _is_blank(naics)
+        else "NAICS: not provided"
+    )
+    return sic_label, naics_label
 
 
 def _resolve_country(name: str):
@@ -249,83 +347,60 @@ def match_size(csv_size: str, target_size: str) -> tuple[str, str]:
 # Check 3: Industry (LLM — always runs)                                       #
 # --------------------------------------------------------------------------- #
 
-# Static system prompt — contains ONLY rules/examples with zero variables.
+# Static system prompt — ONLY rules and structure, zero variables.
 # Sent as SystemMessage so OpenAI caches this prefix across every call in the run.
-# Dynamic context (sender info, target industry, company data) goes in HumanMessage.
+# Dynamic context (target industry, company data) goes in HumanMessage.
 #
 # DESIGN NOTE: This prompt is deliberately industry-agnostic. The target industry
-# is injected at the end of build_system_message() — never hardcode industry-specific
-# rules here, or the screener silently breaks for any non-manufacturing campaign.
+# and sender context are injected at the end of build_system_message() — never
+# hardcode industry-specific rules here, or the screener silently breaks for any
+# non-manufacturing campaign.
+#
+# DETERMINISM: The decision tree below is the primary driver of verdicts. The model
+# must apply the tree in order and stop at the first rule that resolves the case.
+# This eliminates open-ended reasoning on edge cases that caused run-to-run variance.
 _INDUSTRY_SCREEN_SYSTEM = """\
-You are a B2B lead pre-screener doing INDUSTRY CLASSIFICATION only.
+You are a B2B lead-screener. Determine whether a company's PRIMARY business belongs
+to the TARGET INDUSTRY. This is a taxonomy decision — not sales fit, not product match.
 
-Answer this single question:
-"Does this company's primary business belong to the TARGET INDUSTRY stated at the end
-of this message?"
+You are given three pieces of evidence. Use all three together to reach the most
+accurate conclusion.
 
-You are NOT judging sales fit, product relevance, or operational match.
-Sender context is provided solely so you understand which industry sector is being
-targeted. Do NOT use it to assess whether the sender's product would work for this
-company.
+EVIDENCE 1 — DESCRIPTION
+  Read what the company says about itself. Identify their primary business activity.
+  The description is the strongest signal because it reflects what the company
+  actually does. When the description is clear, trust it above the codes.
 
-VERDICTS:
+EVIDENCE 2 — SIC CODE
+  The SIC code and its official sector name are provided. This is an official
+  industry classification. Use it to corroborate or challenge what the description says.
+  Note: data providers sometimes assign codes inaccurately — if the SIC sector name
+  contradicts a very clear description, the description is more reliable.
 
-"pass" — the company clearly belongs to the target industry:
-  - Its PRIMARY business activity falls squarely within the target industry category.
-  - The industry label, SIC/NAICS codes, and description consistently confirm
-    membership in that sector.
+EVIDENCE 3 — NAICS CODE
+  The NAICS code and its official industry name are provided. This is a second
+  official classification. Use it alongside SIC to build a fuller picture.
+  Same caveat: if the NAICS name conflicts with a clear description, trust the description.
 
-"fail" — the company clearly does NOT belong to the target industry:
-  - Its core activities have no meaningful overlap with the target industry.
-  - The company's industry label AND description both point away from the target sector.
-  - A company that serves or sells to companies in the target industry is not
-    automatically a fail — evaluate what the company itself primarily does.
+HOW TO DECIDE
+  • If all three signals agree → verdict is clear.
+  • If description is clear and codes support it → PASS or FAIL confidently.
+  • If description is clear but codes conflict → trust the description; explain why the
+    codes appear misassigned.
+  • If description is vague and codes conflict → return UNKNOWN.
+  • Never return UNKNOWN just because codes are in a different sector — codes are
+    frequently misassigned. Only return UNKNOWN when there is genuine uncertainty
+    about what the company actually does.
 
-"unknown" — the available signals are too thin or conflicting to decide:
-  - Description is very short, generic, or uses only vague terms.
-  - The company could plausibly belong to the target industry or to another sector.
-  - Industry label and description give conflicting or unclear signals.
-  - The company genuinely straddles two industry categories.
-
-CALIBRATION RULES:
-  1. Follow the evidence — do not invent reasons to pass or fail. Let the industry
-     label, SIC/NAICS code, and description speak for themselves.
-  2. UNKNOWN is a pass-through — use it only when the signals are genuinely
-     insufficient or contradictory, not as a default to avoid making a call.
-  3. SIC/NAICS codes are supporting evidence. State what the code means and whether
-     it aligns or conflicts with the description. Source data sometimes assigns
-     incorrect codes — if the code and description clearly contradict each other,
-     explain the conflict and state which signal is more reliable and why.
-  4. If all three signals (industry label, SIC/NAICS, description) agree, the verdict
-     should match them — pass if they all point to the target industry, fail if they
-     all point away from it.
-  5. Only use UNKNOWN when at least one signal is missing or signals genuinely conflict
-     with no clear way to resolve the contradiction.
-  6. Treat the target industry as a BROAD SUPERCATEGORY. Any company whose primary
-     business falls within a recognised subcategory of the target industry is a PASS.
-     Do not require an exact label match — classify by what the company actually does,
-     not by whether the wording of its label exactly matches the target industry name.
-
-REASONING FIELDS — fill each field precisely:
-
-decision_reason   : One sentence — the single clearest reason the company was approved, rejected, or marked inconclusive.
-industry_label_signal : State the label and whether it aligns with, conflicts with, or is unrelated to the target industry.
-sic_signal        : State the SIC code number and its official category name, then state whether it aligns or conflicts with the target industry.
-naics_signal      : State the NAICS code number and its official category name, then state whether it aligns or conflicts with the target industry.
-description_signal: Quote the single most relevant phrase from the description verbatim, then state what it confirms or contradicts.
-signals_conclusion: State whether all signals agree or conflict. If conflict, name which signal is most reliable and why.
+Output JSON:
+  verdict            : "pass" | "fail" | "unknown"
+  signals_conclusion : brief summary of what each evidence piece says and how they were weighted
+  description_reasoning : 2-3 sentences — what the company does, quote the key phrase, plain English explanation of whether it belongs to the target industry
+  sic_reasoning      : 2-3 sentences — SIC code number, resolved sector name, what that sector represents, whether it fits the target industry
+  naics_reasoning    : 2-3 sentences — NAICS code number, resolved industry name, what that industry represents, whether it fits the target industry
+  final_reasoning    : 3-4 sentences — summarise all three signals, state whether they agree or conflict, give the plain-English reason for the verdict
 \
 """
-
-
-def _sic_naics_context(sic: str, naics: str) -> str:
-    """Render a short human-readable SIC/NAICS context string for the prompt."""
-    parts = []
-    if sic and not _is_blank(sic):
-        parts.append(f"SIC {sic}")
-    if naics and not _is_blank(naics):
-        parts.append(f"NAICS {naics}")
-    return ", ".join(parts) if parts else "Not available"
 
 
 # --------------------------------------------------------------------------- #
@@ -482,10 +557,17 @@ class LeadFitScreener:
         target_industry: str,
         sender_customers: str,
         sender_services: str,
-        campaign_prompt: str,
+        campaign_prompt: str,  # kept for API compat; intentionally NOT injected below
     ) -> str:
         """
-        Combine static rules + ALL campaign-level context into one system message.
+        Combine static rules + target industry into one system message.
+
+        IMPORTANT: campaign_prompt and sender context are deliberately excluded from
+        the industry classification prompt. Including them caused the model to shift
+        its interpretation of the industry boundary based on campaign wording, which
+        was the primary source of run-to-run non-determinism. Industry classification
+        is a pure taxonomy decision — it must not be influenced by sales context.
+
         This string is IDENTICAL for every company in the same batch, so OpenAI
         caches the entire prefix after the first call — only the company block
         (sent as HumanMessage) incurs uncached token cost.
@@ -494,16 +576,8 @@ class LeadFitScreener:
             _INDUSTRY_SCREEN_SYSTEM
             + "\n\n"
             + "=" * 60 + "\n"
-            + "CAMPAIGN CONTEXT — same for every company in this batch:\n\n"
-            + "SENDER CONTEXT (for industry boundary reference only):\n"
-            + f"- Sender sells to: {sender_customers[:300]}\n"
-            + f"- Sender's offerings: {sender_services[:300]}\n\n"
-            + "CAMPAIGN OBJECTIVE (use this only to understand the industry boundary —\n"
-            + "do not use it to stretch or narrow the target industry beyond what the\n"
-            + "TARGET INDUSTRY label already states):\n"
-            + f"{campaign_prompt[:500]}\n\n"
             + f"TARGET INDUSTRY: {target_industry}\n\n"
-            + "Classify the company supplied in the next message."
+            + "Apply the decision tree above to classify the company in the next message."
         )
 
     async def _check_industry(
@@ -522,14 +596,15 @@ class LeadFitScreener:
         result — AIMessage.usage_metadata contains input_token_details.cached
         which is the only reliable way to read cached token counts from LangChain.
         """
-        sic_naics_ctx = _sic_naics_context(csv_sic, csv_naics)
+        sic_label, naics_label = _sic_naics_context(csv_sic, csv_naics)
         description = csv_desc.strip() if csv_desc and not _is_blank(csv_desc) else "(no description provided)"
 
         human_content = (
             f"COMPANY:\n"
             f"Name: {name}\n"
             f"Industry label: {csv_industry or 'Not stated'}\n"
-            f"SIC/NAICS: {sic_naics_ctx}\n"
+            f"{sic_label}\n"
+            f"{naics_label}\n"
             f'Description: """{description[:2000]}"""'
         )
 
@@ -561,12 +636,12 @@ class LeadFitScreener:
 
             decision_word = {"pass": "APPROVED", "fail": "REJECTED", "unknown": "INCONCLUSIVE"}.get(parsed.verdict, parsed.verdict.upper())
             evidence = (
-                f"DECISION: {decision_word} — {parsed.decision_reason}\n"
-                f"- Industry label: {parsed.industry_label_signal}\n"
-                f"- {parsed.sic_signal}\n"
-                f"- {parsed.naics_signal}\n"
-                f"- Description: {parsed.description_signal}\n"
-                f"- Signals: {parsed.signals_conclusion}"
+                f"DECISION: {decision_word}\n"
+                f"Signals: {parsed.signals_conclusion}\n\n"
+                f"Description: {parsed.description_reasoning}\n\n"
+                f"SIC Code: {parsed.sic_reasoning}\n\n"
+                f"NAICS Code: {parsed.naics_reasoning}\n\n"
+                f"Conclusion: {parsed.final_reasoning}"
             )
             check = CheckResult(
                 verdict=parsed.verdict,

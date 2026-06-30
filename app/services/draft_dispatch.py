@@ -262,6 +262,10 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
         db.commit()
 
         creds = TokenService.get_google_credentials(db, db_draft.campaign.user_id)
+        if not creds:
+            _mark_draft_dispatch_failure(draft_id, "Mailbox not connected or credentials revoked.")
+            return {"status": "mailbox_required", "message": "Gmail connection lost. Please reconnect your mailbox."}
+
         thread_id = db_draft.dm.thread_id if db_draft.dm else None
         in_reply_to = db_draft.dm.last_rfc_message_id if db_draft.dm else None
         msg_data = email_service.send_email(

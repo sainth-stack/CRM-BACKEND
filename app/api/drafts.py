@@ -112,6 +112,12 @@ def send_draft(
     if not prospect_email:
         raise HTTPException(status_code=400, detail="Deployment coordinate (Email) missing. Please refine and synchronize stakeholder data.")
 
+    # Verify Gmail token is live before committing to a scheduled send.
+    from app.core.token_service import TokenService
+    creds = TokenService.get_google_credentials(db, current_user.id)
+    if not creds:
+        raise HTTPException(status_code=403, detail="Gmail connection lost. Please reconnect your mailbox.", headers={"X-Error-Code": "mailbox_required"})
+
     queue_state = queue_draft_dispatch(
         db,
         db_draft,
@@ -203,4 +209,6 @@ def send_draft_now(
         return {"message": "sent", "detail": result["message"]}
     if result["status"] == "in_progress":
         raise HTTPException(status_code=429, detail="Operational Lock: This draft is currently being deployed.")
+    if result["status"] == "mailbox_required":
+        raise HTTPException(status_code=403, detail=result["message"], headers={"X-Error-Code": "mailbox_required"})
     raise HTTPException(status_code=500, detail=result.get("message", "Send failed."))

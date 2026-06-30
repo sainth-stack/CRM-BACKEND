@@ -39,3 +39,4 @@ langchain-groq
 trafilatura
 pycountry
 pycountry-convert
+naics

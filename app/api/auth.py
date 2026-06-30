@@ -156,10 +156,18 @@ def login(request: Request, credentials: LoginRequest = Body(...), db: Session =
     record_login_session(db, request, user)
     identity = build_identity_context(db, user)
 
+    # Proactively refresh Gmail access token at login so the user starts with a
+    # live credential. If the refresh token is revoked, has_mailbox is set to
+    # false here and the frontend routes the user to /connect-mailbox immediately.
+    from app.core.token_service import TokenService
+    gmail_creds = TokenService.get_google_credentials(db, user.id)
+    has_mailbox = gmail_creds is not None
+
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
+        "has_mailbox": has_mailbox,
         "user": {
             "id": user.id,
             "email": user.email,

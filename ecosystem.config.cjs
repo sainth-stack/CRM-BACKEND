@@ -90,7 +90,7 @@ module.exports = {
       // CRITICAL: exactly ONE beat instance, ever. Never scale this.
       ...celeryCommon,
       name: "crm-celery-beat",
-      args: `-A ${CELERY_APP} beat --loglevel=info --scheduler celery.beat.PersistentScheduler`,
+      args: `-A ${CELERY_APP} beat --loglevel=info --scheduler app.workers.config.celery_app.DiagnosticBeatScheduler`,
     },
   ],
 };

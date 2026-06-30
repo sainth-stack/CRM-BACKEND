@@ -74,7 +74,21 @@ class CampaignBaseTask(Task):
                 logger.critical(f"[TERMINAL FAILURE] Could not update campaign status: {db_err}")
 
 
-from celery.signals import task_failure
+from celery.signals import task_failure, beat_init
+
+@beat_init.connect
+def log_beat_redis_url(sender=None, **kwargs):
+    """Log the active Redis URL when celery-beat starts so we can cross-check
+    which Upstash instance is actually being used vs what we expect."""
+    masked = redis_url
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(redis_url)
+        # Mask password but keep host/port/db visible for debugging
+        masked = redis_url.replace(parsed.password, "***") if parsed.password else redis_url
+    except Exception:
+        pass
+    logger.info(f"[BEAT INIT] Celery-beat started. Active Redis broker URL: {masked}")
 
 @task_failure.connect
 def handle_task_failure(sender=None, task_id=None, exception=None, args=None, kwargs=None, traceback=None, einfo=None, **extra):
@@ -235,3 +249,36 @@ celery_app.conf.beat_schedule = {
     # bookings, slot lookups, drafting - so a periodic global sweep across every
     # user was redundant idle Redis/Celery traffic on top of the on-demand path.
 }
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic Beat Scheduler — logs Redis URL on SchedulingError so we can
+# verify which Upstash instance is actually being hit during production issues.
+# ---------------------------------------------------------------------------
+from celery.beat import PersistentScheduler
+
+class DiagnosticBeatScheduler(PersistentScheduler):
+    """Drop-in replacement for the default beat scheduler.
+    On any SchedulingError it emits the active Redis broker URL so we can
+    confirm whether the error is coming from the expected Upstash database.
+    """
+
+    def apply_entry(self, entry, producer=None):
+        try:
+            return super().apply_entry(entry, producer=producer)
+        except Exception as exc:
+            # Only enrich the log for connection/limit errors — everything else
+            # is already handled by the standard beat error handler.
+            error_str = str(exc)
+            if "max requests limit" in error_str or "ConnectionError" in error_str or "SchedulingError" in error_str:
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(redis_url)
+                    masked = redis_url.replace(parsed.password, "***") if parsed.password else redis_url
+                except Exception:
+                    masked = "<could not parse redis_url>"
+                logger.error(
+                    f"[BEAT SCHEDULING ERROR] Task '{entry.name}' failed to schedule. "
+                    f"Active Redis broker URL: {masked} | Error: {exc}"
+                )
+            raise

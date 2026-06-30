@@ -45,21 +45,28 @@ class CheckResult(BaseModel):
 class IndustryScreenVerdict(BaseModel):
     verdict: Literal["pass", "fail", "unknown"] = Field(
         description=(
-            "'pass'  = the company's actual business clearly falls under the target industry. "
-            "'fail'  = the company is CLEARLY in a DIFFERENT supercategory than EVERY target "
-            "industry — reserve for unambiguous mismatches ONLY (e.g. a law firm against "
-            "Manufacturing, a barbershop against Technology). "
-            "'unknown' = description too thin, vague, or genuinely ambiguous to decide."
+            "'pass' = company's primary business clearly belongs to the target industry. "
+            "'fail' = company's primary business clearly does NOT belong to the target industry. "
+            "'unknown' = signals are too thin, missing, or genuinely contradictory to decide."
         )
     )
-    evidence: str = Field(
-        description=(
-            "One sentence citing SPECIFIC text from the description that drove the verdict. "
-            "If unknown, state what was missing."
-        )
+    decision_reason: str = Field(
+        description="One sentence: the single clearest reason why this company was approved, rejected, or marked inconclusive."
     )
-    actual_business: str = Field(
-        description="One sentence: what this company actually does, read from the description."
+    industry_label_signal: str = Field(
+        description="State the industry label and whether it aligns with, conflicts with, or is unrelated to the target industry."
+    )
+    sic_signal: str = Field(
+        description="State the SIC code number, its official category name, and whether it aligns with or conflicts with the target industry. If not provided, say 'SIC: not provided'."
+    )
+    naics_signal: str = Field(
+        description="State the NAICS code number, its official category name, and whether it aligns with or conflicts with the target industry. If not provided, say 'NAICS: not provided'."
+    )
+    description_signal: str = Field(
+        description="Quote the single most relevant phrase from the company description and state what it confirms or contradicts about industry fit."
+    )
+    signals_conclusion: str = Field(
+        description="State whether all signals agree or conflict. If they conflict, state which signal is most reliable and why it was trusted over the others."
     )
 
 
@@ -75,182 +82,47 @@ class ScreenerOutput(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Geography helpers — continent / region expansion                             #
+# Geography helpers                                                            #
 # --------------------------------------------------------------------------- #
 
-# Business sub-regions → ISO alpha-2 sets (deterministic, no pycountry needed)
-_SPECIAL_REGION_ALPHA2: dict[str, set[str]] = {
-    "mena": {
-        "DZ","BH","DJ","EG","IQ","JO","KW","LB","LY","MR","MA","OM","PS",
-        "QA","SA","SO","SD","SY","TN","AE","YE","IR","IL","TR",
-    },
-    "middle east and north africa": {
-        "DZ","BH","DJ","EG","IQ","JO","KW","LB","LY","MR","MA","OM","PS",
-        "QA","SA","SO","SD","SY","TN","AE","YE","IR","IL","TR",
-    },
-    "middle east": {"AE","SA","QA","KW","BH","OM","YE","JO","IQ","SY","LB","IR","IL","PS","TR"},
-    "dach": {"DE","AT","CH"},
-    "nordics": {"DK","FI","NO","SE","IS"},
-    "scandinavia": {"DK","FI","NO","SE","IS"},
-    "benelux": {"BE","NL","LU"},
-    "cee": {
-        "PL","CZ","SK","HU","RO","BG","HR","SI","RS","AL","MK","BA","ME","XK",
-        "LV","LT","EE","UA","BY","MD",
-    },
-    "central and eastern europe": {
-        "PL","CZ","SK","HU","RO","BG","HR","SI","RS","AL","MK","BA","ME","XK",
-        "LV","LT","EE","UA","BY","MD",
-    },
-    "gcc": {"SA","AE","QA","KW","BH","OM"},
-    "gulf cooperation council": {"SA","AE","QA","KW","BH","OM"},
-    "anz": {"AU","NZ"},
-    "sea": {"SG","MY","TH","VN","PH","ID","MM","KH","LA","BN","TL"},
-    "southeast asia": {"SG","MY","TH","VN","PH","ID","MM","KH","LA","BN","TL"},
-    "south asia": {"IN","PK","BD","LK","NP","BT","MV","AF"},
-    "east asia": {"CN","JP","KR","TW","HK","MO"},
-    "latam": {
-        "MX","GT","BZ","HN","SV","NI","CR","PA","CU","JM","HT","DO","PR",
-        "CO","VE","GY","SR","EC","PE","BO","BR","PY","UY","AR","CL","TT",
-    },
-    "latin america": {
-        "MX","GT","BZ","HN","SV","NI","CR","PA","CU","JM","HT","DO","PR",
-        "CO","VE","GY","SR","EC","PE","BO","BR","PY","UY","AR","CL","TT",
-    },
-    "apac": {
-        "CN","JP","KR","TW","HK","MO","SG","MY","TH","VN","PH","ID","MM","KH","LA","BN",
-        "IN","PK","BD","LK","NP","BT","MV","AF","AU","NZ","FJ","PG","WS","TO","VU","TL",
-    },
-    "asia pacific": {
-        "CN","JP","KR","TW","HK","MO","SG","MY","TH","VN","PH","ID","MM","KH","LA","BN",
-        "IN","PK","BD","LK","NP","BT","MV","AF","AU","NZ","FJ","PG","WS","TO","VU","TL",
-    },
-    "asia-pacific": {
-        "CN","JP","KR","TW","HK","MO","SG","MY","TH","VN","PH","ID","MM","KH","LA","BN",
-        "IN","PK","BD","LK","NP","BT","MV","AF","AU","NZ","FJ","PG","WS","TO","VU","TL",
-    },
-    "sub-saharan africa": {
-        "NG","KE","ZA","GH","ET","TZ","UG","CM","CI","SN","ZM","ZW","MZ","AO","MG",
-        "BF","ML","RW","TD","SO","MR","NE","SS","CD","CG","GA","GN","SL","LR","TG",
-    },
-    "north africa": {"EG","LY","TN","DZ","MA","SD"},
-    "west africa": {"NG","GH","CI","SN","ML","BF","GN","SL","LR","TG","BJ","NE","MR","GW","CV","GM"},
-    "east africa": {"KE","ET","TZ","UG","RW","SO","DJ","ER","MG","MZ","ZM","ZW","MW","SC"},
-    "southern africa": {"ZA","ZM","ZW","MZ","BW","NA","LS","SZ","AO","MG","MU","MW"},
-}
-
-# Standard continent name → ISO continent code (for pycountry-convert)
-_CONTINENT_NAME_TO_CODE: dict[str, str] = {
-    "africa": "AF",
-    "north america": "NA",
-    "south america": "SA",
-    "europe": "EU",
-    "asia": "AS",
-    "oceania": "OC",
-    "australia": "OC",
-    "antarctica": "AN",
-}
-
-# Common country name/alias → ISO alpha-2 (handles spellings pycountry may miss)
-_COUNTRY_ALIAS_TO_ALPHA2: dict[str, str] = {
-    "usa": "US", "us": "US", "america": "US", "united states": "US",
-    "united states of america": "US",
-    "uk": "GB", "britain": "GB", "great britain": "GB", "england": "GB",
-    "scotland": "GB", "wales": "GB", "northern ireland": "GB", "gb": "GB",
-    "uae": "AE", "united arab emirates": "AE",
-    "south korea": "KR", "korea": "KR", "republic of korea": "KR",
-    "north korea": "KP",
-    "czechia": "CZ", "czech republic": "CZ",
-    "russia": "RU", "russian federation": "RU",
-    "iran": "IR",
-    "syria": "SY",
-    "taiwan": "TW",
-    "vietnam": "VN", "viet nam": "VN",
-    "venezuela": "VE",
-    "bolivia": "BO",
-    "moldova": "MD",
-    "tanzania": "TZ",
-    "new zealand": "NZ",
-    "saudi arabia": "SA",
-    "south africa": "ZA",
-    "hong kong": "HK",
-    "macau": "MO", "macao": "MO",
-    "ivory coast": "CI", "cote d'ivoire": "CI",
-    "myanmar": "MM", "burma": "MM",
-    "palestine": "PS",
-    "laos": "LA",
-    "timor-leste": "TL", "east timor": "TL",
-}
+import pycountry
+import pycountry_convert as pc
 
 _BLANK_VALUES = {"", "n/a", "na", "none", "null", "unknown", "any", "-"}
+
+# All continent names returned by pycountry-convert, lowercased for fast lookup.
+_CONTINENT_NAMES: frozenset[str] = frozenset({
+    "africa", "antarctica", "asia", "europe",
+    "north america", "oceania", "south america",
+})
 
 
 def _is_blank(v: str) -> bool:
     return (v or "").strip().lower() in _BLANK_VALUES
 
 
-def _country_to_alpha2(text: str) -> str | None:
-    """Resolve a country name / alias string to ISO alpha-2. Returns None if unresolvable."""
-    if not text or _is_blank(text):
-        return None
-    t = text.strip().lower()
-
-    # 1. Fast alias table
-    if t in _COUNTRY_ALIAS_TO_ALPHA2:
-        return _COUNTRY_ALIAS_TO_ALPHA2[t]
-
-    # 2. pycountry exact + fuzzy
+def _resolve_country(name: str):
+    """Return a pycountry country object or None. Tries lookup() then search_fuzzy()."""
     try:
-        import pycountry
-        c = pycountry.countries.get(name=text.strip())
-        if c:
-            return c.alpha_2
-        results = pycountry.countries.search_fuzzy(text.strip())
-        if results:
-            return results[0].alpha_2
-    except Exception:
+        return pycountry.countries.lookup(name.strip())
+    except LookupError:
         pass
-
+    try:
+        results = pycountry.countries.search_fuzzy(name.strip())
+        if results:
+            return results[0]
+    except LookupError:
+        pass
     return None
 
 
-def _continent_alpha2_set(continent_code: str) -> set[str]:
-    """All alpha-2 codes belonging to a continent (AF/NA/SA/EU/AS/OC/AN)."""
-    result: set[str] = set()
+def _prospect_continent(alpha2: str) -> str | None:
+    """Return the continent name (lowercase) for a country alpha-2, or None."""
     try:
-        import pycountry
-        import pycountry_convert as pc
-        for country in pycountry.countries:
-            try:
-                if pc.country_alpha2_to_continent_code(country.alpha_2) == continent_code:
-                    result.add(country.alpha_2)
-            except Exception:
-                continue
-    except ImportError:
-        logger.warning("[LeadFitScreener] pycountry-convert not installed — continent lookup skipped.")
-    return result
-
-
-def _expand_target_to_alpha2_set(target_loc: str) -> set[str] | None:
-    """
-    If target_loc names a continent or known business region, return the set of
-    alpha-2 codes it covers. Returns None when the target is a specific country
-    or city/state (caller handles those via direct country matching).
-    """
-    t = target_loc.strip().lower()
-
-    # Check longest-match first so "southeast asia" beats "asia"
-    for region_key in sorted(_SPECIAL_REGION_ALPHA2, key=len, reverse=True):
-        if region_key in t:
-            return _SPECIAL_REGION_ALPHA2[region_key]
-
-    # Standard continent names
-    for cont_name, cont_code in sorted(_CONTINENT_NAME_TO_CODE.items(), key=lambda x: len(x[0]), reverse=True):
-        if cont_name in t:
-            if cont_name == "americas":
-                return _continent_alpha2_set("NA") | _continent_alpha2_set("SA")
-            return _continent_alpha2_set(cont_code)
-
-    return None  # not a region — treat as country / city / state
+        code = pc.country_alpha2_to_continent_code(alpha2)
+        return pc.convert_continent_code_to_continent_name(code).lower()
+    except (KeyError, TypeError):
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -259,62 +131,60 @@ def _expand_target_to_alpha2_set(target_loc: str) -> set[str] | None:
 
 def match_location(csv_country: str, target_loc: str) -> tuple[str, str]:
     """
-    Continent/region-aware deterministic location match.
+    Deterministic location match. Target is always a Country OR Continent.
+    Prospect (csv_country) is always a Country.
+
+    Resolution order:
+      1. If target matches a known continent name → continent check.
+      2. Otherwise resolve target as a country → direct country equality check.
+
+    Continent is checked FIRST to prevent pycountry fuzzy-matching continent
+    names to countries (e.g. "Africa" → "South Africa").
 
     Returns (verdict, evidence):
-      'pass'    — company country is within the target location / region.
-      'fail'    — company country is a KNOWN country clearly outside the target.
-      'unknown' — cannot determine (missing data, unresolvable names).
-
-    UNKNOWN is always a pass-through — never blocks a company.
+      'pass'    — match confirmed.
+      'fail'    — prospect country is known and does not match.
+      'unknown' — missing data or unresolvable name (safe pass-through).
     """
     if _is_blank(target_loc):
         return "pass", "No location requirement specified."
     if _is_blank(csv_country):
         return "unknown", "Company country not stated in CSV."
 
-    csv_a2 = _country_to_alpha2(csv_country)
+    prospect = _resolve_country(csv_country)
+    if prospect is None:
+        return "unknown", f"Could not resolve prospect country '{csv_country}'."
 
-    # Check if target is a region / continent (may contain multiple targets: "USA, Europe")
-    for part in re.split(r"[,/;|]|\bor\b", target_loc, flags=re.IGNORECASE):
-        part = part.strip()
-        if not part:
-            continue
+    target_norm = target_loc.strip().lower()
 
-        target_set = _expand_target_to_alpha2_set(part)
-
-        if target_set is not None:
-            # Region / continent path
-            if csv_a2 and csv_a2 in target_set:
-                return "pass", f"'{csv_country}' is within the target region '{part}'."
-            if csv_a2 and csv_a2 not in target_set:
-                # Don't FAIL yet — another part of the target might still match
-                continue
-            # Can't resolve CSV country against region — unknown for this part
-            continue
-        else:
-            # Specific country / city / state path
-            # Substring match (e.g. target "India", csv "Bangalore, India")
-            if part.lower() in (csv_country or "").lower():
-                return "pass", f"CSV country '{csv_country}' matches target '{part}'."
-            # Alpha-2 comparison
-            tgt_a2 = _country_to_alpha2(part)
-            if tgt_a2 and csv_a2 and tgt_a2 == csv_a2:
-                return "pass", f"CSV country '{csv_country}' matches target '{part}'."
-
-    # Exhausted all target parts without a PASS
-    if csv_a2:
-        # We identified the company's country — it didn't match anything → FAIL
+    # ── Case 1: Target is a continent ───────────────────────────────────────
+    if target_norm in _CONTINENT_NAMES:
+        prospect_continent = _prospect_continent(prospect.alpha_2)
+        if prospect_continent is None:
+            return "unknown", (
+                f"Could not determine continent for '{csv_country}' ({prospect.alpha_2})."
+            )
+        if prospect_continent == target_norm:
+            return "pass", (
+                f"'{csv_country}' is in {prospect_continent.title()}, "
+                f"which matches target '{target_loc}'."
+            )
         return "fail", (
-            f"'{csv_country}' (resolved: {csv_a2}) is not within the "
-            f"target location '{target_loc}'."
+            f"'{csv_country}' is in {prospect_continent.title()}, "
+            f"not in target continent '{target_loc}'."
         )
 
-    # Couldn't resolve the company's country → safe unknown
-    return "unknown", (
-        f"Could not resolve '{csv_country}' to a known country — "
-        f"cannot confirm or deny match against '{target_loc}'."
-    )
+    # ── Case 2: Target is a country ─────────────────────────────────────────
+    target_country = _resolve_country(target_loc)
+    if target_country is not None:
+        if prospect.alpha_2 == target_country.alpha_2:
+            return "pass", f"'{csv_country}' matches target country '{target_loc}'."
+        return "fail", (
+            f"'{csv_country}' ({prospect.alpha_2}) does not match "
+            f"target country '{target_loc}' ({target_country.alpha_2})."
+        )
+
+    return "unknown", f"Could not resolve target location '{target_loc}' as a country or continent."
 
 
 # --------------------------------------------------------------------------- #
@@ -402,37 +272,49 @@ VERDICTS:
 
 "pass" — the company clearly belongs to the target industry:
   - Its PRIMARY business activity falls squarely within the target industry category.
-  - The industry label, SIC/NAICS codes, or description language clearly confirm
+  - The industry label, SIC/NAICS codes, and description consistently confirm
     membership in that sector.
-  - When the evidence tilts toward the target industry but is not definitive, prefer
-    "pass" over "unknown" — a missed prospect is a worse outcome than a false lead.
 
-"fail" — the company is clearly in a DIFFERENT industry supercategory:
-  - Its core activities have NO meaningful overlap with the target industry.
-  - Reserve FAIL for UNAMBIGUOUS mismatches only — not borderline judgement calls.
-  - The company's own industry label and what it does must both point clearly away
-    from the target sector.
-  - IMPORTANT: A company that SERVES, DISTRIBUTES, or SELLS TO companies in the
-    target industry is NOT automatically a FAIL — evaluate its own primary business,
-    not its customer base. Only FAIL if the company's own core activity is clearly
-    outside the target industry.
+"fail" — the company clearly does NOT belong to the target industry:
+  - Its core activities have no meaningful overlap with the target industry.
+  - The company's industry label AND description both point away from the target sector.
+  - A company that serves or sells to companies in the target industry is not
+    automatically a fail — evaluate what the company itself primarily does.
 
-"unknown" — too ambiguous or too thin to decide:
-  - Description is very short, generic, or uses only vague terms ("provider of
-    solutions", "leading supplier of products").
-  - The company could plausibly belong to the target industry OR to another sector.
+"unknown" — the available signals are too thin or conflicting to decide:
+  - Description is very short, generic, or uses only vague terms.
+  - The company could plausibly belong to the target industry or to another sector.
   - Industry label and description give conflicting or unclear signals.
-  - Genuinely borderline — the company straddles two industry categories.
+  - The company genuinely straddles two industry categories.
 
 CALIBRATION RULES:
-  1. Wrong FAILs eliminate real prospects permanently. Wrong PASSes are caught by the
-     deeper ICP qualification stage. Always err toward PASS or UNKNOWN over FAIL.
-  2. UNKNOWN is always a pass-through — it never eliminates a company.
-  3. SIC/NAICS codes provide supporting evidence but do not override a clear description.
-     Descriptions and industry labels take precedence when they conflict with codes.
-  4. If the industry label places the company clearly in the target sector AND the
-     description does not explicitly contradict that — return PASS or UNKNOWN, not FAIL.
-  5. Do not invent reasons to FAIL. If you are unsure, UNKNOWN is correct.\
+  1. Follow the evidence — do not invent reasons to pass or fail. Let the industry
+     label, SIC/NAICS code, and description speak for themselves.
+  2. UNKNOWN is a pass-through — use it only when the signals are genuinely
+     insufficient or contradictory, not as a default to avoid making a call.
+  3. SIC/NAICS codes are supporting evidence. State what the code means and whether
+     it aligns or conflicts with the description. Source data sometimes assigns
+     incorrect codes — if the code and description clearly contradict each other,
+     explain the conflict and state which signal is more reliable and why.
+  4. If all three signals (industry label, SIC/NAICS, description) agree, the verdict
+     should match them — pass if they all point to the target industry, fail if they
+     all point away from it.
+  5. Only use UNKNOWN when at least one signal is missing or signals genuinely conflict
+     with no clear way to resolve the contradiction.
+  6. Treat the target industry as a BROAD SUPERCATEGORY. Any company whose primary
+     business falls within a recognised subcategory of the target industry is a PASS.
+     Do not require an exact label match — classify by what the company actually does,
+     not by whether the wording of its label exactly matches the target industry name.
+
+REASONING FIELDS — fill each field precisely:
+
+decision_reason   : One sentence — the single clearest reason the company was approved, rejected, or marked inconclusive.
+industry_label_signal : State the label and whether it aligns with, conflicts with, or is unrelated to the target industry.
+sic_signal        : State the SIC code number and its official category name, then state whether it aligns or conflicts with the target industry.
+naics_signal      : State the NAICS code number and its official category name, then state whether it aligns or conflicts with the target industry.
+description_signal: Quote the single most relevant phrase from the description verbatim, then state what it confirms or contradicts.
+signals_conclusion: State whether all signals agree or conflict. If conflict, name which signal is most reliable and why.
+\
 """
 
 
@@ -517,13 +399,24 @@ class LeadFitScreener:
         sz_v, sz_e = match_size(csv_size, target_size)
         size_check = CheckResult(verdict=sz_v, evidence=sz_e)
 
-        # ── Check 3: Industry (LLM — always runs) ───────────────────────────
+        # ── Check 3: Industry (LLM) ──────────────────────────────────────────
+        # Short-circuit: if location or size is already a hard FAIL the final
+        # verdict is FAIL regardless of industry — skip the LLM call entirely.
+        _already_rejected = (
+            location_check.verdict == "fail" or size_check.verdict == "fail"
+        )
+
         from app.core.logging_config import agent_label_var, company_domain_var
         _dom_tok = company_domain_var.set(company_data.get("domain") or company_data.get("website") or name)
         _ag_tok  = agent_label_var.set("screener")
         tok_usage: dict = {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}
         try:
-            if _is_blank(target_industry):
+            if _already_rejected:
+                industry_check = CheckResult(
+                    verdict="unknown",
+                    evidence="Skipped — company already rejected on location/size.",
+                )
+            elif _is_blank(target_industry):
                 industry_check = CheckResult(verdict="pass", evidence="No target industry specified.")
             else:
                 sys_msg = self.build_system_message(
@@ -603,11 +496,11 @@ class LeadFitScreener:
             + "=" * 60 + "\n"
             + "CAMPAIGN CONTEXT — same for every company in this batch:\n\n"
             + "SENDER CONTEXT (for industry boundary reference only):\n"
-            + f"- Sender sells to: {sender_customers}\n"
-            + f"- Sender's offerings: {sender_services}\n\n"
-            + "CAMPAIGN OBJECTIVE (the specific goal the campaign is targeting — use this to\n"
-            + "understand the operational context and what kind of companies are sought beyond\n"
-            + "the industry label alone):\n"
+            + f"- Sender sells to: {sender_customers[:300]}\n"
+            + f"- Sender's offerings: {sender_services[:300]}\n\n"
+            + "CAMPAIGN OBJECTIVE (use this only to understand the industry boundary —\n"
+            + "do not use it to stretch or narrow the target industry beyond what the\n"
+            + "TARGET INDUSTRY label already states):\n"
             + f"{campaign_prompt[:500]}\n\n"
             + f"TARGET INDUSTRY: {target_industry}\n\n"
             + "Classify the company supplied in the next message."
@@ -666,9 +559,18 @@ class LeadFitScreener:
                 details = token_usage.get("prompt_tokens_details") or {}
                 tok["cached_tokens"] = details.get("cached_tokens", 0) or 0
 
+            decision_word = {"pass": "APPROVED", "fail": "REJECTED", "unknown": "INCONCLUSIVE"}.get(parsed.verdict, parsed.verdict.upper())
+            evidence = (
+                f"DECISION: {decision_word} — {parsed.decision_reason}\n"
+                f"- Industry label: {parsed.industry_label_signal}\n"
+                f"- {parsed.sic_signal}\n"
+                f"- {parsed.naics_signal}\n"
+                f"- Description: {parsed.description_signal}\n"
+                f"- Signals: {parsed.signals_conclusion}"
+            )
             check = CheckResult(
                 verdict=parsed.verdict,
-                evidence=f"[{parsed.actual_business}] {parsed.evidence}",
+                evidence=evidence,
             )
             return check, tok
 

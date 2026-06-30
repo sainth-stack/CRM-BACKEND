@@ -55,13 +55,13 @@ from app.core.logging_config import logger
 # =============================================================================
 # CONFIG
 # =============================================================================
-SITE_CHAR_BUDGET        = 12_000
-PRESS_CHAR_BUDGET       = 6_000
+SITE_CHAR_BUDGET        = 8_000    # was 12_000 — prefilter selects high-signal paras, 8K sufficient
+PRESS_CHAR_BUDGET       = 6_000    # kept at 6K — certifications (AS9100/Nadcap/ASME) need the depth
 NEWS_CHAR_BUDGET        = 2_500
 DDGS_CHAR_BUDGET        = 4_500
 HIRING_CHAR_BUDGET      = 2_000
 WIKI_CHAR_BUDGET        = 1_500
-PAIN_SIGNALS_CHAR_BUDGET = 4_000   # L6 — targeted pain-signal search results
+PAIN_SIGNALS_CHAR_BUDGET = 2_000   # was 4_000 — L6 DDGS snippets rarely exceed 2K
 
 HARD_TIMEOUT_SEC        = int(os.getenv("ENRICH_TIMEOUT_SEC", "75"))     # per-company watchdog (seconds)
 DDGS_CONCURRENCY        = int(os.getenv("ENRICH_DDGS_CONCURRENCY", "4"))  # max concurrent DDGS thread-pool calls (global)
@@ -766,7 +766,10 @@ async def _layer6_pain_signals(
 # =============================================================================
 # LLM extraction — fuses all layers into a CompanyEnrichment record
 # =============================================================================
-_ENRICH_PROMPT = """\
+# Static rules in a system message so OpenAI's prompt cache fires across all
+# companies in a batch (cache key = system message content, stable per run).
+# Company-specific data goes in the user message only.
+_ENRICH_SYSTEM = """\
 You are a B2B data-enrichment analyst. COLLECT signal-level company intelligence for a
 downstream ICP system. Do NOT score or judge fit.
 
@@ -787,7 +790,7 @@ RULES:
    Never write "indicates a need for…", "suggests pressure to…", or any analysis of what an event
    means — that reasoning belongs in pain_points. Write only the event itself (what happened, when).
 
-2. ENTITY FILTER: growth_signals and recent_events MUST be about {company_name} ITSELF, not
+2. ENTITY FILTER: growth_signals and recent_events MUST be about the target company ITSELF, not
    partners, industry trends, or other organisations.
 
 3. INFERENCE FIELD DISCIPLINE — where inferences belong:
@@ -805,8 +808,8 @@ RULES:
      from the company's own website or an official press release / news article. REJECT estimates
      from third-party aggregators (ZoomInfo, Owler, Craft.co, Dun & Bradstreet, Growjo, LeadIQ,
      Tracxn, etc.) — they are modelled estimates, not verified facts.
-   - Cross-check source URLs against the company domain ({domain}). If a search snippet clearly
-     refers to a different company that shares a word in the name, IGNORE it.
+   - Cross-check source URLs against the company domain. If a search snippet clearly refers to a
+     different company that shares a word in the name, IGNORE it.
 
 6. OTHER RULES:
    - hiring_signals: use the LIVE HIRING section for actual job postings.
@@ -834,8 +837,10 @@ RULES:
    - key_initiatives: strategic programs named in the sources; no invented phrases.
    - Return [] for fact lists (growth_signals, recent_events, hiring_signals) when evidence
      is absent. pain_points should always have 2–4 bullets unless the context is truly empty.
-   - Mine overview, products_services, and target_customers thoroughly from the website.
+   - Mine overview, products_services, and target_customers thoroughly from the website.\
+"""
 
+_ENRICH_USER = """\
 COMPANY: {company_name}  |  DOMAIN: {domain}
 
 === WEBSITE CONTENT (overview, products, customers) ===
@@ -863,7 +868,7 @@ COMPANY: {company_name}  |  DOMAIN: {domain}
     press releases mentioning the sender's pain vocabulary; empty when not supplied) ===
 {pain_signals_content}
 
-Produce the CompanyEnrichment record now.
+Produce the CompanyEnrichment record now.\
 """
 
 
@@ -874,13 +879,19 @@ async def _llm_extract(
     tech_stack: list[str],
     pain_signals_content: str = "",
 ) -> Optional[CompanyEnrichment]:
+    from langchain_core.messages import SystemMessage, HumanMessage
     from app.core.llm import get_chat_llm
     from app.core.logging_config import agent_label_var, company_domain_var
+
     llm   = get_chat_llm("enrichment", timeout=90)
     chain = llm.with_structured_output(CompanyEnrichment)
-    prompt = _ENRICH_PROMPT.format(
-        company_name=company_name, domain=domain,
+
+    system_msg = SystemMessage(content=_ENRICH_SYSTEM.format(
         signal_cutoff_year=_SIGNAL_CUTOFF_YEAR,
+    ))
+    user_msg = HumanMessage(content=_ENRICH_USER.format(
+        company_name=company_name,
+        domain=domain,
         site_content=_prefilter_enrichment(site_content, SITE_CHAR_BUDGET),
         wiki_content=(wiki_content or "[No Wikipedia entry]")[:WIKI_CHAR_BUDGET],
         owned_content=(owned_content or "[None found]")[:PRESS_CHAR_BUDGET],
@@ -889,12 +900,13 @@ async def _llm_extract(
         hiring_content=hiring_content[:HIRING_CHAR_BUDGET],
         tech_stack=", ".join(tech_stack) if tech_stack else "None detected",
         pain_signals_content=(pain_signals_content or "[Not supplied]")[:PAIN_SIGNALS_CHAR_BUDGET],
-    )
+    ))
+
     # Label this call so cost tracking knows which agent + company produced the spend.
     _dom_tok = company_domain_var.set(domain)
     _ag_tok  = agent_label_var.set("enrichment_v2")
     try:
-        rec: CompanyEnrichment = await chain.ainvoke(prompt)
+        rec: CompanyEnrichment = await chain.ainvoke([system_msg, user_msg])
         return rec
     except Exception as e:
         logger.warning(f"[EnrichV2] LLM extraction failed for {company_name}: {e}")

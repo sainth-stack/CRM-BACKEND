@@ -44,7 +44,7 @@ class Settings:
     #   Tier 2 (2M TPM):   floor(2M   / 12.5K × 0.90) = 144  (cap at 40 for RAM)
     #   Tier 3+:           raise further as needed
     # Running at 20 on Tier-1 generates ~250K TPM → trips circuit breaker repeatedly.
-    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "14"))        # enrich + ICP — TPM-bound (Tier-1 safe ceiling)
+    ICP_CONCURRENCY = int(os.getenv("ICP_CONCURRENCY", "13"))        # screener + enrich + ICP — Tier-1 safe ceiling (200K TPM)
     STAGE5_CONCURRENCY = int(os.getenv("STAGE5_CONCURRENCY", "25"))   # stakeholder ranking (~2K tokens/call — TPM-safe)
     STAGE6_CONCURRENCY = int(os.getenv("STAGE6_CONCURRENCY", "20"))   # email drafting — reduced from 25; retry storms at 25 can hit ~250K TPM
 

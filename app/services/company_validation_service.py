@@ -210,32 +210,21 @@ none). If the evidence is thin, capture only what is grounded and say so in the 
 
 
 # Call 2 (per company): MEDDPICC validation against sender profile + campaign.
-# The static campaign-level block is IDENTICAL across all companies in a run —
-# OpenAI caches this prefix; only the TARGET RECORD at the end is per-company.
-_VALIDATE_PROMPT = ChatPromptTemplate.from_template(
-    """You are a STRICT B2B ICP analyst qualifying an OUTBOUND lead before any contact. Your #1 job is to
+#
+# Three-part message structure for prompt caching:
+#   SystemMessage  — static rules that never change (cached across ALL campaigns)
+#   HumanMessage 1 — campaign-level inputs (same for every company in this run,
+#                    cached after the first company in the batch)
+#   HumanMessage 2 — per-company target record (changes every call)
+#
+# This replaces the old ChatPromptTemplate.from_template approach which put
+# everything in one user message, preventing any cache hits.
+
+_VALIDATE_SYSTEM = """\
+You are a STRICT B2B ICP analyst qualifying an OUTBOUND lead before any contact. Your #1 job is to
 PREVENT false positives and stay fully grounded. Quote facts from the RESEARCH PROFILE; never invent
 needs, names, or firmographics. Everything sender-related must be derived from THIS sender — no
 fixed-industry assumptions.
-
-==================== CAMPAIGN-LEVEL INPUTS (identical for every company in this run) ====================
-These inputs are the SAME for every lead in the campaign. They form the cache-stable prefix; the only
-per-company data is the TARGET RECORD at the very end.
-
-SENDER PROFILE — who is doing the outreach:
-- Company: {sender_name}
-- Offerings: {sender_offerings}
-- Sells to (their ICP): {sender_customers}
-- Differentiators: {sender_advantages}
-- Capability → customer-pain map: {sender_capmap}
-- Proof points: {sender_proof}
-- Business summary: {sender_research}
-
-CAMPAIGN OBJECTIVE — the user's own words: {campaign_prompt}
-
-APPROVAL THRESHOLD: {threshold}/100. A company is ACCEPTED when its fit score reaches this threshold.
-Calibrate operational_overlap HONESTLY against this bar — never inflate to clear it, never deflate a
-genuine fit.
 
 NOTE: Firmographic pre-filtering (industry / location / employee-size) was handled upstream by
 LeadFitScreener. Only companies that cleared that screen reach you. Do NOT re-evaluate firmographics —
@@ -301,17 +290,38 @@ paper_process, discovery_checklist: fill these from the profile + sender context
 business_opportunity_reason: the 'why now' anchored to ONE specific fact in the profile. State plainly
 if no concrete trigger was found.
 matched_pains / matched_services: the sender pains/services that apply to what the profile shows.
-overall_reasoning: professional 2-3 sentence FACTUAL assessment using the exact sender name
-{sender_name}. Ground in what the company DOES. FORBIDDEN: any sentence about missing/unstated
+overall_reasoning: professional 2-3 sentence FACTUAL assessment using the exact sender name from the
+campaign inputs. Ground in what the company DOES. FORBIDDEN: any sentence about missing/unstated
 information. No scores, field names, booleans, or verdict labels. No accept/reject recommendation.
-confidence: 0-100.
+confidence: 0-100.\
+"""
 
+_VALIDATE_CAMPAIGN = """\
+==================== CAMPAIGN-LEVEL INPUTS (same for every company in this run) ====================
+
+SENDER PROFILE — who is doing the outreach:
+- Company: {sender_name}
+- Offerings: {sender_offerings}
+- Sells to (their ICP): {sender_customers}
+- Differentiators: {sender_advantages}
+- Capability → customer-pain map: {sender_capmap}
+- Proof points: {sender_proof}
+- Business summary: {sender_research}
+
+CAMPAIGN OBJECTIVE — the user's own words: {campaign_prompt}
+
+APPROVAL THRESHOLD: {threshold}/100. A company is ACCEPTED when its fit score reaches this threshold.
+Calibrate operational_overlap HONESTLY against this bar — never inflate to clear it, never deflate a
+genuine fit.\
+"""
+
+_VALIDATE_TARGET = """\
 ==================== TARGET RECORD (the ONLY per-company input) ====================
 TARGET COMPANY:
 - Name: {name}
 - RESEARCH PROFILE (THE evidence — quote from it):
-\"\"\"{profile}\"\"\""""
-)
+\"\"\"{profile}\"\"\"\
+"""
 
 
 # ===========================================================================
@@ -851,23 +861,41 @@ class CompanyValidationService:
         sender_research: str,
         campaign_prompt: str,
     ) -> ICPMeddpiccJudgment:
+        from langchain_core.messages import SystemMessage, HumanMessage
         from app.core.logging_config import agent_label_var
-        chain = _VALIDATE_PROMPT | self.reasoning_llm.with_structured_output(ICPMeddpiccJudgment)
+
+        chain = self.reasoning_llm.with_structured_output(ICPMeddpiccJudgment)
+
+        # SystemMessage — static rules, cached across all campaigns.
+        system_msg = SystemMessage(content=_VALIDATE_SYSTEM)
+
+        # HumanMessage 1 — campaign-level inputs, cached within a campaign run.
+        campaign_msg = HumanMessage(content=_VALIDATE_CAMPAIGN.format(
+            sender_name=sender_name,
+            sender_offerings=sender_offerings,
+            sender_customers=sender_customers,
+            sender_advantages=sender_advantages,
+            sender_capmap=sender_capmap[:2_000],
+            sender_proof=sender_proof,
+            sender_research=(sender_research or "N/A")[:3_000],
+            threshold=settings.ICP_ACCEPT_THRESHOLD,
+            campaign_prompt=campaign_prompt[:1_500],
+        ))
+
+        # HumanMessage 2 — per-company target record, changes every call.
+        # Profile cap kept at 8K: ICP-critical fields (growth_signals, hiring_signals,
+        # pain_points) render last in _render_profile_v2 and would be silently truncated
+        # at 4K for data-rich companies, directly hurting scoring accuracy.
+        target_msg = HumanMessage(content=_VALIDATE_TARGET.format(
+            name=name,
+            profile=rendered_profile[:8_000],
+        ))
+
         _ag_tok = agent_label_var.set("icp_validate")
         try:
-            result: ICPMeddpiccJudgment = await chain.ainvoke({
-                "sender_name":      sender_name,
-                "sender_offerings": sender_offerings,
-                "sender_customers": sender_customers,
-                "sender_advantages":sender_advantages,
-                "sender_capmap":    sender_capmap,
-                "sender_proof":     sender_proof,
-                "sender_research":  (sender_research or "N/A")[:3000],
-                "threshold":        settings.ICP_ACCEPT_THRESHOLD,
-                "campaign_prompt":  campaign_prompt[:1500],
-                "name":             name,
-                "profile":          rendered_profile[:8000],
-            })
+            result: ICPMeddpiccJudgment = await chain.ainvoke(
+                [system_msg, campaign_msg, target_msg]
+            )
         finally:
             agent_label_var.reset(_ag_tok)
         return result

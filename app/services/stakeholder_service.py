@@ -1,7 +1,7 @@
 import logging
 from typing import List, Dict, Any, Literal
 
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
 
 from app.core.llm import get_chat_llm
@@ -144,38 +144,17 @@ class StakeholderRankingService:
         return candidates
 
     # ------------------------------------------------------------------ #
-    # Scoring prompt                                                       #
+    # Prompt templates — split for prompt caching                         #
+    #                                                                     #
+    # SystemMessage  : static methodology (never changes)                 #
+    # HumanMessage 1 : campaign-level sender profile (same per campaign)  #
+    # HumanMessage 2 : per-company inputs (changes every call)            #
     # ------------------------------------------------------------------ #
-    async def _score_role_fit(
-        self, shortlist, user_intel, research_context, objective, industry=""
-    ) -> Dict[int, dict]:
-        target_profiles = user_intel.get("target_customers", [])
-        pains_solved = user_intel.get("capability_to_pain_map", [])
-
-        contact_lines = []
-        for idx, p in enumerate(shortlist):
-            contact_lines.append(
-                f"{idx}. Name: {p.get('contact_full_name', 'N/A')} | "
-                f"Title: {p.get('title') or p.get('position') or 'N/A'} | "
-                f"Seniority: {p.get('seniority', 'N/A')} | "
-                f"Department: {p.get('department', 'N/A')} | "
-                f"Time in role: {p.get('time_in_role', 'N/A')} | "
-                f"Time at company: {p.get('time_at_company', 'N/A')}"
-            )
-        contacts_block = "\n".join(contact_lines)
-
-        prompt = ChatPromptTemplate.from_template(
-            """You are a B2B sales strategist deciding WHO to contact at a target account.
+    _SYSTEM = """\
+You are a B2B sales strategist deciding WHO to contact at a target account.
 Score each contact 0-100 on how well they fit as the ECONOMIC BUYER, CHAMPION, or
 key INFLUENCER for what this sender is offering. Every score must be earned from
 the evidence — derive everything from the sender profile and company context below.
-
-════════════════════════════════════════════════════════
-SENDER PROFILE
-════════════════════════════════════════════════════════
-Ideal buyer profiles:  {target_profiles}
-Pains the sender solves: {pains_solved}
-Campaign objective:    {objective}
 
 ════════════════════════════════════════════════════════
 SCORING METHODOLOGY — apply all three in order
@@ -263,8 +242,19 @@ Write for a salesperson, in natural business language.
 BANNED phrases (expose the rubric — never write these):
   "irrelevant function", "aligns with", "does not align with", "buying committee",
   "key functions", "viability", "not viable", "pillar", "ceiling", "cap", "STEP",
-  "function fit", "economic buyer profile", "scoring rubric", "band", "score".
+  "function fit", "economic buyer profile", "scoring rubric", "band", "score".\
+"""
 
+    _CAMPAIGN = """\
+════════════════════════════════════════════════════════
+SENDER PROFILE
+════════════════════════════════════════════════════════
+Ideal buyer profiles:  {target_profiles}
+Pains the sender solves: {pains_solved}
+Campaign objective:    {objective}\
+"""
+
+    _TARGET = """\
 ════════════════════════════════════════════════════════
 TARGET COMPANY (the only per-company inputs)
 ════════════════════════════════════════════════════════
@@ -274,20 +264,47 @@ Research: {research_context}
 CONTACTS — score EVERY index 0-100 (the system applies the ceiling from STEP B in code):
 {contacts_block}
 
-First output the `company_fit` verdict, then a ranking entry for EVERY index."""
-        )
+First output the `company_fit` verdict, then a ranking entry for EVERY index.\
+"""
+
+    # ------------------------------------------------------------------ #
+    # Scoring                                                              #
+    # ------------------------------------------------------------------ #
+    async def _score_role_fit(
+        self, shortlist, user_intel, research_context, objective, industry=""
+    ) -> Dict[int, dict]:
+        target_profiles = user_intel.get("target_customers", [])
+        pains_solved = user_intel.get("capability_to_pain_map", [])
+
+        contact_lines = []
+        for idx, p in enumerate(shortlist):
+            contact_lines.append(
+                f"{idx}. Name: {p.get('contact_full_name', 'N/A')} | "
+                f"Title: {p.get('title') or p.get('position') or 'N/A'} | "
+                f"Seniority: {p.get('seniority', 'N/A')} | "
+                f"Department: {p.get('department', 'N/A')} | "
+                f"Time in role: {p.get('time_in_role', 'N/A')} | "
+                f"Time at company: {p.get('time_at_company', 'N/A')}"
+            )
+        contacts_block = "\n".join(contact_lines)
+
+        messages = [
+            SystemMessage(content=self._SYSTEM),
+            HumanMessage(content=self._CAMPAIGN.format(
+                target_profiles=str(target_profiles)[:1500],
+                pains_solved=str(pains_solved)[:1500],
+                objective=(objective or "(general outreach)")[:1000],
+            )),
+            HumanMessage(content=self._TARGET.format(
+                industry=(industry or "(unspecified)")[:300],
+                research_context=(research_context or "N/A")[:2000],
+                contacts_block=contacts_block,
+            )),
+        ]
 
         structured = self.llm.with_structured_output(StakeholderRanking)
-        chain = prompt | structured
         try:
-            result: StakeholderRanking = await chain.ainvoke({
-                "target_profiles": str(target_profiles)[:1500],
-                "pains_solved": str(pains_solved)[:1500],
-                "objective": (objective or "(general outreach)")[:1000],
-                "industry": (industry or "(unspecified)")[:300],
-                "research_context": (research_context or "N/A")[:2000],
-                "contacts_block": contacts_block,
-            })
+            result: StakeholderRanking = await structured.ainvoke(messages)
             ceiling = _COMPANY_FIT_CEILING.get(result.company_fit, 100)
             logger.info(f"[STAKEHOLDER] company_fit={result.company_fit} ceiling={ceiling}")
             raw = {

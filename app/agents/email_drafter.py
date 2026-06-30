@@ -67,7 +67,7 @@ ALTERNATIVE AVAILABLE SLOTS:
 {alternative_slots_context}
 
 GREETING (BOTH modes, ALWAYS): begin with "Hi <first name>," using ONLY the first word of "{dm_name}" —
-on its own line, followed by a blank line.
+on its own line. THEN a blank line before Para 1.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STRATEGY — apply the section that matches Follow-up #{followup_number}
@@ -179,41 +179,98 @@ STRICT CONSTRAINTS (both follow-up numbers)
 10. Return subject + body.
 """
 
+_GREETING_LINE_RE = re.compile(r'^\s*(hi|hello|hey)\s+[^,\n]+,?\s*$', re.IGNORECASE)
+
+_RE_PREFIX_RE = re.compile(r'^(re:\s*)+', re.IGNORECASE)
+
+
+def root_subject(subject: str | None) -> str:
+    """Strip any existing 'Re:' prefix(es) to get back the original subject line."""
+    return _RE_PREFIX_RE.sub('', subject or '').strip()
+
+
+def reply_subject(original_subject: str | None) -> str:
+    """Build the subject for a follow-up/reminder so every email to the same
+    prospect threads under one subject line, instead of a fresh AI-generated
+    subject each time (which breaks subject-based thread grouping in most
+    mail clients)."""
+    root = root_subject(original_subject)
+    return f"Re: {root}" if root else "Checking in"
+
+
 def clean_email_body(body: str) -> str:
-    """Cleans single line breaks inside paragraphs to prevent jagged wrapping, while preserving signature spacing."""
+    """Cleans single line breaks inside paragraphs to prevent jagged wrapping, while
+    preserving signature spacing.
+
+    Every drafter's output passes through here, so this is the single place that
+    guarantees consistent formatting app-wide — even if a given LLM call drifts
+    from the prompt instruction.
+    """
     if not body:
         return ""
     body = body.replace("\r\n", "\n")
     body = re.sub(r'\n{3,}', '\n\n', body)
-    
+
     # 1. Look for signature block starting with a signoff keyword at the end
     signoff_pattern = r'\n+(best regards|best|sincerely|regards|thanks|warmly|cheers|best wishes),?\s*\n\s*(.+)$'
     match = re.search(signoff_pattern, body, re.IGNORECASE | re.DOTALL)
-    
+
     signature_block = ""
     if match:
         body = body[:match.start()]
         sign_off = match.group(1)
         sig_lines = match.group(2).strip()
         signature_block = f"\n\n{sign_off.capitalize()},\n\n{sig_lines}"
-        
+
     # 2. Clean main paragraphs
     parts = body.split('\n\n')
     cleaned_parts = []
-    for part in parts:
+    for idx, part in enumerate(parts):
         part = part.strip()
         if not part:
             continue
-        cleaned_part = re.sub(r'(?<!\n)\n(?!\n)', ' ', part)
+
+        lines = [l.strip() for l in part.split('\n') if l.strip()]
+
+        # The opening block is the greeting. Keep it on its own line untouched.
+        if idx == 0 and lines and _GREETING_LINE_RE.match(lines[0]):
+            cleaned_part = '\n'.join(lines)
+        else:
+            cleaned_part = re.sub(r'(?<!\n)\n(?!\n)', ' ', part)
+
         cleaned_parts.append(cleaned_part)
-        
+
     cleaned_body = '\n\n'.join(cleaned_parts).strip()
-    
+
     # 3. Re-append protected signature block
     if signature_block:
         cleaned_body += signature_block
-        
+
     return cleaned_body
+
+
+_HOPE_LINE = "I hope you are doing well,"
+
+
+def insert_initial_hope_line(body: str) -> str:
+    """INITIAL email only: hardcode 'I hope you are doing well,' as its own
+    paragraph directly under the greeting, regardless of what the LLM wrote.
+
+    Call this on the Email 1 / INITIAL draft only — never on follow-ups or
+    reminders. Must run on the final, already-cleaned body: sequence_graph.py's
+    own banned-phrase validator rejects this exact phrase, so inserting it
+    before that validator runs would just burn rewrite attempts.
+    """
+    if not body:
+        return body
+    parts = body.split('\n\n', 1)
+    greeting = parts[0].strip()
+    if not _GREETING_LINE_RE.match(greeting):
+        return body
+    rest = parts[1].lstrip('\n') if len(parts) > 1 else ""
+    if rest.strip().lower().startswith(_HOPE_LINE.lower()):
+        return body  # already present — don't duplicate
+    return f"{greeting}\n\n{_HOPE_LINE}\n\n{rest}".rstrip() + ("\n" if body.endswith("\n") else "")
 
 
 from pydantic import BaseModel, Field
@@ -357,7 +414,7 @@ ALL EMAILS WE HAVE SENT (oldest → newest):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 GREETING (ALWAYS): begin with "Hi <first name>," using ONLY the first word of "{dm_name}" —
-on its own line, followed by a blank line.
+on its own line. THEN a blank line before Para 1.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STRATEGY — apply the section that matches Reminder #{reminder_number}
@@ -476,10 +533,10 @@ def draft_reminder_escalation_email(
         if data:
             dumped = data.model_dump()
             return clean_email_body(dumped["body"])
-        return f"Hi {dm_name}, I wanted to follow up on my previous message.\n\nBest regards,\n\n{user_name}\n{ui.get('company_name', '')}"
+        return clean_email_body(f"Hi {_first_name(dm_name)},\n\nI wanted to follow up on my previous message.\n\nBest regards,\n\n{user_name}\n{ui.get('company_name', '')}")
     except Exception as e:
         logger.error(f"[GHOSTWRITER] Reminder escalation drafting failure: {e}")
-        return f"Hi {dm_name}, I wanted to follow up on my previous message.\n\nBest regards,\n\n{user_name}\n{ui.get('company_name', '')}"
+        return clean_email_body(f"Hi {_first_name(dm_name)},\n\nI wanted to follow up on my previous message.\n\nBest regards,\n\n{user_name}\n{ui.get('company_name', '')}")
 
 
 def _first_name(name: str | None) -> str:
@@ -576,15 +633,18 @@ def draft_discovery_request(user_intel: dict, dm_name: str, dm_position: str, ta
     Previous Interest Context:
     - Interest Signal: {last_interest}
     
+    GREETING (ALWAYS): begin with "Hi <first name>," using ONLY the first word of "{dm_name}" — on its
+    own line. THEN a blank line before the rest of the email.
+
     STRATEGY:
     - Acknowledge their interest briefly.
     - {booking_context}
-    
+
     STRICT CONSTRAINTS:
     1. NO PLACEHOLDERS.
     2. Sign off exactly as follows, with a double line break after 'Best regards,' and a single line break between the sender name and the company name:
        "Best regards,
-       
+
        {user_real_name}
        {user_name}"
     3. Keep it under 80 words.

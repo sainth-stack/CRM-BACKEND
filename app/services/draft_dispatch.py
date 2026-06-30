@@ -29,6 +29,7 @@ def _apply_sent_draft_effects(
     *,
     message_id: str,
     thread_id: str | None,
+    rfc_message_id: str | None = None,
     sent_at: datetime.datetime,
     dispatch_state: str = "SENT",
     dispatch_error: str | None = None,
@@ -56,6 +57,7 @@ def _apply_sent_draft_effects(
         dm = db_draft.dm
         dm.last_message_id = message_id
         dm.thread_id = thread_id or dm.thread_id
+        dm.last_rfc_message_id = rfc_message_id or dm.last_rfc_message_id
         dm.last_sent_at = sent_at
         dm.termination_reason = None
         dm.retry_after = None
@@ -140,6 +142,7 @@ def _recover_sent_draft_persistence(
     *,
     message_id: str,
     thread_id: str | None,
+    rfc_message_id: str | None = None,
     sent_at: datetime.datetime,
     dispatch_error: str,
 ) -> bool:
@@ -159,6 +162,7 @@ def _recover_sent_draft_persistence(
             draft,
             message_id=message_id,
             thread_id=thread_id,
+            rfc_message_id=rfc_message_id,
             sent_at=sent_at,
             dispatch_state="REQUIRES_REVIEW",
             dispatch_error=dispatch_error,
@@ -214,6 +218,7 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
     lock_key = f"send_draft:{draft_id}"
     msg_id = None
     thread_id = None
+    rfc_message_id = None
     sent_at = None
 
     try:
@@ -258,24 +263,28 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
 
         creds = TokenService.get_google_credentials(db, db_draft.campaign.user_id)
         thread_id = db_draft.dm.thread_id if db_draft.dm else None
+        in_reply_to = db_draft.dm.last_rfc_message_id if db_draft.dm else None
         msg_data = email_service.send_email(
             to_email=prospect_email,
             subject=db_draft.subject,
             body=db_draft.body,
             creds=creds,
             thread_id=thread_id,
+            in_reply_to_message_id=in_reply_to,
         )
         msg_id = msg_data["id"]
         thread_id = msg_data["thread_id"]
+        rfc_message_id = msg_data.get("rfc_message_id")
 
         from app.services.observability_service import ObservabilityService
-        
+
         sent_at = datetime.datetime.now(UTC).replace(tzinfo=None)
         _apply_sent_draft_effects(
             db,
             db_draft,
             message_id=msg_id,
             thread_id=thread_id,
+            rfc_message_id=rfc_message_id,
             sent_at=sent_at,
         )
         db.commit()
@@ -290,6 +299,7 @@ def execute_draft_send(draft_id: str) -> dict[str, str]:
                 draft_id,
                 message_id=msg_id,
                 thread_id=thread_id,
+                rfc_message_id=rfc_message_id,
                 sent_at=sent_at,
                 dispatch_error=f"Recovered after post-send persistence error: {str(exc)}",
             )

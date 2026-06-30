@@ -22,14 +22,10 @@ from app.core.security import (
 )
 from app.core.token_service import TokenService
 from app.core.email_service import email_service
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+from app.core.limiter import limiter
 from app.core.logging_config import logger
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
-
-# Module-level limiter (shares state with main app via Cloud Redis)
-limiter = Limiter(key_func=get_remote_address, storage_uri=os.getenv("REDIS_URL"))
 
 
 def _lock_query(query):
@@ -1413,5 +1409,4 @@ def trigger_token_refresh(
     return {
         "message": "Token refresh completed",
         "results": results,
-        "next_auto_refresh": (datetime.datetime.now(UTC) + timedelta(hours=6)).isoformat()
     }

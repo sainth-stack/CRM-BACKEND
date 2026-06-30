@@ -304,7 +304,8 @@ def _split_paragraphs(body: str) -> List[str]:
     paras = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
     return [
         p for p in paras
-        if not re.match(r"^hi\s+\w+,?\s*$", p, re.I)
+        # Exclude the greeting line ("Hi <name>,") from the content paragraphs.
+        if not re.match(r"^hi\s+\w+,?", p, re.I)
         and not re.match(r"^best\b", p, re.I)
         and not re.match(r"^regards\b", p, re.I)
     ]

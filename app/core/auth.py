@@ -1,7 +1,8 @@
 import os
 from app.core.logging_config import logger
 import requests
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from datetime import datetime, timedelta
 from fastapi import HTTPException, status
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
@@ -202,6 +203,39 @@ class MicrosoftAuthService:
         raise NotImplementedError("Microsoft Auth engagement protocol pending mobilization.")
 
 
+def _resolve_cal_expiry(data: Dict[str, Any]) -> Optional[str]:
+    """Resolve the access-token expiry from a Cal.com v2 token response.
+
+    Verified against the live API (2026-06-29): Cal.com's real response shape
+    is {"access_token", "refresh_token", "expires_in": 1800, "scope"} - a
+    RELATIVE duration in seconds. It does NOT send an absolute "expiresAt" /
+    "expires_at" timestamp, despite that being the field this code used to
+    look for exclusively (which meant the lookup always returned None and
+    silently fell through to a hardcoded 1800s guess in cal.py - coincidentally
+    correct only because Cal.com's real TTL also happens to be 1800s).
+
+    Check the relative field first since that's what Cal.com actually sends;
+    keep the absolute-timestamp check as a fallback in case a future API
+    version switches shape.
+
+    Returns a NAIVE (no tzinfo) ISO string in local time deliberately, NOT UTC:
+    every consumer of "expires_at" (cal.py, and the connect-mailbox endpoint in
+    this file) does `dateutil.parser.parse(...).replace(tzinfo=None)` and then
+    compares the result against bare `datetime.now()` (also naive-local). If
+    this returned a UTC-aware timestamp, `.replace(tzinfo=None)` would silently
+    drop the UTC offset instead of converting it, making the stored expiry
+    wrong by the local UTC offset (e.g. IST: off by 5.5 hours). Staying naive
+    here keeps the round trip correct under the codebase's existing convention.
+    """
+    expires_in = data.get("expiresIn") if data.get("expiresIn") is not None else data.get("expires_in")
+    if expires_in is not None:
+        try:
+            return (datetime.now() + timedelta(seconds=int(expires_in))).isoformat()
+        except (TypeError, ValueError):
+            pass
+    return data.get("expiresAt") or data.get("expires_at")
+
+
 class CalAuthService:
     @staticmethod
     def get_authorization_url(user_id: str, email: str = None) -> str:
@@ -290,11 +324,14 @@ class CalAuthService:
                 )
             response.raise_for_status()
             body = response.json()
-            # Cal.com v2 token response structure: {"status": "success", "data": {"accessToken": "...", "refreshToken": "...", "expiresAt": "..."}}
+            # Verified live (2026-06-29): Cal.com v2 returns the token pair flat,
+            # e.g. {"access_token", "refresh_token", "expires_in": 1800, "scope"} -
+            # not nested under "data" and not an absolute "expiresAt" timestamp.
+            # Keep the data.get("data", body) unwrap for resilience to either shape.
             data = body.get("data", body) if isinstance(body, dict) else {}
             access_token = data.get("accessToken") or data.get("access_token")
             refresh_token = data.get("refreshToken") or data.get("refresh_token")
-            expires_at = data.get("expiresAt") or data.get("expires_at")
+            expires_at = _resolve_cal_expiry(data)
 
             return {
                 "access_token": access_token,
@@ -338,7 +375,7 @@ class CalAuthService:
             data = body.get("data", body) if isinstance(body, dict) else {}
             access_token = data.get("accessToken") or data.get("access_token")
             new_refresh_token = data.get("refreshToken") or data.get("refresh_token") or refresh_token
-            expires_at = data.get("expiresAt") or data.get("expires_at")
+            expires_at = _resolve_cal_expiry(data)
 
             return {
                 "access_token": access_token,

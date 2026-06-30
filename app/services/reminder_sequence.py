@@ -108,8 +108,10 @@ def _sent_history(db, dm):
         f"[Reply {i + 1}] {(log.body or '')}"
         for i, log in enumerate(replies)
     ) or None
-    last_subject = sent[-1].subject if sent else None
-    return previous_emails, previous_replies, last_subject
+    # Root (first-ever) subject, not the most recent — the most recent may
+    # already carry a "Re:" prefix, which would otherwise double up.
+    root_subject = sent[0].subject if sent else None
+    return previous_emails, previous_replies, root_subject
 
 
 def _target_company_intel(dm) -> dict:
@@ -155,14 +157,14 @@ def create_next_reminder_draft_for_review(db, dm, *, actor: str = "orchestrator"
         dm.next_action_at = None
         return {"status": "existing", "draft": None, "reminder_number": reminder_number, "skipped": slot["skipped"]}
 
-    from app.agents.email_drafter import draft_asset_link_email, draft_reminder_escalation_email
+    from app.agents.email_drafter import draft_asset_link_email, draft_reminder_escalation_email, reply_subject
 
     campaign = dm.campaign
     ui = campaign.user_intel
     tc = dm.target_company
     user_name = _user_name(dm)
-    previous_emails, previous_replies, last_subject = _sent_history(db, dm)
-    subject = f"Re: {last_subject}" if last_subject else "Checking in"
+    previous_emails, previous_replies, root_subject = _sent_history(db, dm)
+    subject = reply_subject(root_subject)
 
     if slot["kind"] in ("ai_intro", "ai_soft_close"):
         body = draft_reminder_escalation_email(
@@ -191,7 +193,7 @@ def create_next_reminder_draft_for_review(db, dm, *, actor: str = "orchestrator"
             content_kind=slot["kind"],
             pain_hint=(tc.matched_pains or tc.pain_hooks or tc.opportunity_reason) if tc else None,
         )
-        subject = f"Re: {last_subject}" if last_subject else draft["subject"]
+        subject = reply_subject(root_subject) if root_subject else draft["subject"]
         body = draft["body"]
 
     draft = models.EmailDraft(

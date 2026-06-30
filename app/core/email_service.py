@@ -1,6 +1,7 @@
 import base64
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import make_msgid
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 import httplib2
@@ -11,21 +12,38 @@ from googleapiclient.errors import HttpError
 
 class EmailService:
     """
-    Service layer for GMail API interactions including campaign outreach, 
+    Service layer for GMail API interactions including campaign outreach,
     OTP verification, and account setup.
     """
     def __init__(self):
         # Cache Gmail service objects to avoid re-parsing the API discovery doc.
         self._service_cache = {}
-    
-    def send_email(self, to_email: str, subject: str, body: str, creds: Credentials, thread_id: str = None) -> dict:
-        """Send an email through the user's connected mailbox."""
+
+    def send_email(
+        self,
+        to_email: str,
+        subject: str,
+        body: str,
+        creds: Credentials,
+        thread_id: str = None,
+        in_reply_to_message_id: str = None,
+    ) -> dict:
+        """Send an email through the user's connected mailbox.
+
+        thread_id: Gmail's internal thread id — groups the message in the
+            sender's own Gmail conversation view via the API's `threadId` param.
+        in_reply_to_message_id: the RFC5322 Message-ID of the previous email WE
+            sent this prospect — required for the In-Reply-To/References headers
+            so the RECIPIENT's mail client (Gmail, Outlook, Apple Mail, etc.)
+            threads the conversation too. These are two different identifiers;
+            do not pass thread_id for this parameter.
+        """
         if not creds:
             logger.error(f"Email failed: No credentials for {to_email}")
             raise Exception("No mailbox credentials provided.")
 
         try:
-            return self._send_via_gmail(to_email, subject, body, creds, thread_id)
+            return self._send_via_gmail(to_email, subject, body, creds, thread_id, in_reply_to_message_id)
         except Exception as e:
             logger.error(f"[EMAIL] Failed to send to {to_email}: {e}", exc_info=True)
             raise e
@@ -44,7 +62,15 @@ class EmailService:
         return service
 
     @with_retries(max_attempts=3, base_delay=3.0, exceptions=(HttpError, httplib2.ServerNotFoundError, ConnectionError))
-    def _send_via_gmail(self, to_email: str, subject: str, body: str, creds: Credentials, thread_id: str = None) -> dict:
+    def _send_via_gmail(
+        self,
+        to_email: str,
+        subject: str,
+        body: str,
+        creds: Credentials,
+        thread_id: str = None,
+        in_reply_to_message_id: str = None,
+    ) -> dict:
         """Send via the Gmail API (supports threading) with a 10s timeout."""
         service = self._get_service(creds)
 
@@ -52,10 +78,19 @@ class EmailService:
         message['To'] = to_email
         message['Subject'] = subject
 
-        # Thread the reply when a thread id is supplied.
-        if thread_id:
-            message['In-Reply-To'] = thread_id
-            message['References'] = thread_id
+        # Every outgoing email gets its own RFC5322 Message-ID. We hand the
+        # value back to the caller so it can be stored and passed as
+        # in_reply_to_message_id on the NEXT email to this prospect.
+        new_message_id = make_msgid()
+        message['Message-ID'] = new_message_id
+
+        # Thread the reply: References/In-Reply-To must point at the previous
+        # email's real Message-ID, NOT Gmail's internal thread_id — those are
+        # different identifiers and mixing them up breaks threading for any
+        # client that isn't Gmail's own conversation view.
+        if in_reply_to_message_id:
+            message['In-Reply-To'] = in_reply_to_message_id
+            message['References'] = in_reply_to_message_id
 
         is_html = any(tag in body.lower() for tag in ["<html", "<div", "<p", "<table", "<body"])
         
@@ -91,7 +126,7 @@ class EmailService:
             msg_id = sent_msg.get('id')
             new_thread_id = sent_msg.get('threadId')
             logger.info(f"[GMAIL] Sent: {to_email} (ID: {msg_id})")
-            return {"id": msg_id, "thread_id": new_thread_id}
+            return {"id": msg_id, "thread_id": new_thread_id, "rfc_message_id": new_message_id}
         except Exception as e:
             logger.error(f"[GMAIL] Failed to send to {to_email}: {e}")
             raise e

@@ -1,5 +1,5 @@
 from app.db import models
-from app.agents.email_drafter import draft_followup_email, draft_discovery_request
+from app.agents.email_drafter import draft_followup_email, draft_discovery_request, reply_subject
 from app.services.drafting_service import DraftingService
 from app.workers.config.celery_app import celery_app
 from app.core.logging_config import logger
@@ -405,7 +405,7 @@ def draft_followup_worker(dm_id: str, db=None, manual_scheduling: bool = False, 
                 new_draft = models.EmailDraft(
                     campaign_id=campaign.id,
                     decision_maker_id=dm.id,
-                    subject=draft_data["subject"],
+                    subject=reply_subject(sent_logs[0].subject) if sent_logs else draft_data["subject"],
                     body=draft_data["body"],
                     status="DRAFTED",
                     followup_index=draft_index,
@@ -507,6 +507,11 @@ def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
             models.CommunicationLog.direction == "RECEIVED"
         ).order_by(models.CommunicationLog.received_at.desc()).first()
 
+        first_sent = db.query(models.CommunicationLog).filter(
+            models.CommunicationLog.dm_id == dm.id,
+            models.CommunicationLog.direction == "SENT"
+        ).order_by(models.CommunicationLog.received_at.asc()).first()
+
         draft = draft_discovery_request(
             user_intel=user_intel,
             dm_name=dm.name,
@@ -522,7 +527,7 @@ def draft_discovery_worker(dm_id: str, db=None, is_auto_booking: bool = False):
                 new_draft = models.EmailDraft(
                     campaign_id=campaign.id,
                     decision_maker_id=dm.id,
-                    subject=draft["subject"],
+                    subject=reply_subject(first_sent.subject) if first_sent else draft["subject"],
                     body=draft["body"],
                     status="DRAFTED",
                     followup_index=_next_discovery_draft_index(db, dm.id),

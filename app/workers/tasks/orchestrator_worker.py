@@ -248,6 +248,7 @@ def _apply_nudge_effects(
     body: str,
     message_id: str,
     thread_id: str | None,
+    rfc_message_id: str | None = None,
     sent_at: datetime.datetime,
     is_discovery: bool,
     expire_after_send: bool,
@@ -271,6 +272,7 @@ def _apply_nudge_effects(
 
     dm.last_message_id = message_id
     dm.thread_id = thread_id or dm.thread_id
+    dm.last_rfc_message_id = rfc_message_id or dm.last_rfc_message_id
     dm.last_sent_at = sent_at
     dm.reminder_count = reminder_number
     dm.termination_reason = None
@@ -324,6 +326,7 @@ def _recover_nudge_persistence(
     body: str,
     message_id: str,
     thread_id: str | None,
+    rfc_message_id: str | None = None,
     sent_at: datetime.datetime,
     is_discovery: bool,
     expire_after_send: bool,
@@ -345,7 +348,7 @@ def _recover_nudge_persistence(
                 recovery_db, dm,
                 next_state=next_state, reminder_number=reminder_number,
                 subject=subject, body=body, message_id=message_id,
-                thread_id=thread_id, sent_at=sent_at,
+                thread_id=thread_id, rfc_message_id=rfc_message_id, sent_at=sent_at,
                 is_discovery=is_discovery, expire_after_send=expire_after_send,
             )
             recovery_db.commit()
@@ -471,7 +474,8 @@ def _deploy_nudge(
                 user_name=user_name,
                 reminder_number=reminder_number,
             )
-        subject = f"Re: {last_sent.subject}" if last_sent else "Checking in"
+        from app.agents.email_drafter import reply_subject
+        subject = reply_subject(sent_logs[0].subject) if sent_logs else "Checking in"
 
         # Resolve timezone and book the next available slot
         prospect_tz = resolve_prospect_timezone(db, dm)
@@ -559,6 +563,7 @@ def send_scheduled_nudge_worker(
                 body=body,
                 creds=creds,
                 thread_id=dm.thread_id,
+                in_reply_to_message_id=dm.last_rfc_message_id,
             )
             sent_at = utcnow_naive()
             next_state = models.ProspectState(next_state_value)
@@ -571,6 +576,7 @@ def send_scheduled_nudge_worker(
                 body=body,
                 message_id=msg_data["id"],
                 thread_id=msg_data.get("thread_id"),
+                rfc_message_id=msg_data.get("rfc_message_id"),
                 sent_at=sent_at,
                 is_discovery=is_discovery,
                 expire_after_send=expire_after_send,

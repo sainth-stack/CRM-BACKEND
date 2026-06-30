@@ -125,6 +125,10 @@ class DecisionMaker(Base):
 
     last_message_id = Column(String, nullable=True)
     thread_id = Column(String, nullable=True, index=True)
+    # RFC5322 Message-ID header (e.g. "<abc123@mail.acme.com>") of the last email WE sent
+    # this prospect. Used for In-Reply-To/References on the NEXT send so every client
+    # (not just Gmail's own threadId heuristics) threads the conversation correctly.
+    last_rfc_message_id = Column(String, nullable=True)
     
     # Meeting & Reminder Synchronization
     scheduled_time_utc = Column(DateTime, nullable=True) # Canonical UTC coordinate

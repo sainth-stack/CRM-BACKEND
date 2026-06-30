@@ -68,6 +68,9 @@ def _send_reminder(db, dm, reminder_type: str):
         body += f"Note: {dm.scheduling_note}\n\n"
     body += f"Meeting Link: {dm.meeting_link}\n\nLooking forward to it!"
     creds = TokenService.get_google_credentials(db, dm.campaign.user_id)
-    email_service.send_email(dm.email, subject, body, creds=creds, thread_id=dm.thread_id)
+    email_service.send_email(
+        dm.email, subject, body, creds=creds,
+        thread_id=dm.thread_id, in_reply_to_message_id=dm.last_rfc_message_id,
+    )
     logger.info(f"[SENTINEL] {reminder_type} Reminder deployed for stakeholder {dm.name}")
 

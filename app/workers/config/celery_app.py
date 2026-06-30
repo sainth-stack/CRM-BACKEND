@@ -121,7 +121,6 @@ celery_app = Celery(
         "app.workers.tasks.orchestrator_worker",
         "app.workers.tasks.reminders_worker",
         "app.workers.tasks.sweeper_worker",
-        "app.workers.tasks.token_refresh_worker",
     ],
     task_cls=CampaignBaseTask
 )
@@ -198,7 +197,6 @@ celery_app.conf.task_routes = {
     "app.workers.tasks.orchestrator_worker.*": {"queue": "orchestrator"},
     "app.workers.tasks.reminders_worker.*": {"queue": "orchestrator"},
     "app.workers.tasks.sweeper_worker.*": {"queue": "orchestrator"},
-    "app.workers.tasks.token_refresh_worker.*": {"queue": "orchestrator"},
 }
 
 celery_app.conf.beat_schedule = {
@@ -231,8 +229,9 @@ celery_app.conf.beat_schedule = {
         "schedule": float(settings.DISPATCH_POLL_SECONDS),
         "options": {"queue": "outbound_dispatch"},
     },
-    "refresh-oauth-tokens": {
-        "task": "app.workers.tasks.token_refresh_worker.refresh_expiring_tokens_task",
-        "schedule": float(settings.OAUTH_REFRESH_SECONDS),
-    },
+    # Proactive OAuth token refresh sweep removed: both Google (TokenService.
+    # get_google_credentials) and Cal.com (cal_provider.get_valid_access_token)
+    # already lazy-refresh on demand at every call site - settings-page loads,
+    # bookings, slot lookups, drafting - so a periodic global sweep across every
+    # user was redundant idle Redis/Celery traffic on top of the on-demand path.
 }

@@ -126,7 +126,13 @@ class Settings:
     # 10. STATE-MACHINE TIMERS & NUDGE TUNING COORDINATES
     REPLY_FALLBACK_WINDOW_DAYS = int(os.getenv("REPLY_FALLBACK_WINDOW_DAYS", "90"))
     NUDGE_DISPATCH_STALE_MINUTES = int(os.getenv("NUDGE_DISPATCH_STALE_MINUTES", "15"))
+
+    # === [TEST-TUNABLE] REMINDER WAIT TIME =================================
+    # How long to wait after sending an email before the NEXT follow-up/reminder
+    # to the same prospect becomes due. Lower this to test the reminder sequence
+    # faster (e.g. "2" = next reminder due in 2 minutes instead of 2 days).
     NUDGE_FOLLOWUP_DELAY_MINUTES = int(os.getenv("NUDGE_FOLLOWUP_DELAY_MINUTES", "2880"))
+    # =========================================================================
     SWEEP_STUCK_MINUTES = int(os.getenv("SWEEP_STUCK_MINUTES", "10"))
 
     # How long to hold sibling prospects after a discovery email is sent to one DM
@@ -143,13 +149,27 @@ class Settings:
     REMINDER_1H_MAX_MINUTES = int(os.getenv("REMINDER_1H_MAX_MINUTES", "75"))
 
     # 11. CELERY BEAT SCHEDULES (seconds between each periodic task run)
+
+    # === [TEST-TUNABLE] INBOX POLLING =======================================
+    # How often (seconds) the inbox_worker checks the mailbox for new prospect
+    # replies. Lower this to see incoming replies picked up faster during testing.
     INBOX_POLL_SECONDS            = int(os.getenv("INBOX_POLL_SECONDS",            "300"))    # 5 min
+    # =========================================================================
+
     MEETING_CHECK_SECONDS         = int(os.getenv("MEETING_CHECK_SECONDS",         "3600"))   # 1 hr
+
+    # === [TEST-TUNABLE] REMINDER SCHEDULING TRACKER =========================
+    # How often (seconds) the orchestrator's check_all_inactivity_task runs —
+    # this is the loop that notices a prospect's reminder is due (per
+    # NUDGE_FOLLOWUP_DELAY_MINUTES above) and schedules/drafts the next one.
+    # Lower this so a shortened reminder wait time above actually gets acted on
+    # promptly instead of waiting up to 30 minutes for the next tracker pass.
     INACTIVITY_CHECK_SECONDS      = int(os.getenv("INACTIVITY_CHECK_SECONDS",      "1800"))   # 30 min
+    # =========================================================================
+
     SWEEP_STUCK_CAMPAIGNS_SECONDS = int(os.getenv("SWEEP_STUCK_CAMPAIGNS_SECONDS", "1800"))   # 30 min
     SWEEP_STRANDED_DISPATCHES_SECONDS = int(os.getenv("SWEEP_STRANDED_DISPATCHES_SECONDS", "600"))  # 10 min
     REACTIVATION_CHECK_SECONDS    = int(os.getenv("REACTIVATION_CHECK_SECONDS",    "86400"))  # 24 hr
-    OAUTH_REFRESH_SECONDS         = int(os.getenv("OAUTH_REFRESH_SECONDS",         "21600"))  # 6 hr
 
     # 12. EMAIL DELIVERY WINDOWS (prospect local time, 24-h "HH:MM" format)
     # Two windows per day; emails outside these windows are held until the next slot.

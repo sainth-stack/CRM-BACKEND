@@ -100,10 +100,10 @@ class CalProvider:
             logger.info(f"[CAL] Access token for user {user.email} is expired. Refreshing...")
             try:
                 # Cal.com refresh tokens are single-use/rotating. Lock the row and pull
-                # the latest state first — a concurrent worker (e.g. the proactive
-                # token_refresh_worker, or another task for the same user) may have
-                # already consumed and rotated this refresh token. Refreshing again
-                # with the stale value would 400 and wipe the (now-valid) credentials.
+                # the latest state first — this is the only refresh chokepoint now (no
+                # proactive worker), but two concurrent on-demand callers for the same
+                # user (e.g. two open tabs) could still race. Refreshing again with a
+                # stale value would 400 and wipe the (now-valid) credentials.
                 user = (
                     db.query(models.User)
                     .filter(models.User.id == user.id)
@@ -131,7 +131,15 @@ class CalProvider:
                 else:
                     user.cal_token_expires_at = datetime.now() + timedelta(seconds=1800)
 
-                db.flush()
+                # Cal.com refresh tokens are single-use/rotating: the instant this
+                # call succeeds, Cal.com invalidates the old refresh token
+                # server-side. A flush() alone is not durable - if the caller's
+                # session is later rolled back or closed without an explicit
+                # commit (several call sites don't commit), the new pair is lost
+                # while Cal.com has already killed the old one, permanently
+                # breaking the connection on the next refresh attempt. Commit
+                # immediately so the rotation can never be silently discarded.
+                db.commit()
                 logger.info(f"[CAL] Access token successfully refreshed for user {user.email}")
             except Exception as e:
                 error_str = str(e).lower()
@@ -147,9 +155,9 @@ class CalProvider:
                     user.cal_refresh_token = None
                     user.cal_token_expires_at = None
                     try:
-                        db.flush()
+                        db.commit()
                     except Exception:
-                        pass
+                        db.rollback()
                 else:
                     logger.error(f"[CAL] Failed to refresh access token for user {user.email}: {e}")
                 return None

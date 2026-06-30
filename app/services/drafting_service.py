@@ -72,7 +72,7 @@ class DraftingService:
             temp_db.close()
 
         # 2. Run the Strategist -> Writer -> Validate sub-graph.
-        from app.agents.email_drafter import clean_email_body
+        from app.agents.email_drafter import clean_email_body, insert_initial_hope_line
         from app.services.observability_service import ObservabilityService
 
         first_name = prospect_name.split(' ')[0] if prospect_name and ' ' in prospect_name else (prospect_name or "there")
@@ -143,7 +143,7 @@ class DraftingService:
             sequence = [
                 {
                     "subject":        email1["subject"],
-                    "body":           clean_email_body(email1["body"]),
+                    "body":           insert_initial_hope_line(clean_email_body(email1["body"])),
                     "draft_type":     "INITIAL",
                     "followup_index": 0,
                 },

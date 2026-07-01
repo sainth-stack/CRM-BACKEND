@@ -9,14 +9,18 @@ Architecture:
                 OR legacy: site crawl → _enrich() → CompanyResearchProfile (v1).
   Call 2      — Reasoning model validates the profile against sender + campaign:
                 ICPMeddpiccJudgment (MEDDPICC role gate + operational_overlap LLM,
-                scale_readiness + signal_breadth computed deterministically).
+                trigger_readiness + signal_breadth computed deterministically).
   Decision    — _decide(): binary ACCEPTED / REJECTED vs ICP_ACCEPT_THRESHOLD.
 
 Globally unbiased:
   - No hardcoded industry, geography, or sector rubric.
   - All scoring is relative to the sender's actual profile.
-  - operational_overlap is the only LLM-graded number; scale + breadth are
-    computed from firmographics/lists to give consistent per-company spread.
+  - operational_overlap (0-55) is the PRIMARY constraint and the only LLM-graded
+    number — a genuine operational match is close to a full qualifying fit on its
+    own. trigger_readiness (0-25, active change/investment signals from enrichment)
+    and signal_breadth (0-20, matched pains/services) are score-RAISING modifiers
+    computed from enrichment data, not gates — thin web coverage should never sink
+    a genuine operational match.
 """
 from __future__ import annotations
 
@@ -56,8 +60,19 @@ class ICPMeddpiccJudgment(BaseModel):
     """Reasoning-model output — MEDDPICC ICP qualification against THIS sender.
 
     operator_fit is SYSTEM-COMPUTED from the LLM's operational_overlap plus two
-    deterministic sub-scores (scale_readiness, signal_breadth). The LLM MUST output
-    0 for scale_readiness, signal_breadth, and operator_fit — the system fills them.
+    deterministic sub-scores (trigger_readiness, signal_breadth). The LLM MUST output
+    0 for trigger_readiness, signal_breadth, and operator_fit — the system fills them.
+
+    Weighting (2026-07-01 rebalance): operational_overlap is the PRIMARY constraint — a
+    genuine operational match is close to a full qualifying signal on its own. The two
+    deterministic sub-scores are score-RAISING modifiers, not gates: trigger_readiness
+    replaced the old firmographic scale_readiness (size/revenue is a weak fit signal —
+    it says a company is big, not that it needs this) with evidence of an ACTIVE change/
+    investment window (growth, hiring, initiatives, recent events) — a real buying-readiness
+    signal pulled from the same enrichment call, not a new cost. signal_breadth is capped
+    lower because it depends entirely on how much the web enrichment happened to surface —
+    thin web coverage should raise/lower the score at the margin, never sink a genuine
+    operational match.
     """
 
     # ── Role gate ────────────────────────────────────────────────────────────
@@ -87,18 +102,20 @@ class ICPMeddpiccJudgment(BaseModel):
     # ── Operational fit — ONLY operational_overlap is LLM-scored ────────────
     operational_overlap: int = Field(
         description=(
-            "0-45 (operators only; 0 for other roles): how DIRECTLY the target's core operations "
+            "0-55 (operators only; 0 for other roles): how DIRECTLY the target's core operations "
             "match the sender's buyer profile and its derived operational signals, inferred from "
-            "what the company does/makes/serves. "
-            "38-45 = textbook match to the central signal; "
-            "25-37 = clear match; 12-24 = partial/adjacent overlap; 1-11 = loose. "
+            "what the company does/makes/serves. THIS IS THE PRIMARY CONSTRAINT — a genuine match "
+            "here is close to a full qualifying fit on its own; the other sub-scores only raise or "
+            "lower it at the margin. "
+            "46-55 = textbook match to the central signal; "
+            "30-45 = clear match; 15-29 = partial/adjacent overlap; 1-14 = loose. "
             "DIFFERENTIATE — avoid round-number defaults; two companies should rarely tie. "
             "Never lower this score because pain is not explicitly stated in the profile."
         )
     )
-    scale_readiness: int = Field(
+    trigger_readiness: int = Field(
         default=0,
-        description="SYSTEM-COMPUTED from firmographics — output 0; the system fills this."
+        description="SYSTEM-COMPUTED from enrichment change/investment signals — output 0; the system fills this."
     )
     signal_breadth: int = Field(
         default=0,
@@ -106,7 +123,7 @@ class ICPMeddpiccJudgment(BaseModel):
     )
     operator_fit: int = Field(
         default=0,
-        description="SYSTEM-COMPUTED (operational_overlap + scale_readiness + signal_breadth) — output 0."
+        description="SYSTEM-COMPUTED (operational_overlap + trigger_readiness + signal_breadth) — output 0."
     )
 
     # ── Corroborating evidence (bonus signals — absence is NEUTRAL, never a penalty) ─
@@ -291,8 +308,9 @@ service firms, consultancies, SaaS/software, financial services, or pure reselle
 without making anything of their own.
 
 Score target_role, role_reason, and operational_overlap using the company's RESEARCH PROFILE judged in
-light of the campaign objective. Fill scale_readiness, signal_breadth, operator_fit with 0 — system
-computes them.
+light of the campaign objective. operational_overlap is the PRIMARY constraint — a genuine operational
+match is close to a full qualifying fit on its own. Fill trigger_readiness, signal_breadth, operator_fit
+with 0 — system computes them.
 
 has_evidenced_need + need_evidence: TRUE only if THE NEED (iii) happens to be EXPLICIT in the profile.
 Setting it false does NOT reduce the score. Do NOT force it true.
@@ -538,113 +556,47 @@ class CompanyValidationService:
     # ------------------------------------------------------------------ #
     # Deterministic sub-scores                                            #
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _revenue_score(revenue: str) -> int:
-        """0-12 from a revenue-range string (uses UPPER bound). Blank → neutral 3."""
-        t = (revenue or "").lower().replace(",", "").replace("$", "")
-        if not t.strip():
-            return 3
-        vals = []
-        for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([bmk])?", t):
-            if not num:
-                continue
-            mult = {"b": 1_000_000_000, "m": 1_000_000, "k": 1_000}.get(unit, 1)
-            vals.append(float(num) * mult)
-        if not vals:
-            return 3
-        v = max(vals)
-        for thr, sc in ((1e9, 12), (5e8, 11), (1e8, 9), (5e7, 7), (2e7, 5), (5e6, 4), (1e6, 2)):
-            if v >= thr:
-                return sc
-        return 1
-
     @classmethod
-    def _headcount_score(cls, size: str) -> int:
-        """0-8 from an employee-size string (uses UPPER bound). Blank → neutral 2."""
-        ranges = cls._parse_ranges(size or "")
-        if not ranges:
-            return 2
-        hi = max(h if h != float("inf") else l for l, h in ranges)
-        for thr, sc in ((5000, 8), (1000, 7), (500, 6), (200, 5), (50, 4), (10, 3)):
-            if hi >= thr:
-                return sc
-        return 2
+    def _compute_trigger_readiness(cls, profile: dict) -> int:
+        """0-25 from ACTIVE change/investment signals already captured by enrichment.
 
-    @staticmethod
-    def _age_score(founded_year: str) -> int:
-        """0-3 company-maturity score from a founded year/date. Blank → neutral 1."""
-        if not founded_year:
-            return 1
-        m = re.search(r"(19|20)\d{2}", str(founded_year))
-        if not m:
-            return 1
-        import datetime as _dt
-        age = _dt.datetime.utcnow().year - int(m.group(0))
-        for thr, sc in ((50, 3), (20, 2), (3, 1)):
-            if age >= thr:
-                return sc
-        return 1
+        Replaces the old firmographic scale_readiness (revenue/headcount/age). Company
+        SIZE is a weak fit signal — being big doesn't mean a company needs this offering.
+        Evidence of an ACTIVE change/investment window (growth, hiring, initiatives, recent
+        news) is a real buying-readiness signal, and it comes from the SAME enrichment call
+        already made for this company — no new cost, just using data we were discarding.
 
-    @staticmethod
-    def _parse_ranges(text: str):
-        """Parse employee-count ranges from free text → [(low, high)]; high=inf for '5000+'."""
-        if not text:
-            return []
-        t = text.lower().replace(",", "")
-        ranges = []
-        for mt in re.finditer(r"(\d+)\s*\+", t):
-            ranges.append((int(mt.group(1)), float("inf")))
-        for mt in re.finditer(r"(\d+)\s*(?:-|to|–|—|−)\s*(\d+)", t):
-            a, b = int(mt.group(1)), int(mt.group(2))
-            ranges.append((min(a, b), max(a, b)))
-        if not ranges:
-            nums = [int(x) for x in re.findall(r"\d+", t)]
-            if len(nums) == 1:
-                ranges.append((nums[0], nums[0]))
-            elif len(nums) >= 2:
-                ranges.append((min(nums), max(nums)))
-        return ranges
+        v2 profiles:            growth_signals + recent_events + hiring_signals + key_initiatives.
+        v1 (legacy/eval) profiles: growth_hooks + news_hooks — the closest available analogue.
 
-    @classmethod
-    def _compute_scale_readiness(cls, company_data: dict, profile: dict) -> int:
-        """0-30 from real firmographic + profile facts.
-
-        revenue (0-12) + headcount (0-8) + market_breadth (0-4)
-        + products (0-3) + age (0-3) = 30.
-
-        For v2 profiles, target_customers (string) is parsed for market breadth;
-        products_services list is used for product count.
-        For v1 profiles, markets_served list is used directly.
+        Rewards both BREADTH (how many distinct categories fired) and DEPTH (how many items
+        within them), capped at 25. Blank across the board → 0 — this is a score-raising
+        modifier, not a penalty, so absence is neutral, matching the has_evidenced_* bonuses.
         """
-        score = cls._revenue_score(
-            company_data.get("annual_revenue") or company_data.get("revenue")
-        )
-        score += cls._headcount_score(
-            company_data.get("staff_count") or company_data.get("size")
-        )
-
-        if CompanyValidationService._profile_is_v2(profile):
-            # Parse target_customers string for market breadth (split by comma/semicolon)
-            tc_raw = (profile.get("target_customers") or "").strip()
-            if tc_raw and tc_raw.lower() not in ("unknown", "not stated", "n/a", ""):
-                tc_parts = [p.strip() for p in re.split(r"[,;]", tc_raw) if p.strip()]
-                score += min(4, len(tc_parts)) if tc_parts else 1
+        if cls._profile_is_v2(profile):
+            categories = ("growth_signals", "recent_events", "hiring_signals", "key_initiatives")
+            cat_weight, item_weight = 3, 2
         else:
-            score += min(4, len(profile.get("markets_served") or []))
+            categories = ("growth_hooks", "news_hooks")
+            cat_weight, item_weight = 6, 3
 
-        score += min(3, len(profile.get("products_services") or []))
-        score += cls._age_score(company_data.get("founded_year"))
-        return max(0, min(30, score))
+        lists = [profile.get(c) or [] for c in categories]
+        present = sum(1 for lst in lists if lst)
+        item_count = sum(len(lst) for lst in lists)
+        return max(0, min(25, present * cat_weight + item_count * item_weight))
 
     @staticmethod
     def _compute_signal_breadth(m: ICPMeddpiccJudgment) -> int:
-        """0-25 from how many sender pains/services the target matched.
+        """0-20 from how many sender pains/services the target matched.
 
         LLM lists vary per company (reliable extraction), so the derived count
-        spreads naturally where a direct 0-25 grade would cluster.
+        spreads naturally where a direct 0-20 grade would cluster. Capped lower than
+        before (was 25) — this depends entirely on how much the web enrichment happened
+        to surface, so it should raise/lower the score at the margin, never sink a
+        genuine operational match on its own.
         """
         n = len(m.matched_pains or []) + len(m.matched_services or [])
-        return max(0, min(25, n * 4))
+        return max(0, min(20, n * 4))
 
     # ── Bonus for corroborating evidence (positive signals only) ─────────────
     _NEED_BONUS        = 8
@@ -1092,22 +1044,23 @@ class CompanyValidationService:
             )
             m.target_role = "operator_end_user"
             m.role_reason = (m.role_reason or "") + " [System: confirmed production operations.]"
-            # Conservative 'clear match' baseline; real differentiation still comes
-            # from the computed scale + breadth sub-scores.
-            m.operational_overlap = max(int(m.operational_overlap or 0), 24)
+            # Conservative 'clear match' baseline (rescaled to the 0-55 operational_overlap
+            # range); real differentiation still comes from the computed trigger + breadth
+            # sub-scores.
+            m.operational_overlap = max(int(m.operational_overlap or 0), 29)
 
         # ── Compute deterministic sub-scores ─────────────────────────────────
         if m.target_role == "operator_end_user":
-            m.scale_readiness = self._compute_scale_readiness(company_data, profile)
-            m.signal_breadth  = self._compute_signal_breadth(m)
-            m.operator_fit    = (
-                max(0, min(45, int(m.operational_overlap or 0)))
-                + m.scale_readiness
+            m.trigger_readiness = self._compute_trigger_readiness(profile)
+            m.signal_breadth    = self._compute_signal_breadth(m)
+            m.operator_fit      = (
+                max(0, min(55, int(m.operational_overlap or 0)))
+                + m.trigger_readiness
                 + m.signal_breadth
             )
         else:
             m.operational_overlap = 0
-            m.scale_readiness     = 0
+            m.trigger_readiness   = 0
             m.signal_breadth      = 0
             m.operator_fit        = 0
 

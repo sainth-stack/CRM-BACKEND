@@ -170,16 +170,32 @@ class ICPMeddpiccJudgment(BaseModel):
     )
     overall_reasoning: str = Field(
         description=(
-            "A professional 2-3 sentence FACTUAL assessment for a sales team. "
-            "Ground it in what the company actually does/operates and why that matches (or does "
-            "not match) the sender's target-customer profile. "
-            "FORBIDDEN: any sentence referencing missing or unstated information. Never write "
-            "phrases like 'absence of challenges', 'no specific needs were stated', 'limits "
+            "A professional 3-4 sentence FACTUAL assessment for a sales team, in TWO explicit parts: "
+            "(1) IDENTITY — name the SPECIFIC product/process the company runs (e.g. 'manufactures "
+            "fire-alarm control panels via electronics assembly'), not a generic label. If the "
+            "DATA-PROVIDER INDUSTRY LABEL supplied in the target record disagrees with this conclusion, "
+            "name that label explicitly and say why the evidence confirms or overrides it — e.g. "
+            "'Although the data provider labels this company Consumer Electronics, its description and "
+            "SIC/NAICS classification confirm it manufactures switchgear, a genuine Manufacturing operation.' "
+            "(2) OPERATIONAL FIT — name the SPECIFIC operational signal the sender's offering targets "
+            "(quote or paraphrase it from the sender/campaign context, e.g. 'unplanned downtime and "
+            "reactive maintenance on physical asset fleets') and state PLAINLY, with a concrete reason "
+            "tied to the evidence, whether this company's operations exhibit that signal or not. When "
+            "the signal is absent, give the AFFIRMATIVE causal reason WHY — what kind of operation the "
+            "company runs INSTEAD and why that operation does not produce the signal (e.g. 'Kentec's "
+            "panels are compact electronic assemblies rather than the heavy machinery or production-line "
+            "equipment that generates unplanned downtime'). NEVER phrase the absence as an information "
+            "gap — 'not evidenced', 'not explicitly evidenced', 'no evidence of', 'unclear whether' are "
+            "FORBIDDEN here; the absence itself, causally explained, IS the answer. "
+            "BANNED as standalone filler: 'does not align with the offerings', 'does not indicate a "
+            "need', 'too weak a match', 'not a fit' — these words may ONLY appear immediately followed "
+            "by the concrete evidenced reason (what the company does instead, and why that doesn't "
+            "produce the signal). Also FORBIDDEN: any sentence referencing missing or unstated "
+            "information ('absence of challenges', 'no specific needs were stated', 'limits "
             "confidence', 'despite the absence', 'not explicitly stated', 'further exploration "
-            "needed', or 'may not be a fit'. Marketing websites describe capabilities, not "
-            "problems — treating absence of stated problems as a caveat is WRONG. "
-            "Write only affirmative, evidence-grounded sentences. "
-            "Do NOT state or imply accept/reject. Use the exact sender name."
+            "needed'). Marketing websites describe capabilities, not problems — treating absence of "
+            "stated problems as a caveat is WRONG. Write only affirmative, evidence-grounded sentences. "
+            "Do NOT state or imply accept/reject verdict words. Use the exact sender name."
         )
     )
     confidence: int = Field(description="0-100 confidence given the quality/quantity of evidence.")
@@ -290,9 +306,12 @@ paper_process, discovery_checklist: fill these from the profile + sender context
 business_opportunity_reason: the 'why now' anchored to ONE specific fact in the profile. State plainly
 if no concrete trigger was found.
 matched_pains / matched_services: the sender pains/services that apply to what the profile shows.
-overall_reasoning: professional 2-3 sentence FACTUAL assessment using the exact sender name from the
-campaign inputs. Ground in what the company DOES. FORBIDDEN: any sentence about missing/unstated
-information. No scores, field names, booleans, or verdict labels. No accept/reject recommendation.
+overall_reasoning: a two-part FACTUAL assessment (see field description) — first confirm what the
+company concretely does and reconcile it against the raw DATA-PROVIDER INDUSTRY LABEL in the target
+record if the two conflict, then name the SPECIFIC operational signal the sender targets and state
+plainly, with a concrete evidenced reason, whether this company shows it. Every judgement must be
+traceable to a named fact — never a bare 'doesn't align' with no reason attached. No scores, field
+names, booleans, or verdict labels. No accept/reject recommendation.
 confidence: 0-100.\
 """
 
@@ -319,6 +338,8 @@ _VALIDATE_TARGET = """\
 ==================== TARGET RECORD (the ONLY per-company input) ====================
 TARGET COMPANY:
 - Name: {name}
+- DATA-PROVIDER INDUSTRY LABEL (raw, from the lead source — often inaccurate; the RESEARCH PROFILE
+  below is the authority when the two disagree): {csv_industry_label}
 - RESEARCH PROFILE (THE evidence — quote from it):
 \"\"\"{profile}\"\"\"\
 """
@@ -703,7 +724,8 @@ class CompanyValidationService:
     # Hedge scrubber                                                      #
     # ------------------------------------------------------------------ #
     _HEDGE_RE = re.compile(
-        r"absence of|not (?:explicitly )?stated"
+        r"absence of|not (?:explicitly )?stated|not (?:explicitly |directly )?evidenced"
+        r"|no evidence of|unclear whether"
         r"|no (?:specific|explicit) (?:challenge|need|pain|problem)"
         r"|limits? (?:the ability|confidence)|despite the absence|further exploration"
         r"|without explicit|no (?:stated|mentioned) (?:challenge|need|pain)",
@@ -724,29 +746,34 @@ class CompanyValidationService:
     # Decision + result builder                                           #
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _format_reasoning(m: ICPMeddpiccJudgment, verdict: str) -> str:
+    def _format_reasoning(m: ICPMeddpiccJudgment, verdict: str, score: int, threshold: int) -> str:
         base = (m.overall_reasoning or "").strip()
         if base and base[-1] not in ".!?":
             base += "."
         if verdict == "ACCEPT":
-            note = "On balance the company qualifies for outreach as a genuine operational fit for the sender's offering."
+            note = (
+                f"Fit score {score}/100 clears the {threshold}/100 qualification bar — "
+                "a genuine operational fit for the sender's offering."
+            )
             if m.has_evidenced_need and (m.need_evidence or "").strip().lower() not in ("", "none evidenced"):
                 note += f" A relevant need is evidenced: {m.need_evidence.strip()}"
         else:
             if m.target_role == "solution_vendor_overlap":
                 note = (
-                    "It does not qualify: the company appears to sell a solution that competes with "
-                    "the sender's, rather than being a prospective customer."
+                    "Not qualified: the company appears to sell a solution that competes with the "
+                    "sender's, rather than being a prospective customer."
                 )
             elif m.target_role == "out_of_domain":
                 note = (
-                    "It does not qualify: its operations fall outside the domain the sender's "
-                    "offering serves."
+                    "Not qualified: its evidenced operations do not run the kind of physical/operational "
+                    "process the sender's offering targets, regardless of its stated or data-provider "
+                    "industry label — see the identity/operational-fit reasoning above for the specific gap."
                 )
             else:
                 note = (
-                    "It does not qualify: its operations are too weak a match for the sender's "
-                    "target-customer profile to meet the qualification bar."
+                    f"Not qualified: fit score {score}/100 falls short of the {threshold}/100 "
+                    "qualification bar. Its operations are a confirmed but weak match for the sender's "
+                    "target-customer profile — see the operational-fit reasoning above for the specific gap."
                 )
         return f"{base} {note}".strip()
 
@@ -763,7 +790,7 @@ class CompanyValidationService:
 
         verdict = "ACCEPT" if score >= threshold else "REJECT"
         status  = "ACCEPTED" if verdict == "ACCEPT" else "REJECTED"
-        reasoning = self._format_reasoning(m, verdict)
+        reasoning = self._format_reasoning(m, verdict, score, threshold)
 
         # Map profile fields → canonical output keys (v2 and v1 both produce same keys)
         if self._profile_is_v2(profile):
@@ -860,6 +887,7 @@ class CompanyValidationService:
         sender_proof: str,
         sender_research: str,
         campaign_prompt: str,
+        csv_industry_label: str,
     ) -> ICPMeddpiccJudgment:
         from langchain_core.messages import SystemMessage, HumanMessage
         from app.core.logging_config import agent_label_var
@@ -888,6 +916,7 @@ class CompanyValidationService:
         # at 4K for data-rich companies, directly hurting scoring accuracy.
         target_msg = HumanMessage(content=_VALIDATE_TARGET.format(
             name=name,
+            csv_industry_label=csv_industry_label or "Not provided",
             profile=rendered_profile[:8_000],
         ))
 
@@ -929,6 +958,9 @@ class CompanyValidationService:
         _dom_tok = company_domain_var.set(domain or "unknown")
 
         csv_desc        = company_data.get("description") or ""
+        csv_industry_label = self._as_text(
+            company_data.get("industry") or company_data.get("company_type"), empty="Not provided"
+        )
         campaign_prompt = self._as_text(
             campaign_metadata.get("prompt"), empty="(no specific objective provided)"
         )
@@ -1009,6 +1041,7 @@ class CompanyValidationService:
                 sender_proof=sender_proof,
                 sender_research=sender_research,
                 campaign_prompt=campaign_prompt,
+                csv_industry_label=csv_industry_label,
             )
         except Exception as e:
             company_domain_var.reset(_dom_tok)

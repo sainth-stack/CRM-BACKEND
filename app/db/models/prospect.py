@@ -59,6 +59,7 @@ class TargetCompany(Base):
     v2_intel = Column(JSON, nullable=True)
     relevance_score = Column(Integer, default=0, index=True) # Numeric quality score
     relevance_explanation = Column(Text, nullable=True) # Reasoning for the score
+    screener_reasoning = Column(Text, nullable=True) # Raw LeadFitScreener verdict (survives ICP overwrite of relevance_explanation)
     rejection_reason = Column(Text, nullable=True)
     matched_pains = Column(JSON, nullable=True)
     matched_services = Column(JSON, nullable=True)

@@ -523,21 +523,15 @@ class LeadFitScreener:
 
         final = "FAIL" if failed else "PASS"
 
-        if final == "FAIL":
-            summary = f"FAIL on: {', '.join(failed)}. " + " | ".join(
-                f"{c}: {r.evidence}"
-                for c, r in [
-                    ("location", location_check),
-                    ("size", size_check),
-                    ("industry", industry_check),
-                ]
-                if r.verdict == "fail"
-            )
-        else:
-            parts = []
-            for label, check in [("location", location_check), ("size", size_check), ("industry", industry_check)]:
-                parts.append(f"{label}={check.verdict}")
-            summary = "PASS — " + ", ".join(parts)
+        prefix = f"FAIL on: {', '.join(failed)}. " if final == "FAIL" else ""
+        summary = prefix + " | ".join(
+            f"{c}: {r.evidence}"
+            for c, r in [
+                ("location", location_check),
+                ("size", size_check),
+                ("industry", industry_check),
+            ]
+        )
 
         logger.info(f"[LeadFitScreener] {name}: {final} — {summary}")
 

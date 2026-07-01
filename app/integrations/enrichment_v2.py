@@ -61,9 +61,22 @@ NEWS_CHAR_BUDGET        = 2_500
 DDGS_CHAR_BUDGET        = 4_500
 HIRING_CHAR_BUDGET      = 2_000
 WIKI_CHAR_BUDGET        = 1_500
-PAIN_SIGNALS_CHAR_BUDGET = 2_000   # was 4_000 — L6 DDGS snippets rarely exceed 2K
+PAIN_SIGNALS_CHAR_BUDGET = 4_000
 
-HARD_TIMEOUT_SEC        = int(os.getenv("ENRICH_TIMEOUT_SEC", "75"))     # per-company watchdog (seconds)
+HARD_TIMEOUT_SEC        = int(os.getenv("ENRICH_TIMEOUT_SEC", "110"))    # per-company watchdog (seconds) —
+                                                                            # must exceed crawl time + LLM_EXTRACT_TIMEOUT_SEC with margin
+LLM_EXTRACT_TIMEOUT_SEC = int(os.getenv("ENRICH_LLM_TIMEOUT_SEC", "55"))  # bounds the LLM step alone so a slow
+                                                                            # call degrades gracefully instead of
+                                                                            # blowing the outer per-company watchdog
+DDGS_LAYER_TIMEOUT_SEC  = int(os.getenv("ENRICH_DDGS_LAYER_TIMEOUT_SEC", "25"))  # hard cap on L3 (DDGS) alone —
+                                                                            # the underlying ddgs lib fans out to
+                                                                            # several scraped search engines (Brave,
+                                                                            # Mojeek, Yandex, Google...) that 429/403
+                                                                            # under concurrent load; without this cap
+                                                                            # a stuck engine can eat the whole
+                                                                            # per-company HARD_TIMEOUT_SEC budget and
+                                                                            # discard L1/L2/L4/L5 data that already
+                                                                            # succeeded
 DDGS_CONCURRENCY        = int(os.getenv("ENRICH_DDGS_CONCURRENCY", "4"))  # max concurrent DDGS thread-pool calls (global)
 NEWS_CONCURRENCY        = int(os.getenv("ENRICH_NEWS_CONCURRENCY", "8"))  # max concurrent Google News fetches (global)
 # Global cap on simultaneous lxml/trafilatura parses. This is the single heaviest
@@ -565,7 +578,13 @@ async def _layer3_ddgs(company_name: str, tokens: list[str],
         groups = [_run_group(_GROUP_A), _run_group(_GROUP_B), _run_group(_GROUP_C)]
         if site_unreachable:
             groups.append(_run_group(_GROUP_SITE_FALLBACK))
-        group_results = await asyncio.gather(*groups, return_exceptions=True)
+        # Hard cap the WHOLE layer (all groups + their internal retries). A rate-limited
+        # or blocked search backend (Brave 429, Mojeek 403, Grokipedia timeout, etc.) can
+        # otherwise make _retry()'s attempts run long — capping here means a stuck DDGS
+        # layer degrades to whatever hits arrived in time instead of blowing the shared
+        # per-company watchdog and discarding L1/L2/L4/L5 data that already succeeded.
+        group_results = await asyncio.wait_for(
+            asyncio.gather(*groups, return_exceptions=True), timeout=DDGS_LAYER_TIMEOUT_SEC)
         seen_urls: set[str] = set()
         all_hits: list[dict] = []
         for gr in group_results:
@@ -575,6 +594,8 @@ async def _layer3_ddgs(company_name: str, tokens: list[str],
                     if u not in seen_urls:
                         seen_urls.add(u)
                         all_hits.append(h)
+    except asyncio.TimeoutError:
+        return "[DDGS timeout — search backends unresponsive, continuing without this layer]"
     except Exception as exc:
         return f"[DDGS failed: {exc}]"
 
@@ -749,7 +770,9 @@ async def _layer6_pain_signals(
     async with _sem("ddgs", DDGS_CONCURRENCY):
         try:
             hits = await asyncio.wait_for(
-                loop.run_in_executor(None, _search), timeout=20)
+                loop.run_in_executor(None, _search), timeout=DDGS_LAYER_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            return "[L6 timeout — search backends unresponsive, continuing without this layer]"
         except Exception as exc:
             return f"[L6 failed: {exc}]"
 
@@ -883,7 +906,7 @@ async def _llm_extract(
     from app.core.llm import get_chat_llm
     from app.core.logging_config import agent_label_var, company_domain_var
 
-    llm   = get_chat_llm("enrichment", timeout=90)
+    llm   = get_chat_llm("enrichment", timeout=LLM_EXTRACT_TIMEOUT_SEC)
     chain = llm.with_structured_output(CompanyEnrichment)
 
     system_msg = SystemMessage(content=_ENRICH_SYSTEM.format(
@@ -906,7 +929,11 @@ async def _llm_extract(
     _dom_tok = company_domain_var.set(domain)
     _ag_tok  = agent_label_var.set("enrichment_v2")
     try:
-        rec: CompanyEnrichment = await chain.ainvoke([system_msg, user_msg])
+        # Bound the WHOLE call (incl. langchain's internal retries) so a slow/rate-limited
+        # LLM step degrades gracefully (caller falls back to a degraded record) instead of
+        # eating into the per-company HARD_TIMEOUT_SEC and losing the already-crawled data.
+        rec: CompanyEnrichment = await asyncio.wait_for(
+            chain.ainvoke([system_msg, user_msg]), timeout=LLM_EXTRACT_TIMEOUT_SEC)
         return rec
     except Exception as e:
         logger.warning(f"[EnrichV2] LLM extraction failed for {company_name}: {e}")

@@ -140,6 +140,7 @@ class CampaignService:
                         if existing:
                             existing.status = status
                             existing.relevance_explanation = reasoning
+                            existing.screener_reasoning = screen.summary if screen else None
                         else:
                             new_co = models.TargetCompany(
                                 campaign_id=campaign_id,
@@ -148,6 +149,7 @@ class CampaignService:
                                 status=status,
                                 relevance_score=0,
                                 relevance_explanation=reasoning,
+                                screener_reasoning=screen.summary if screen else None,
                                 location=co_extra.get("location"),
                                 company_type=co_extra.get("industry"),
                                 employee_count=co_extra.get("size"),

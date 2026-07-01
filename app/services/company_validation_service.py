@@ -875,7 +875,7 @@ class CompanyValidationService:
             sender_offerings=sender_offerings,
             sender_customers=sender_customers,
             sender_advantages=sender_advantages,
-            sender_capmap=sender_capmap[:2_000],
+            sender_capmap=sender_capmap,
             sender_proof=sender_proof,
             sender_research=(sender_research or "N/A")[:3_000],
             threshold=settings.ICP_ACCEPT_THRESHOLD,
@@ -939,7 +939,7 @@ class CompanyValidationService:
         )
         sender_customers  = self._as_text(user_intel.get("target_customers"))
         sender_advantages = self._as_text(user_intel.get("competitive_advantages"))
-        sender_capmap     = str(user_intel.get("capability_to_pain_map") or [])[:2000]
+        sender_capmap     = str(user_intel.get("capability_to_pain_map") or [])
         sender_proof      = str(user_intel.get("proof_points") or [])[:1000]
         sender_research   = self._as_text(user_intel.get("deep_research"), empty="N/A")
 
